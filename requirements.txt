@@ -1,0 +1,65 @@
+# Core Framework
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+httpx
+requests
+unsync
+
+# --- Databases & Drivers ---
+# SQLAlchemy Core (for Postgres, MySQL, SQLite, SingleStore)
+sqlalchemy
+
+# Async Drivers for SQLAlchemy
+aiosqlite       # For async SQLite
+asyncpg         # For async PostgreSQL
+aiomysql        # For async MySQL
+
+# NoSQL & Cloud Databases
+boto3           # For DynamoDB
+aioboto3        # For async DynamoDB
+pymongo         # For MongoDB
+motor           # For async MongoDB
+redis           # For Redis
+#google-cloud-firestore
+#google-cloud-storage
+#surrealdb
+
+# --- Knowledge, Embedders & Rerankers ---
+# Readers
+beautifulsoup4
+python-pptx
+pypdf
+rapidocr-onnxruntime
+youtube-transcript-api
+arxiv
+wikipedia
+firecrawl-py
+ddgs
+googlesearch-python
+unstructured
+markdown
+
+# Embedders & Rerankers
+sentence-transformers
+#cohere
+#voyageai
+#ollama
+openai
+jinaai
+fastembed
+huggingface-hub
+
+# --- Interfaces ---
+discord.py
+slack-sdk
+a2a-sdk
+fastmcp
+
+# --- Utilities ---
+rich            # For beautiful CLI output
+pyjwt           # For JWT authentication
+pyyaml          # For loading YAML configs
+packaging
+importlib-metadata; python_version < "3.8"
