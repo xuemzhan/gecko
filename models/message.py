@@ -138,7 +138,7 @@ class Message(BaseModel):
     # === 模型输出扩展 ===
     reasoning_content: Optional[str] = None  # 模型推理内容（不发送给 API）
     redacted_reasoning_content: Optional[str] = None  # 脱敏后的推理内容（发送给 API）
-    provider_ Optional[Dict[str, Any]] = None  # 提供商特定数据 # type: ignore
+    provider_data: Optional[Dict[str, Any]] = None  # 提供商特定数据 # type: ignore
     citations: Optional[Citations] = None  # 引用信息
 
     # === 元数据与控制 ===
@@ -328,7 +328,7 @@ class Message(BaseModel):
                 _logger(f"* Provider metrics: {m.provider_metrics}")
             if m.additional_metrics:
                 _logger(f"* Additional metrics: {m.additional_metrics}")
-            _logger(header, center=True, symbol="*")
+            _logger(header, center=True, symbol="*") # type: ignore
 
     def content_is_valid(self) -> bool:
         """检查消息内容是否有效（非空）"""
