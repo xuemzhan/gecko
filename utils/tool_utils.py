@@ -20,9 +20,9 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 # 动态导入以避免循环依赖
 try:
-    from agno.guardrails.base import BaseGuardrail
-    from agno.models.response import ToolExecution
-    from agno.tools.function import Function, FunctionCall
+    from guardrails.base import BaseGuardrail
+    from models.response import ToolExecution
+    from tools.function import Function, FunctionCall
 except ImportError:
     # 定义桩类以供独立测试
     class BaseGuardrail: pass
@@ -188,7 +188,7 @@ def normalize_hooks(
     result_hooks: List[Callable[..., Any]] = []
     for hook in hooks:
         if isinstance(hook, BaseGuardrail):
-            result_hooks.append(hook.async_check if async_mode else hook.check)
+            result_hooks.append(hook.async_check if async_mode else hook.check) # type: ignore
         elif callable(hook):
             # 检查异步函数是否在同步模式下被错误使用
             if not async_mode and inspect.iscoroutinefunction(hook):

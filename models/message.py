@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field
 # 尝试导入真实模块；若失败则使用简化版（用于独立测试）
 try:
     from media import Audio, File, Image, Video  # type: ignore
-    from models.metrics import Metrics
+    from models.metrics import Metrics # type: ignore
     from utils.log import log_debug, log_error, log_info, log_warning  # type: ignore
 except ImportError:
     # --- 简化版依赖（仅用于测试）---
