@@ -6,7 +6,6 @@ from gecko.core.session import Session
 from gecko.core.events import EventBus
 from gecko.core.runner import AsyncRunner
 from gecko.core.protocols import ModelProtocol
-from gecko.plugins.models.litellm import LiteLLMModel
 
 class AgentBuilder:
     def __init__(self):
@@ -16,31 +15,12 @@ class AgentBuilder:
         self._event_bus: Optional[EventBus] = None
         self._kwargs: Dict[str, Any] = {}
 
-    # def with_model(
-    #     self,
-    #     model: str | dict,
-    #     base_url: str | None = None,
-    #     api_key: str | None = None,
-    #     **kwargs
-    # ) -> Self:
-    #     if isinstance(model, dict):
-    #         config = model
-    #     else:
-    #         config = {"model": model, "base_url": base_url, "api_key": api_key, **kwargs}
-    #     self._model_instance = LiteLLMModel(**config)
-    #     return self
     def with_model(self, model_instance: ModelProtocol) -> Self:
         """
-        统一入口：接收任何实现了 acompletion 方法的模型实例
-        支持：
-          - LiteLLMModel(**config)
-          - glm_4_5_air()
-          - 未来所有自定义模型
+        注入模型实例。模型必须实现 ModelProtocol。
         """
         if not hasattr(model_instance, "acompletion"):
-            raise ValueError("Model must implement async acompletion(messages, **kwargs) method")
-        if not callable(getattr(model_instance, "acompletion")):
-            raise ValueError("acompletion must be callable")
+            raise ValueError("Model must implement async acompletion method")
         
         self._model_instance = model_instance
         return self
@@ -61,28 +41,25 @@ class AgentBuilder:
         self._kwargs.update(kwargs)
         return self
     
-    # gecko/core/builder.py → 添加两个方法
     def with_session_storage_url(self, url: str) -> Self:
-        """注入 Session 存储"""
         from gecko.plugins.storage.factory import get_storage_by_url
         self._kwargs["session_storage"] = get_storage_by_url(url, required="session")
         return self
 
     def with_vector_storage_url(self, url: str) -> Self:
-        """注入 Vector 存储（RAG 用）"""
         from gecko.plugins.storage.factory import get_storage_by_url
         self._kwargs["vector_storage"] = get_storage_by_url(url, required="vector")
         return self
 
     def build(self) -> Agent:
         if not self._model_instance:
-            raise ValueError("Model is required. Call .with_model(...) first.")
+            # [修复] 移除括号 (...)，避免 pytest match 正则歧义
+            raise ValueError("Model is required. Call with_model first.")
 
         return Agent(
             model=self._model_instance,
             tools=self._tools,
             session=self._session,
             event_bus=self._event_bus,
-            # Runner 由 Agent 内部创建，Builder 不干预
             **self._kwargs
         )

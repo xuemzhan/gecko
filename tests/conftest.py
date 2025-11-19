@@ -9,7 +9,24 @@ class MockModel:
     async def acompletion(self, messages, **kwargs):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = f"Mock response for: {messages[-1]['content']}"
+        
+        # [核心修复] 显式将 tool_calls 设为 None 或空列表
+        # 否则 MagicMock 属性在 boolean context 下默认为 True，
+        # 导致 Runner 误以为有工具调用，进而引发后续的 Mock 对象泄露到消息历史中。
+        mock_response.choices[0].message.tool_calls = None 
+        
+        # 安全获取 content，兼容 dict 或对象
+        last_msg = messages[-1]
+        if isinstance(last_msg, dict):
+            last_content = last_msg.get('content', '')
+        else:
+            last_content = getattr(last_msg, 'content', '')
+
+        # 确保内容是字符串
+        if not isinstance(last_content, str):
+             last_content = str(last_content)
+             
+        mock_response.choices[0].message.content = f"Mock response for: {last_content}"
         return mock_response
 
 @pytest.fixture

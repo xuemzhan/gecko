@@ -2,9 +2,19 @@
 from unittest.mock import AsyncMock
 import pytest
 import asyncio
+from gecko.core.builder import AgentBuilder
 from gecko.core.exceptions import AgentError
 from gecko.core.message import Message
 from gecko.core.output import AgentOutput
+
+@pytest.fixture
+def simple_agent(mock_model):
+    # 注入工具避免 fallback
+    from gecko.plugins.tools.calculator import CalculatorTool
+    return AgentBuilder()\
+        .with_model(mock_model)\
+        .with_tools([CalculatorTool()])\
+        .build()
 
 @pytest.mark.asyncio
 async def test_agent_run(simple_agent):

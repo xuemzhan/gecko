@@ -11,5 +11,6 @@ def test_builder_chain(mock_model):
     assert agent.model == mock_model
 
 def test_builder_missing_model():
-    with pytest.raises(ValueError, match="Model is required. Call .with_model(...) first."):
+    # [修复] 匹配字符串移除括号，与代码一致
+    with pytest.raises(ValueError, match="Model is required. Call with_model first."):
         AgentBuilder().build()

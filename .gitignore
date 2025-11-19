@@ -36,6 +36,10 @@ MANIFEST
 *.manifest
 *.spec
 
+# pye中间文件
+requirements-dev.lock
+requirements.lock
+
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt

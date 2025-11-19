@@ -2,82 +2,104 @@
 from __future__ import annotations
 import asyncio
 import anyio
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional, Any
+from gecko.core.events import RunEvent
+from gecko.core.utils import ensure_awaitable  # [修复] 导入辅助函数
+
 if TYPE_CHECKING:
     from .workflow import Workflow
-from gecko.core.events import RunEvent
 
 def step(name: Optional[str] = None):
     """
-    节点装饰器：自动注册 callable / Agent / Team 为 Workflow 节点
-    用法：
-    @step("research")
-    async def research_func(context): ...
+    节点装饰器：将普通函数或异步函数标记为 Workflow 节点。
+    
+    用法:
+        @step("research")
+        async def research(context): ...
     """
     def decorator(func: Callable):
-        step_name = name or func.__name__
-        # 返回包装器，便于 Workflow.add_node(step_name, func)
+        # 包装函数，确保在 Workflow 中调用时始终是异步的
         async def wrapper(context):
-            return await func(context) if asyncio.iscoroutinefunction(func) else func(context)
+            return await ensure_awaitable(func, context)
+        
+        # 保留原函数的元数据（如 __name__），以便日志和可视化使用
+        wrapper.__name__ = name or func.__name__
         return wrapper
     return decorator
 
 class Condition:
-    """条件节点：作为 edge condition 使用"""
-    def __init__(self, predicate: Callable):
+    """条件节点：用于 Workflow 的边（Edge）判断条件"""
+    def __init__(self, predicate: Callable, name: Optional[str] = None):
         self.predicate = predicate
+        self.name = name
 
-    async def __call__(self, context):
-        return await self.predicate(context) if asyncio.iscoroutinefunction(self.predicate) else self.predicate(context)
+    async def __call__(self, context: Any) -> bool:
+        # [修复] 使用 ensure_awaitable，兼容 lambda x: True 这种同步写法
+        return await ensure_awaitable(self.predicate, context)
 
 class Loop:
-    """循环节点：包装子 Workflow，支持 max_iters"""
+    """循环节点：包装一个子 Workflow 进行循环执行"""
     def __init__(
         self,
-        body: Workflow,  # 类型注解使用 Workflow（TYPE_CHECKING 下安全）
+        body: Workflow,
         condition: Callable,
         max_iters: int = 5,
         event_bus = None
-        ):
+    ):
         self.body = body
         self.condition = condition
         self.max_iters = max_iters
+        # 如果没有传入 event_bus，尝试从 body 中获取
         self.event_bus = event_bus or (body.event_bus if hasattr(body, "event_bus") else None)
 
-    async def execute(self, context):
+    async def execute(self, context: Any) -> Any:
         iters = 0
-        await self.event_bus.publish(RunEvent(type="loop_started", data={"max_iters": self.max_iters}))
-        while await self.condition(context) and iters < self.max_iters:
-            # 关键修复：递归调用后继承 output
-            loop_context = await self.body.execute(context.get("input", context))  # 输入继承
-            context.update(loop_context)  # 输出合并
+        if self.event_bus:
+            await self.event_bus.publish(RunEvent(type="loop_started", data={"max_iters": self.max_iters}))
+        
+        # [修复] 这里的 condition 可能是同步 lambda，使用 ensure_awaitable 包装
+        # 只有当 condition 返回 True 且未达到最大迭代次数时继续
+        while (await ensure_awaitable(self.condition, context)) and iters < self.max_iters:
+            # 执行循环体（子 Workflow）
+            # 注意：通常循环会将当前 context 作为输入，并将输出合并回 context
+            # [修复] 调用子 Workflow 时要求返回完整 context，以便捕获副作用（如计数器更新）
+            loop_context = await self.body.execute(context.get("input", context), return_context=True)
+            
+            # 如果结果是字典，更新当前上下文（模拟状态流转）
+            if isinstance(loop_context, dict) and isinstance(context, dict):
+                context.update(loop_context)
             iters += 1
-        await self.event_bus.publish(RunEvent(type="loop_completed", data={"iters": iters}))
+            
+        if self.event_bus:
+            await self.event_bus.publish(RunEvent(type="loop_completed", data={"iters": iters}))
         return context
 
 class Parallel:
-    """并行节点：包装多个子节点，默认 TaskGroup 并行（补：事件广播）"""
-    def __init__(self, steps: List[Callable], event_bus: Optional = None): # type: ignore
+    """并行节点：并发执行多个步骤"""
+    def __init__(self, steps: List[Callable], event_bus: Optional = None):
         self.steps = steps
         self.event_bus = event_bus
 
-    async def execute(self, context):
-        await self.event_bus.publish(RunEvent(type="parallel_started", data={"steps": len(self.steps)}))
-        results = []
-        async def _run_step(step):
-            results.append(await step(context) if asyncio.iscoroutinefunction(step) else step(context))
+    async def execute(self, context: Any) -> List[Any]:
+        if self.event_bus:
+            await self.event_bus.publish(RunEvent(type="parallel_started", data={"steps": len(self.steps)}))
+        
+        # 初始化结果列表，保持顺序
+        results = [None] * len(self.steps)
+        
+        async def _run_step(idx: int, step: Callable):
+            # [修复] 确保每个子步骤都被正确 await
+            try:
+                res = await ensure_awaitable(step, context)
+                results[idx] = res
+            except Exception as e:
+                results[idx] = f"Error: {str(e)}"
 
+        # 使用 AnyIO TaskGroup 进行真·异步并发
         async with anyio.create_task_group() as tg:
-            for step in self.steps:
-                tg.start_soon(_run_step, step)
-        await self.event_bus.publish(RunEvent(type="parallel_completed", data={"results": results}))
+            for idx, step in enumerate(self.steps):
+                tg.start_soon(_run_step, idx, step)
+        
+        if self.event_bus:
+            await self.event_bus.publish(RunEvent(type="parallel_completed", data={"results": results}))
         return results
-    
-class Condition:
-    """条件节点：支持自定义显示名称（增强版）"""
-    def __init__(self, predicate: Callable, name: Optional[str] = None):
-        self.predicate = predicate
-        self.name = name  # 新增：用户可指定标签名
-
-    async def __call__(self, context):
-        return await self.predicate(context) if asyncio.iscoroutinefunction(self.predicate) else self.predicate(context)
