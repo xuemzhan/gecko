@@ -35,12 +35,14 @@ class Workflow:
             raise ValueError(f"节点 {name} 已存在")
         self.nodes[name] = node_func
         self.graph.add_node(name)
+        return
 
     def add_edge(self, from_node: str, to_node: str, condition: Optional[Callable] = None):
         """添加边：支持条件分支（condition 为 callable，返回 bool）"""
         if from_node not in self.nodes or to_node not in self.nodes:
             raise ValueError(f"节点 {from_node} 或 {to_node} 未定义")
         self.graph.add_edge(from_node, to_node, condition=condition)
+        return self
 
     def validate(self):
         """验证 DAG：无环 + 连通（补：检查孤立节点）"""
@@ -49,6 +51,7 @@ class Workflow:
         isolated = list(nx.isolates(self.graph))
         if isolated and set(isolated) - {"start", "end"}:
             raise WorkflowError(f"孤立节点: {isolated}")
+        return self
 
     async def execute(self, input_data: Any) -> Any:
         """异步执行 Workflow（补：超时可选扩展）"""

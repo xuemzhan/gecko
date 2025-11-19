@@ -15,63 +15,41 @@ classifiers = [
     "Intended Audience :: Developers",
     "Topic :: Software Development :: Libraries :: Application Frameworks",
 ]
-dependencies = [
-    "duckduckgo-search>=8.1.1",
-    "chromadb>=1.3.5",
-    "pymilvus>=2.6.3",
-    "qdrant-client>=1.16.0",
-    "sqlmodel>=0.0.27",
-    "lancedb>=0.25.3",
-    "tantivy>=0.25.0",
-    "asyncpg>=0.30.0",
-    "pyarrow>=22.0.0",
-    "redis>=7.0.1",
-]
 
-[tool.hatch.build.targets.wheel]
-packages = ["gecko"]
-
-# 核心依赖：极简、零可选、< 50MB
+# 核心依赖（移出 project，Rye 推荐写法）
 dependencies = [
     "pydantic>=2.9,<3.0",
     "anyio>=4.6,<5.0",
     "typing-extensions>=4.12",
     "pluggy>=1.5",
-]
-
-# 插件式 extras —— 用户按需选择（这就是 Gecko 的精髓）
-[project.optional-dependencies]
-# 90%+ LLM 支持，一行配置搞定
-llm = [
-    "litellm>=1.80.0",
-]
-
-
-# Workflow DAG 编排（基于 networkx）
-workflow = ["networkx>=3.3,<4.0"]
-
-# 企业级可观测性
-otel = ["opentelemetry-api>=1.27.0"]
-
-# 完整生产环境（推荐给大多数用户）
-full = [
-    "litellm>=1.53.0",
     "networkx>=3.3,<4.0",
-    "opentelemetry-api>=1.27.0",
+    # 存储相关（生产默认包含，轻量）
+    "duckduckgo-search>=8.1.1",
+    "lancedb>=0.25.3",
+    "sqlmodel>=0.0.27",
+    "pyarrow>=22.0.0",
 ]
 
-# 开发 & 测试依赖
+[project.optional-dependencies]
+llm = ["litellm>=1.80.0"]
+storage = [
+    "chromadb>=1.3.5",
+    "pymilvus>=2.6.3",
+    "qdrant-client>=1.16.0",
+    "asyncpg>=0.30.0",
+    "redis>=7.0.1",
+]
+otel = ["opentelemetry-api>=1.27.0"]
+full = ["gecko-ai[llm,storage,otel]"]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
+    "pytest-mock>=3.14",
     "ruff>=0.6",
     "mypy>=1.11",
     "httpx>=0.27",
     "hypothesis>=6.100",
 ]
-
-# 兼容层（旧 agno 用户零改动迁移）
-compat = ["gecko-ai[full]"]
 
 [project.urls]
 Homepage = "https://github.com/xuemzhan/gecko"
@@ -79,22 +57,53 @@ Repository = "https://github.com/xuemzhan/gecko"
 Documentation = "https://gecko.ai"
 Issues = "https://github.com/xuemzhan/gecko/issues"
 
-# 插件入口点 —— 社区可以直接贡献模型/工具/存储
 [project.entry-points."gecko.models"]
 [project.entry-points."gecko.tools"]
 [project.entry-points."gecko.storage"]
 
-# 构建系统
+# 构建系统（保持 hatchling）
 [build-system]
-requires = ["hatchling"]   # 或 "pdm-backend" / "poetry-core"
+requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-# 工具配置（rye / ruff / mypy）
+# 关键修复：显式告诉 Hatchling 源码目录
+[tool.hatch.build.targets.wheel]
+packages = ["gecko"]
+
+# Rye 专属配置（只出现一次！）
 [tool.rye]
 dev-dependencies = [
     "gecko-ai[dev]",
+    "pytest-mock>=3.15.1",
 ]
 
+[tool.rye.scripts]
+# 测试相关（核心修复）
+test = "pytest"                          # rye run test → 运行所有测试
+test-cov = "pytest --cov=gecko --cov-report=term-missing"  # 带覆盖率
+test-async = "pytest -m 'not slow'"      # 只跑快速异步测试
+lint = "ruff check ." # 代码质量
+format = "ruff format ."
+typecheck = "mypy gecko"
+publish = "scripts.publish:main" # 发布（保留原有）
+ci = { chain = ["lint", "typecheck", "test-cov"] } # 一键全量检查（CI 推荐）
+
+# 测试配置
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-ra -q --strict-markers"
+markers = [
+    "slow: marks tests as slow",
+    "integration: integration tests",
+    "e2e: end-to-end tests",
+]
+filterwarnings = [
+    "error",
+    "ignore::DeprecationWarning",
+]
+
+# 代码质量工具
 [tool.ruff]
 target-version = "py312"
 line-length = 100
@@ -102,8 +111,3 @@ line-length = 100
 [tool.mypy]
 python_version = "3.12"
 strict = true
-warn_unused_ignores = true
-disallow_untyped_defs = true
-
-[tool.pytest.ini_options]
-asyncio_mode = "auto"

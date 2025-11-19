@@ -1,6 +1,7 @@
 {
     "cSpell.words": [
         "acompletion",
+        "addopts",
         "anns",
         "anyio",
         "asyncio",
@@ -12,6 +13,7 @@
         "ehthumbs",
         "executemany",
         "fetchrow",
+        "filterwarnings",
         "htmlcov",
         "httpx",
         "ipynb",
@@ -36,6 +38,7 @@
         "pymilvus",
         "pytest",
         "qdrant",
+        "repr",
         "ropeproject",
         "scrapy",
         "sdist",
@@ -44,6 +47,7 @@
         "spyderproject",
         "spyproject",
         "sqlmodel",
+        "testpaths",
         "venv",
         "webassets",
         "zhipu"
