@@ -1,28 +1,41 @@
 # tests/conftest.py
+import asyncio
 import pytest
+import litellm
 from unittest.mock import AsyncMock, MagicMock
 from gecko.core.builder import AgentBuilder
 from gecko.core.message import Message
 from gecko.core.output import AgentOutput
 
+# [新增] 自动清理 fixture
+@pytest.fixture(autouse=True)
+async def cleanup_resources():
+    """在每个测试后清理全局资源，防止 ResourceWarning"""
+    yield
+    # 清理 litellm 客户端
+    if hasattr(litellm, "async_http_handler") and litellm.async_http_handler:
+        await litellm.async_http_handler.client.close()
+    if hasattr(litellm, "http_client") and litellm.http_client:
+        # httpx client
+        await litellm.http_client.aclose()
+        
+    # 给予一点时间让底层 socket 关闭
+    await asyncio.sleep(0.01)
 class MockModel:
     async def acompletion(self, messages, **kwargs):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         
         # [核心修复] 显式将 tool_calls 设为 None 或空列表
-        # 否则 MagicMock 属性在 boolean context 下默认为 True，
-        # 导致 Runner 误以为有工具调用，进而引发后续的 Mock 对象泄露到消息历史中。
         mock_response.choices[0].message.tool_calls = None 
         
-        # 安全获取 content，兼容 dict 或对象
+        # 安全获取 content
         last_msg = messages[-1]
         if isinstance(last_msg, dict):
             last_content = last_msg.get('content', '')
         else:
             last_content = getattr(last_msg, 'content', '')
 
-        # 确保内容是字符串
         if not isinstance(last_content, str):
              last_content = str(last_content)
              
