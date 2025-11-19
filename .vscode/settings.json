@@ -1,0 +1,15 @@
+{
+    "cSpell.words": [
+        "acompletion",
+        "anyio",
+        "asyncio",
+        "httpx",
+        "kimi",
+        "litellm",
+        "mypy",
+        "networkx",
+        "pluggy",
+        "pydantic",
+        "pytest"
+    ]
+}

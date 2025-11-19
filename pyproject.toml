@@ -1,0 +1,96 @@
+[project]
+name = "gecko-ai"
+version = "0.1.0"
+description = "Next-gen modular AI Agent framework — Less is More, Plugin First"
+authors = [{ name = "Your Name", email = "zxm0813@gmail.com" }]
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { text = "Apache-2.0" }
+keywords = ["ai-agent", "llm", "rag", "multi-agent", "workflow", "async"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["gecko"]
+
+# 核心依赖：极简、零可选、< 50MB
+dependencies = [
+    "pydantic>=2.9,<3.0",
+    "anyio>=4.6,<5.0",
+    "typing-extensions>=4.12",
+    "pluggy>=1.5",
+]
+
+# 插件式 extras —— 用户按需选择（这就是 Gecko 的精髓）
+[project.optional-dependencies]
+# 90%+ LLM 支持，一行配置搞定
+llm = [
+    "litellm>=1.80.0",
+]
+
+# Workflow DAG 编排（基于 networkx）
+workflow = ["networkx>=3.3,<4.0"]
+
+# 企业级可观测性
+otel = ["opentelemetry-api>=1.27.0"]
+
+# 完整生产环境（推荐给大多数用户）
+full = [
+    "litellm>=1.51.0",
+    "networkx>=3.3,<4.0",
+    "opentelemetry-api>=1.27.0",
+]
+
+# 开发 & 测试依赖
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "httpx>=0.27",
+    "hypothesis>=6.100",
+]
+
+# 兼容层（旧 agno 用户零改动迁移）
+compat = ["gecko-ai[full]"]
+
+[project.urls]
+Homepage = "https://github.com/xuemzhan/gecko"
+Repository = "https://github.com/xuemzhan/gecko"
+Documentation = "https://gecko.ai"
+Issues = "https://github.com/xuemzhan/gecko/issues"
+
+# 插件入口点 —— 社区可以直接贡献模型/工具/存储
+[project.entry-points."gecko.models"]
+[project.entry-points."gecko.tools"]
+[project.entry-points."gecko.storage"]
+
+# 构建系统
+[build-system]
+requires = ["hatchling"]   # 或 "pdm-backend" / "poetry-core"
+build-backend = "hatchling.build"
+
+# 工具配置（rye / ruff / mypy）
+[tool.rye]
+dev-dependencies = [
+    "gecko-ai[dev]",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
