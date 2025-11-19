@@ -1,3 +1,4 @@
+# gecko/core/session.py
 from typing import Dict, Any
 
 class Session:

@@ -15,6 +15,9 @@ classifiers = [
     "Intended Audience :: Developers",
     "Topic :: Software Development :: Libraries :: Application Frameworks",
 ]
+dependencies = [
+    "duckduckgo-search>=8.1.1",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["gecko"]
@@ -42,7 +45,7 @@ otel = ["opentelemetry-api>=1.27.0"]
 
 # 完整生产环境（推荐给大多数用户）
 full = [
-    "litellm>=1.51.0",
+    "litellm>=1.53.0",
     "networkx>=3.3,<4.0",
     "opentelemetry-api>=1.27.0",
 ]

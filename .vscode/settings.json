@@ -3,6 +3,8 @@
         "acompletion",
         "anyio",
         "asyncio",
+        "DDGS",
+        "duckduckgo",
         "httpx",
         "kimi",
         "litellm",
@@ -10,6 +12,7 @@
         "networkx",
         "pluggy",
         "pydantic",
-        "pytest"
+        "pytest",
+        "zhipu"
     ]
 }
