@@ -1,4 +1,6 @@
 # gecko/__init__.py
+from __future__ import annotations
+
 from gecko.core.agent import Agent
 from gecko.core.builder import AgentBuilder
 from gecko.core.message import Message
