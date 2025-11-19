@@ -60,6 +60,19 @@ class AgentBuilder:
     def with_kwargs(self, **kwargs: Any) -> Self:
         self._kwargs.update(kwargs)
         return self
+    
+    # gecko/core/builder.py → 添加两个方法
+    def with_session_storage_url(self, url: str) -> Self:
+        """注入 Session 存储"""
+        from gecko.plugins.storage.factory import get_storage_by_url
+        self._kwargs["session_storage"] = get_storage_by_url(url, required="session")
+        return self
+
+    def with_vector_storage_url(self, url: str) -> Self:
+        """注入 Vector 存储（RAG 用）"""
+        from gecko.plugins.storage.factory import get_storage_by_url
+        self._kwargs["vector_storage"] = get_storage_by_url(url, required="vector")
+        return self
 
     def build(self) -> Agent:
         if not self._model_instance:
