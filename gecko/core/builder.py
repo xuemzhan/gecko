@@ -4,7 +4,6 @@ from typing import Any, Dict, List, Optional, Self
 from gecko.core.agent import Agent
 from gecko.core.session import Session
 from gecko.core.events import EventBus
-from gecko.core.runner import AsyncRunner
 from gecko.core.protocols import ModelProtocol
 
 class AgentBuilder:
@@ -13,15 +12,13 @@ class AgentBuilder:
         self._tools: List[Any] = []
         self._session: Optional[Session] = None
         self._event_bus: Optional[EventBus] = None
+        self._storage: Optional[Any] = None
+        self._vector_storage: Optional[Any] = None  # [新增] 向量存储字段
         self._kwargs: Dict[str, Any] = {}
 
     def with_model(self, model_instance: ModelProtocol) -> Self:
-        """
-        注入模型实例。模型必须实现 ModelProtocol。
-        """
         if not hasattr(model_instance, "acompletion"):
             raise ValueError("Model must implement async acompletion method")
-        
         self._model_instance = model_instance
         return self
 
@@ -41,19 +38,25 @@ class AgentBuilder:
         self._kwargs.update(kwargs)
         return self
     
-    def with_session_storage_url(self, url: str) -> Self:
+    def with_storage(self, url: str) -> Self:
+        """配置 Agent 的 Session 持久化存储"""
         from gecko.plugins.storage.factory import get_storage_by_url
-        self._kwargs["session_storage"] = get_storage_by_url(url, required="session")
+        self._storage = get_storage_by_url(url, required="session")
         return self
+    
+    def with_session_storage_url(self, url: str) -> Self:
+        """with_storage 的别名，兼容旧 API"""
+        return self.with_storage(url)
 
+    # [新增] 修复 AttributeError
     def with_vector_storage_url(self, url: str) -> Self:
+        """配置 Vector 存储（RAG 用）"""
         from gecko.plugins.storage.factory import get_storage_by_url
-        self._kwargs["vector_storage"] = get_storage_by_url(url, required="vector")
+        self._vector_storage = get_storage_by_url(url, required="vector")
         return self
 
     def build(self) -> Agent:
         if not self._model_instance:
-            # [修复] 移除括号 (...)，避免 pytest match 正则歧义
             raise ValueError("Model is required. Call with_model first.")
 
         return Agent(
@@ -61,5 +64,7 @@ class AgentBuilder:
             tools=self._tools,
             session=self._session,
             event_bus=self._event_bus,
+            storage=self._storage,
+            vector_storage=self._vector_storage,  # [新增] 注入向量存储
             **self._kwargs
         )

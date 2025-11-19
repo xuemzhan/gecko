@@ -76,7 +76,7 @@ class Loop:
 
 class Parallel:
     """并行节点：并发执行多个步骤"""
-    def __init__(self, steps: List[Callable], event_bus: Optional = None):
+    def __init__(self, steps: List[Callable], event_bus: Optional = None): # type: ignore
         self.steps = steps
         self.event_bus = event_bus
 

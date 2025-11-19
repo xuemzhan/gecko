@@ -20,13 +20,18 @@ class LanceDBVectorStorage(VectorInterface):
         self.db = lancedb.connect(db_path)
         self.collection_name = collection_name
         self.embedding_dim = embedding_dim
-        self.table = self.db.open_table(collection_name) if collection_name in self.db.table_names() else None
+        # 检查表是否存在
+        if collection_name in self.db.table_names():
+            self.table = self.db.open_table(collection_name)
+        else:
+            self.table = None
 
     async def upsert(self, documents: List[Dict]):
         """插入/更新文档，首次自动创建表"""
         if not documents:
             return
 
+        # 构造 pyarrow 表数据
         data = pa.table({
             "id": [d["id"] for d in documents],
             "vector": [d["embedding"] for d in documents],
@@ -44,7 +49,8 @@ class LanceDBVectorStorage(VectorInterface):
         if self.table is None:
             return []
 
-        results = self.table.search(query_embedding).limit(top_k).to_pylist()
+        # [修复] 使用 to_list() 替代 to_pylist()
+        results = self.table.search(query_embedding).limit(top_k).to_list()
         return [
             {"text": r["text"], "metadata": r["metadata"], "score": 1 - r["_distance"]}
             for r in results

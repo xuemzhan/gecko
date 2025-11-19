@@ -11,6 +11,7 @@ from gecko.core.session import Session
 from gecko.core.events import AppEvent, EventBus
 from gecko.core.exceptions import AgentError
 from gecko.plugins.registry import model_registry, tool_registry, storage_registry
+from gecko.plugins.storage.interfaces import SessionInterface, VectorInterface
 
 class BaseModel(PydanticBaseModel):
     """所有插件的基类，确保 Pydantic 验证"""
@@ -28,6 +29,9 @@ class Agent:
         tools: Optional[List[Any]] = None,
         session: Optional[Session] = None,
         event_bus: Optional[EventBus] = None,
+        storage: Optional[SessionInterface] = None,  # [New] 存储接口
+        vector_storage: Optional[VectorInterface] = None, # [新增] 接收向量存储
+        memory_window: int = 10,                     # [New] 记忆窗口大小
         **kwargs: Any,
     ):
         self.model = model
@@ -36,10 +40,17 @@ class Agent:
         self.event_bus = event_bus or EventBus()
         # 关键修复：Runner 只接收 agent 本身
         self.runner = AsyncRunner(self)   # ← 正确方式
+        self.storage = storage
+        self.vector_storage = vector_storage # [新增] 保存实例
+        self.memory_window = memory_window
         self.kwargs = kwargs
         
 
     async def run(self, messages: List[Message]) -> AgentOutput:
+        # 支持直接传字符串
+        if isinstance(messages, str):
+            messages = [Message(role="user", content=messages)]
+            
         try:
             await self.event_bus.publish(AppEvent(type="run_started", data={"messages": messages}))
             output = await self.runner.execute(messages)
@@ -61,6 +72,9 @@ class Agent:
 
     async def stream(self, messages: List[Message]) -> AsyncIterator[AgentOutput]:
         """流式输出"""
+        if isinstance(messages, str):
+            messages = [Message(role="user", content=messages)]
+            
         async for chunk in self.runner.stream(messages):
             yield chunk
 

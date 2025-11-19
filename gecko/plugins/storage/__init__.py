@@ -1,13 +1,19 @@
 # gecko/plugins/storage/__init__.py
-# 快速开发插件本地注册 + 暴露工厂
-from .factory import get_storage_by_url
+from gecko.plugins.storage.factory import get_storage_by_url
+from gecko.plugins.storage.interfaces import SessionInterface, VectorInterface
 
-# 手动注册核心快速开发插件（0 依赖启动）
-from gecko.plugins.storage.sqlite import SQLiteSessionStorage
-from gecko.plugins.storage.lancedb import LanceDBVectorStorage
-from gecko.plugins.storage.factory import _register_local
+# 显式导入以触发 @register_storage 装饰器
+import gecko.plugins.storage.sqlite
+import gecko.plugins.storage.redis
+try:
+    import gecko.plugins.storage.lancedb
+except ImportError:
+    pass # 允许用户不安装 lancedb
 
-_register_local("sqlite", SQLiteSessionStorage)
-_register_local("lancedb", LanceDBVectorStorage)
+# Postgres 依赖较重，通常作为 extra 安装，这里尝试可选导入
+try:
+    import gecko.plugins.storage.postgres_pgvector
+except ImportError:
+    pass
 
-__all__ = ["get_storage_by_url"]
+__all__ = ["get_storage_by_url", "SessionInterface", "VectorInterface"]

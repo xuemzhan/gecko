@@ -1,86 +1,131 @@
 # gecko/core/runner.py
 from __future__ import annotations
 import asyncio
-from typing import List, Any
+from typing import List
 from gecko.core.message import Message
 from gecko.core.output import AgentOutput
+from gecko.core.utils import ensure_awaitable
 from gecko.plugins.tools.executor import ToolExecutor
 from gecko.plugins.tools.registry import ToolRegistry
-from gecko.core.utils import ensure_awaitable # [修复] 导入
 
 class AsyncRunner:
     def __init__(self, agent):
         self.agent = agent
         self.model = agent.model
 
-    async def execute(self, messages: List[Message], max_turns: int = 5) -> AgentOutput:
-        current_messages = [m.model_dump() for m in messages]
+    async def execute(self, new_messages: List[Message], max_turns: int = 5) -> AgentOutput:
+        # 1. 加载历史记忆 (Load History)
+        history: List[Message] = []
+        if self.agent.storage and self.agent.session.session_id:
+            session_data = await self.agent.storage.get(self.agent.session.session_id)
+            if session_data and "messages" in session_data:
+                # 反序列化消息
+                raw_msgs = session_data["messages"]
+                # 实现滑动窗口 (Sliding Window): 只取最近 N 条
+                window_size = self.agent.memory_window
+                if len(raw_msgs) > window_size:
+                    raw_msgs = raw_msgs[-window_size:]
+                
+                for m in raw_msgs:
+                    try:
+                        history.append(Message(**m))
+                    except Exception:
+                        pass # 忽略格式错误的历史消息
+        
+        # 2. 构建完整上下文 (Context Construction)
+        # 历史 + 新输入
+        context_messages = history + new_messages
+        
+        # 转换为模型可读格式 (Dict)
+        current_messages_dicts = [m.model_dump() for m in context_messages]
+        
         turn = 0
-        last_response = None
-
+        final_response = None
+        
+        # 3. 执行 ReAct 循环
         while turn < max_turns:
             turn += 1
-            # 注入工具 Schema
-            if turn == 1 and self.agent.tools:
-                tools_schema = [tool.parameters for tool in ToolRegistry.list_all()]
-                # 检查 system message 是否存在，不存在则插入，存在则更新
-                has_system = len(current_messages) > 0 and current_messages[0]["role"] == "system"
-                if not has_system:
-                     current_messages.insert(0, {"role": "system", "content": "", "tools": tools_schema})
-                # 注意：实际生产中需要更复杂的 prompt merging
-           
-            # [修复] 使用 ensure_awaitable 调用模型，防止同步/异步混用警告
-            response = await ensure_awaitable(self.model.acompletion, messages=current_messages)
-            last_response = response
-
-            # [修复] Mock 对象兼容性处理
-            # 许多测试 Mock 只有 content 属性，没有 choices 结构
-            if not hasattr(response, "choices"):
-                 if hasattr(response, "content"):
-                      return AgentOutput(content=response.content, raw=response)
-                 if isinstance(response, (str, dict)):
-                      content_str = str(response)
-                      return AgentOutput(content=content_str, raw=response)
-
-            if not response.choices:
-                break
-           
-            choice = response.choices[0]
-            message = choice.message
             
+            # 注入 System Prompt 和 工具定义 (仅在第一轮)
+            if turn == 1 and self.agent.tools:
+                tools_schema = [tool.parameters for tool in ToolRegistry.list_all()] # 简化：实际应只列出 agent.tools
+                # 这里为了简化，假设 tool_registry 包含了所需工具。
+                # 严谨做法：从 self.agent.tools 中提取 schema
+                
+                has_system = len(current_messages_dicts) > 0 and current_messages_dicts[0]["role"] == "system"
+                if not has_system:
+                    # 简单的 System Prompt
+                    current_messages_dicts.insert(0, {
+                        "role": "system", 
+                        "content": "You are a helpful assistant.",
+                        # 部分模型通过 extra_body 传 tools，部分通过 messages，这里视模型实现而定
+                        # Litellm 会自动处理 tools 参数如果传入 acompletion
+                    })
+
+            # 调用模型
+            # 注意：LiteLLM 等适配器通常将 tools 作为 kwargs 传入，而不是 message content
+            # 这里为了简化，我们假设 model.acompletion 处理了 tools 转换
+            response = await ensure_awaitable(
+                self.model.acompletion, 
+                messages=current_messages_dicts
+            )
+            
+            if not hasattr(response, "choices") or not response.choices:
+                # Mock 或 异常响应处理
+                final_content = getattr(response, "content", str(response))
+                final_response = AgentOutput(content=final_content, raw=response)
+                break
+
+            choice = response.choices[0]
+            response_message = choice.message
+            
+            # 追加模型回复到上下文
+            current_messages_dicts.append(response_message.model_dump())
+
             # 处理工具调用
-            if hasattr(message, "tool_calls") and message.tool_calls:
-                current_messages.append(message.model_dump())
+            if hasattr(response_message, "tool_calls") and response_message.tool_calls:
                 calls = []
-                for tc in message.tool_calls:
+                for tc in response_message.tool_calls:
                     try:
-                        # 解析参数，这里简化处理
                         args_str = tc.function.arguments
-                        args = eval(args_str) if isinstance(args_str, str) and args_str.startswith("{") else {}
-                        # 注意：生产环境应该用 json.loads
+                        import json
+                        args = json.loads(args_str) if isinstance(args_str, str) else args_str
                     except:
                         args = {}
                     calls.append({"name": tc.function.name, "arguments": args})
                 
-                # 并行执行工具
+                # 执行工具
                 tool_results = await ToolExecutor.concurrent_execute(calls)
                 
-                # 将结果添加回消息历史
                 for result in tool_results:
-                    current_messages.append({
+                    tool_msg = {
                         "role": "tool",
                         "name": result.tool_name,
                         "content": result.content,
-                        "tool_call_id": tc.id if hasattr(tc, 'id') else None # 补全 tool_call_id
-                    })
-                continue
-           
-            # 正常返回
-            return AgentOutput(content=message.content or "", raw=response)
-       
-        # [修复] 兜底逻辑：如果循环结束且有最后一次响应，尝试提取内容
-        content = "达到最大工具调用轮次"
-        if last_response and hasattr(last_response, "choices") and last_response.choices:
-             content = last_response.choices[0].message.content or content
+                        "tool_call_id": tc.id if hasattr(tc, 'id') else "call_null"
+                    }
+                    current_messages_dicts.append(tool_msg)
+                continue # 进入下一轮，让模型根据工具结果生成回答
+            
+            # 没有工具调用，生成最终结果
+            final_response = AgentOutput(content=response_message.content or "", raw=response)
+            break
         
-        return AgentOutput(content=content, raw=last_response)
+        if not final_response:
+             final_response = AgentOutput(content="Max turns reached without final response")
+
+        # 4. 保存记忆 (Save History)
+        if self.agent.storage and self.agent.session.session_id:
+            # 保存最新的 current_messages_dicts
+            # 注意：这里保存了 System Prompt 和 Tool Calls 过程
+            # 生产环境可能需要清洗（比如去掉中间步骤，只留 User/Assistant）
+            await self.agent.storage.set(
+                self.agent.session.session_id, 
+                {"messages": current_messages_dicts}
+            )
+
+        return final_response
+
+    async def stream(self, messages):
+        # 简单的流式透传，Day 3 完善
+        yield AgentOutput(content="Streaming not fully implemented in Day 1")

@@ -1,36 +1,53 @@
 # gecko/plugins/storage/factory.py
 from __future__ import annotations
-from typing import Dict, Any, Callable
-from importlib.metadata import entry_points
+import importlib
+import logging
+from urllib.parse import urlparse
+from gecko.plugins.storage.registry import _STORAGE_FACTORIES
 
-# 本地注册表（快速开发插件）
-_LOCAL_FACTORIES: Dict[str, Callable] = {}
-
-def _register_local(scheme: str, cls: Any):
-    """内部注册函数，供 __init__.py 使用"""
-    if scheme in _LOCAL_FACTORIES:
-        raise ValueError(f"本地存储 {scheme} 已注册")
-    def factory(storage_url: str, **overrides):
-        return cls(storage_url=storage_url, **overrides)
-    _LOCAL_FACTORIES[scheme] = factory
+logger = logging.getLogger(__name__)
 
 def get_storage_by_url(storage_url: str, required: str = "any", **overrides) -> Any:
     """
-    终极工厂：本地优先 + entry_points 兜底
+    根据 URL 自动初始化对应的存储后端
     """
-    scheme = storage_url.split("://")[0].split("+")[0]
+    if "://" in storage_url:
+        scheme = storage_url.split("://")[0]
+    else:
+        raise ValueError(f"无效的存储 URL: {storage_url}")
+
+    # 1. 查找已注册的工厂
+    factory = _STORAGE_FACTORIES.get(scheme)
+
+    # 2. [优化] 如果未找到，尝试动态导入同名模块 (gecko.plugins.storage.{scheme})
+    if not factory:
+        try:
+            module_name = f"gecko.plugins.storage.{scheme}"
+            logger.debug(f"尝试动态加载存储插件: {module_name}")
+            importlib.import_module(module_name)
+            # 重新获取
+            factory = _STORAGE_FACTORIES.get(scheme)
+        except ImportError as e:
+            # 如果是因为缺少依赖包（如 lancedb），抛出更明确的错误
+            if scheme in str(e) and "No module named" not in str(e):
+                raise ImportError(f"加载存储插件 {scheme} 失败，请安装对应依赖: {e}")
+            pass
+        except Exception as e:
+            logger.warning(f"动态加载存储插件 {scheme} 失败: {e}")
+
+    if not factory:
+        # 尝试加载外部插件（entry_points）
+        raise ValueError(f"未找到存储实现: {scheme}。\n"
+                         f"请确保：\n"
+                         f"1. 已安装对应依赖 (如 `rye add lancedb`)\n"
+                         f"2. URL 协议头正确 (如 lancedb://)")
+
+    instance = factory(storage_url, **overrides)
     
-    # 1. 优先本地注册（快速开发）
-    factory = _LOCAL_FACTORIES.get(scheme)
-    if factory:
-        return factory(storage_url, **overrides)
-    
-    # 2. 其次 entry_points（生产插件）
-    for ep in entry_points(group="gecko.storage"):
-        if ep.name == scheme:
-            factory_cls = ep.load()
-            return factory_cls(storage_url, **overrides)
-    
-    raise ValueError(f"未找到存储实现: {scheme}\n"
-                     f"  - 快速开发支持: sqlite, lancedb\n"
-                     f"  - 生产插件需 pip install gecko-postgres / gecko-milvus 等")
+    # 简单的接口检查
+    if required == "session" and not hasattr(instance, "get"):
+         raise TypeError(f"存储 {scheme} 不支持 Session 接口")
+    if required == "vector" and not hasattr(instance, "search"):
+         raise TypeError(f"存储 {scheme} 不支持 Vector 接口")
+
+    return instance
