@@ -1,85 +1,84 @@
+# gecko/core/agent.py
 from __future__ import annotations
 
-import asyncio
-from typing import Any, Dict, List, Optional, Union, AsyncIterator
-from pydantic import BaseModel as PydanticBaseModel
+from typing import Any, List, Optional, Type
+from pydantic import BaseModel
 
 from gecko.core.message import Message
 from gecko.core.output import AgentOutput
-from gecko.core.runner import AsyncRunner
 from gecko.core.session import Session
-from gecko.core.events import AppEvent, EventBus
-from gecko.core.exceptions import AgentError
-from gecko.plugins.registry import model_registry, tool_registry, storage_registry
-from gecko.plugins.storage.interfaces import SessionInterface, VectorInterface
-
-class BaseModel(PydanticBaseModel):
-    """所有插件的基类，确保 Pydantic 验证"""
+from gecko.core.events import EventBus, AppEvent
+from gecko.core.toolbox import ToolBox
+from gecko.core.memory import TokenMemory
+from gecko.core.engine.base import CognitiveEngine
+from gecko.core.engine.react import ReActEngine
+from gecko.plugins.storage.interfaces import SessionInterface
 
 class Agent:
     """
-    Gecko 核心 Agent 类：极简执行循环。
-    - 无配置参数，所有通过 Builder 注入。
-    - 负责消息处理、模型调用、工具执行、事件广播。
+    Gecko Agent (v2.0 Refactored)
+    组件容器：组装 ToolBox, Memory, Engine
     """
-
     def __init__(
         self,
         model: Any,
-        tools: Optional[List[Any]] = None,
-        session: Optional[Session] = None,
+        toolbox: ToolBox,
+        memory: TokenMemory,
+        engine_cls: Type[CognitiveEngine] = ReActEngine,
         event_bus: Optional[EventBus] = None,
-        storage: Optional[SessionInterface] = None,  # [New] 存储接口
-        vector_storage: Optional[VectorInterface] = None, # [新增] 接收向量存储
-        memory_window: int = 10,                     # [New] 记忆窗口大小
-        **kwargs: Any,
+        **engine_kwargs
     ):
-        self.model = model
-        self.tools = tools or []
-        self.session = session or Session()
         self.event_bus = event_bus or EventBus()
-        # 关键修复：Runner 只接收 agent 本身
-        self.runner = AsyncRunner(self)   # ← 正确方式
-        self.storage = storage
-        self.vector_storage = vector_storage # [新增] 保存实例
-        self.memory_window = memory_window
-        self.kwargs = kwargs
         
+        # 核心组件
+        self.toolbox = toolbox
+        self.memory = memory
+        
+        # 初始化引擎 (依赖注入)
+        self.engine = engine_cls(
+            model=model, 
+            toolbox=toolbox, 
+            memory=memory,
+            **engine_kwargs
+        )
 
-    async def run(self, messages: List[Message]) -> AgentOutput:
-        # 支持直接传字符串
+    async def run(self, messages: str | List[Message] | Dict) -> AgentOutput:
+        """
+        统一执行入口
+        """
+        # 1. 标准化输入
         if isinstance(messages, str):
-            messages = [Message(role="user", content=messages)]
-            
+            input_msgs = [Message(role="user", content=messages)]
+        elif isinstance(messages, dict):
+             # 兼容 workflow 传入的 context dict
+             content = messages.get("input", str(messages))
+             input_msgs = [Message(role="user", content=content)]
+        elif isinstance(messages, list):
+            input_msgs = messages
+        else:
+            raise ValueError("Invalid input type")
+
+        # 2. 触发事件
+        await self.event_bus.publish(AppEvent(type="run_started", data={"input": input_msgs}))
+
         try:
-            await self.event_bus.publish(AppEvent(type="run_started", data={"messages": messages}))
-            output = await self.runner.execute(messages)
+            # 3. 委托给引擎执行
+            output = await self.engine.step(input_msgs)
+            
             await self.event_bus.publish(AppEvent(type="run_completed", data={"output": output}))
             return output
-        except Exception as e:
-            error_msg = f"Agent run failed: {type(e).__name__}: {str(e)}"
-            print(f"\n❌ Gecko Error: {error_msg}")  # 立即打印，永不吞噬
-            await self.event_bus.publish(AppEvent(
-                type="run_error",
-                error=error_msg,           # 使用新字段
-                data={"exception": str(e)}
-            ))
-            raise AgentError(error_msg) from e
-
-    def sync_run(self, messages: List[Message]) -> AgentOutput:
-        """同步包装（薄层）"""
-        return asyncio.run(self.run(messages))
-
-    async def stream(self, messages: List[Message]) -> AsyncIterator[AgentOutput]:
-        """流式输出"""
-        if isinstance(messages, str):
-            messages = [Message(role="user", content=messages)]
             
-        async for chunk in self.runner.stream(messages):
-            yield chunk
-
-    # 扩展方法：如 add_tool, 但鼓励用 Builder
-    def add_tool(self, tool: BaseModel):
-        self.tools.append(tool)
-        
+        except Exception as e:
+            await self.event_bus.publish(AppEvent(type="run_error", error=str(e)))
+            raise e
     
+    # 增加生命周期管理
+    async def startup(self):
+        """启动所有工具资源"""
+        # 未来遍历 toolbox 调用 tool.startup()
+        pass
+
+    async def shutdown(self):
+        """释放资源"""
+        # 未来遍历 toolbox 调用 tool.shutdown()
+        pass

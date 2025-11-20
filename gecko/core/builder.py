@@ -1,70 +1,61 @@
 # gecko/core/builder.py
-from typing import Any, Dict, List, Optional, Self
-
+# ... imports
+from typing import Any, List
 from gecko.core.agent import Agent
+from gecko.core.toolbox import ToolBox
+from gecko.core.memory import TokenMemory
 from gecko.core.session import Session
-from gecko.core.events import EventBus
-from gecko.core.protocols import ModelProtocol
+from gecko.core.engine.react import ReActEngine # 默认引擎
 
 class AgentBuilder:
     def __init__(self):
-        self._model_instance: ModelProtocol | None = None
-        self._tools: List[Any] = []
-        self._session: Optional[Session] = None
-        self._event_bus: Optional[EventBus] = None
-        self._storage: Optional[Any] = None
-        self._vector_storage: Optional[Any] = None  # [新增] 向量存储字段
-        self._kwargs: Dict[str, Any] = {}
+        self._model = None
+        self._tools = []
+        self._session_id = "default"
+        self._storage = None
+        self._max_tokens = 4000
+        self._system_prompt = None
+        # ... 其他
 
-    def with_model(self, model_instance: ModelProtocol) -> Self:
-        if not hasattr(model_instance, "acompletion"):
-            raise ValueError("Model must implement async acompletion method")
-        self._model_instance = model_instance
+    def with_model(self, model):
+        self._model = model
         return self
 
-    def with_tools(self, tools: List[Any]) -> Self:
+    def with_tools(self, tools: List[Any]):
         self._tools.extend(tools)
         return self
-
-    def with_session(self, session: Session) -> Self:
-        self._session = session
+        
+    def with_storage(self, storage):
+        self._storage = storage
+        return self
+        
+    def with_session_id(self, session_id: str):
+        self._session_id = session_id
         return self
 
-    def with_event_bus(self, event_bus: EventBus) -> Self:
-        self._event_bus = event_bus
-        return self
-
-    def with_kwargs(self, **kwargs: Any) -> Self:
-        self._kwargs.update(kwargs)
-        return self
-    
-    def with_storage(self, url: str) -> Self:
-        """配置 Agent 的 Session 持久化存储"""
-        from gecko.plugins.storage.factory import get_storage_by_url
-        self._storage = get_storage_by_url(url, required="session")
-        return self
-    
-    def with_session_storage_url(self, url: str) -> Self:
-        """with_storage 的别名，兼容旧 API"""
-        return self.with_storage(url)
-
-    # [新增] 修复 AttributeError
-    def with_vector_storage_url(self, url: str) -> Self:
-        """配置 Vector 存储（RAG 用）"""
-        from gecko.plugins.storage.factory import get_storage_by_url
-        self._vector_storage = get_storage_by_url(url, required="vector")
+    def with_system_prompt(self, prompt: str):
+        self._system_prompt = prompt
         return self
 
     def build(self) -> Agent:
-        if not self._model_instance:
-            raise ValueError("Model is required. Call with_model first.")
+        if not self._model:
+            raise ValueError("Model is required")
 
-        return Agent(
-            model=self._model_instance,
-            tools=self._tools,
-            session=self._session,
-            event_bus=self._event_bus,
+        # 1. 构建组件
+        toolbox = ToolBox(self._tools)
+        
+        memory = TokenMemory(
+            session_id=self._session_id,
             storage=self._storage,
-            vector_storage=self._vector_storage,  # [新增] 注入向量存储
-            **self._kwargs
+            max_tokens=self._max_tokens
+        )
+        
+        # 2. 组装 Agent
+        return Agent(
+            model=self._model,
+            toolbox=toolbox,
+            memory=memory,
+            engine_cls=ReActEngine,
+            system_prompt=self._system_prompt
+            # 可传递其他 kwargs 给 engine
         )

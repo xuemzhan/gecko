@@ -50,6 +50,7 @@
         "spyproject",
         "sqlmodel",
         "testpaths",
+        "tmpl",
         "venv",
         "webassets",
         "zhipu"

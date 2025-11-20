@@ -2,32 +2,47 @@
 from __future__ import annotations
 import asyncio
 import anyio
-from typing import List, Any, Dict, Callable
-from gecko.core.agent import Agent  # 集成 Day1 Agent
-from gecko.core.message import Message  # 补导入
+from typing import List, Any, Dict, Union
+from gecko.core.agent import Agent
+# 假设 WorkflowContext 在运行时作为 Any 传入，这里做 duck typing
 
 class Team:
     """
-    Team 节点：多 Agent 并行执行，作为 Workflow 的特殊节点
-    - 支持异步并行：AnyIO TaskGroup
-    - 结果聚合：默认合并输出，可自定义 aggregator（补：强制 await）
-    - 集成 Workflow：可作为 @step 节点嵌入 DAG
+    并行执行多个 Agent，聚合结果
     """
-    def __init__(self, members: List[Agent], aggregator: Callable = lambda results: results):
+    def __init__(self, members: List[Agent]):
         self.members = members
-        self.aggregator = aggregator
 
-    async def execute(self, context: Dict) -> Any:
-        """并行执行所有成员 Agent"""
+    # [新增] __call__ 方法，使 Team 实例可被直接调用，满足 Workflow 节点协议
+    async def __call__(self, context_or_input: Any) -> List[Any]:
+        """
+        允许 Team 实例像函数一样被调用：await team(context)
+        """
+        return await self.execute(context_or_input)
+
+    async def execute(self, context_or_input: Any) -> List[Any]:
+        """
+        执行 Team 逻辑
+        """
+        # 解析输入：兼容直接传值或 WorkflowContext 对象
+        # 使用 getattr 避免循环导入 WorkflowContext 定义
+        if hasattr(context_or_input, "history") and hasattr(context_or_input, "input"):
+            # 是 WorkflowContext，尝试获取上一步输出，否则取全局 input
+            history = getattr(context_or_input, "history", {})
+            inp = history.get("last_output", getattr(context_or_input, "input", None))
+        else:
+            inp = context_or_input
+
         results = [None] * len(self.members)
-        async def _run_member(idx: int, agent: Agent):
-            messages = [Message(role="user", content=context.get("input"))]
-            output = await agent.run(messages)
-            results[idx] = output.content  # 简化，实际可取 full output
 
+        async def _run_one(idx, agent):
+            # Agent.run 现在健壮地处理 str 或 Message
+            res = await agent.run(inp)
+            results[idx] = res.content
+
+        # 并发执行
         async with anyio.create_task_group() as tg:
-            for idx, member in enumerate(self.members):
-                tg.start_soon(_run_member, idx, member)
+            for idx, agent in enumerate(self.members):
+                tg.start_soon(_run_one, idx, agent)
 
-        # 补：异步 aggregator
-        return await self.aggregator(results) if asyncio.iscoroutinefunction(self.aggregator) else self.aggregator(results)
+        return results
