@@ -1,8 +1,8 @@
-# gecko/plugins/models/zhipu.py  —— 删除继承，只保留协议兼容
+# gecko/plugins/models/zhipu.py
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, AsyncIterator # [新增] 导入 AsyncIterator
 
 import litellm
 from pydantic import BaseModel, Field
@@ -25,9 +25,10 @@ class ZhipuGLM(BaseModel):
         os.environ.setdefault("ZHIPU_API_KEY", self.api_key)
 
     async def acompletion(self, messages: list[dict], **kwargs) -> Any:
+        # [保持不变]
         params = {
             "model": self.model,
-            "messages": messages,
+            "messages": messages, # 这里的 messages 已经被 Engine 序列化为标准字典了
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "timeout": self.timeout,
@@ -38,6 +39,27 @@ class ZhipuGLM(BaseModel):
             **kwargs,
         }
         return await litellm.acompletion(**params)
+
+    # [新增] 实现流式接口
+    async def astream(self, messages: list[dict], **kwargs) -> AsyncIterator[Any]:
+        params = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "timeout": self.timeout,
+            "custom_llm_provider": "openai",
+            "api_base": self.base_url,
+            "api_key": self.api_key,
+            "stream": True,  # 开启流式
+            **self.extra_kwargs,
+            **kwargs,
+        }
+        
+        # litellm 在 stream=True 时返回 AsyncGenerator
+        response_iterator = await litellm.acompletion(**params)
+        async for chunk in response_iterator:
+            yield chunk
 
 def glm_4_5_air(api_key: str | None = None, **kwargs) -> ZhipuGLM:
     return ZhipuGLM(api_key=api_key or "3bd5e6fdc377489c80dbb435b84d7560.izN8bDXCVR1FNSYS", **kwargs)

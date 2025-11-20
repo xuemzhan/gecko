@@ -4,6 +4,7 @@
         "addopts",
         "anns",
         "anyio",
+        "astream",
         "asyncio",
         "asyncpg",
         "autouse",

@@ -4,7 +4,12 @@ import asyncio
 from typing import Any, Dict, Callable, Optional, List, Set, Tuple
 from pydantic import BaseModel
 
-from gecko.core.events import EventBus, RunEvent
+from gecko.core.events import EventBus, BaseEvent
+
+# 定义 Workflow 专用事件
+class WorkflowEvent(BaseEvent):
+    pass
+
 from gecko.core.agent import Agent
 from gecko.compose.nodes import Next, ensure_awaitable
 
@@ -65,7 +70,9 @@ class Workflow:
         current_node_name = self.start_node
         steps_count = 0
         
-        await self.event_bus.publish(RunEvent(type="workflow_started", data={"name": self.name}))
+        await self.event_bus.publish(
+             WorkflowEvent(type="workflow_started", data={"name": self.name, "input": str(input_data)})
+        )
 
         while current_node_name and current_node_name != "END":
             if steps_count >= self.max_steps:
@@ -80,7 +87,9 @@ class Workflow:
             # 简单起见，统一传 context，节点内部自己解析
             # 或者：如果是 Agent，取 context.input 或上一步结果
             
-            await self.event_bus.publish(RunEvent(type="node_started", data={"node": current_node_name}))
+            await self.event_bus.publish(
+                WorkflowEvent(type="node_started", data={"node": current_node_name})
+            )
             
             try:
                 # 执行节点
@@ -96,10 +105,14 @@ class Workflow:
                 context.history[current_node_name] = result
                 context.history["last_output"] = result # 方便链式调用
                 
-                await self.event_bus.publish(RunEvent(type="node_completed", data={"node": current_node_name, "result": str(result)}))
+                await self.event_bus.publish(
+                    WorkflowEvent(type="node_completed", data={"node": current_node_name, "result": str(result)})
+                )
 
             except Exception as e:
-                await self.event_bus.publish(RunEvent(type="node_error", error=str(e)))
+                await self.event_bus.publish(
+                    WorkflowEvent(type="node_error", error=str(e), data={"node": current_node_name})
+                )
                 raise e
 
             # 3. 路由决议 (Routing)

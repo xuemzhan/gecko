@@ -1,24 +1,21 @@
 # gecko/core/agent.py
 from __future__ import annotations
-
-from typing import Any, List, Optional, Type
+from typing import Any, List, Optional, Type, Dict, AsyncIterator, Union
 from pydantic import BaseModel
 
 from gecko.core.message import Message
 from gecko.core.output import AgentOutput
-from gecko.core.session import Session
-from gecko.core.events import EventBus, AppEvent
+from gecko.core.events import EventBus, BaseEvent  # [修改] 引入通用事件基类
 from gecko.core.toolbox import ToolBox
 from gecko.core.memory import TokenMemory
 from gecko.core.engine.base import CognitiveEngine
 from gecko.core.engine.react import ReActEngine
-from gecko.plugins.storage.interfaces import SessionInterface
 
+# 定义具体的事件类型 (建议放在 agent.py 或单独的 events 定义文件中)
+class AgentRunEvent(BaseEvent):
+    type: str = "agent_run" # 默认值，实际使用时覆盖
+    
 class Agent:
-    """
-    Gecko Agent (v2.0 Refactored)
-    组件容器：组装 ToolBox, Memory, Engine
-    """
     def __init__(
         self,
         model: Any,
@@ -29,28 +26,20 @@ class Agent:
         **engine_kwargs
     ):
         self.event_bus = event_bus or EventBus()
-        
-        # 核心组件
         self.toolbox = toolbox
         self.memory = memory
-        
-        # 初始化引擎 (依赖注入)
-        self.engine = engine_cls(
-            model=model, 
-            toolbox=toolbox, 
-            memory=memory,
-            **engine_kwargs
-        )
+        self.engine = engine_cls(model=model, toolbox=toolbox, memory=memory, **engine_kwargs)
 
-    async def run(self, messages: str | List[Message] | Dict) -> AgentOutput:
-        """
-        统一执行入口
-        """
+    async def run(
+        self, 
+        messages: str | List[Message] | Dict,
+        response_model: Optional[Type[BaseModel]] = None
+    ) -> AgentOutput | BaseModel:
+        
         # 1. 标准化输入
         if isinstance(messages, str):
             input_msgs = [Message(role="user", content=messages)]
         elif isinstance(messages, dict):
-             # 兼容 workflow 传入的 context dict
              content = messages.get("input", str(messages))
              input_msgs = [Message(role="user", content=content)]
         elif isinstance(messages, list):
@@ -58,27 +47,46 @@ class Agent:
         else:
             raise ValueError("Invalid input type")
 
-        # 2. 触发事件
-        await self.event_bus.publish(AppEvent(type="run_started", data={"input": input_msgs}))
+        # [修改] 发布事件：使用新版 EventBus API
+        # wait=False 表示非阻塞发布（除非这对业务流至关重要，否则建议 False）
+        await self.event_bus.publish(
+            AgentRunEvent(type="run_started", data={"input": [m.to_api_payload() for m in input_msgs]})
+        )
 
         try:
-            # 3. 委托给引擎执行
-            output = await self.engine.step(input_msgs)
+            output = await self.engine.step(input_msgs, response_model=response_model)
             
-            await self.event_bus.publish(AppEvent(type="run_completed", data={"output": output}))
+            # 准备事件数据
+            evt_data = output.model_dump() if isinstance(output, BaseModel) else output
+            
+            await self.event_bus.publish(
+                AgentRunEvent(type="run_completed", data={"output": evt_data})
+            )
             return output
             
         except Exception as e:
-            await self.event_bus.publish(AppEvent(type="run_error", error=str(e)))
+            await self.event_bus.publish(
+                AgentRunEvent(type="run_error", error=str(e), data={"input": str(input_msgs)})
+            )
             raise e
-    
-    # 增加生命周期管理
-    async def startup(self):
-        """启动所有工具资源"""
-        # 未来遍历 toolbox 调用 tool.startup()
-        pass
 
-    async def shutdown(self):
-        """释放资源"""
-        # 未来遍历 toolbox 调用 tool.shutdown()
-        pass
+    async def stream(self, messages: str | List[Message]) -> AsyncIterator[str]:
+        if isinstance(messages, str):
+            input_msgs = [Message(role="user", content=messages)]
+        else:
+            input_msgs = messages
+            
+        # 流式开始事件
+        await self.event_bus.publish(AgentRunEvent(type="stream_started"))
+        
+        try:
+            async for token in self.engine.step_stream(input_msgs):
+                yield token
+                # 可选：发布 token 事件（高频事件，慎用 wait=True）
+                # await self.event_bus.publish(AgentRunEvent(type="stream_chunk", data={"chunk": token}))
+            
+            await self.event_bus.publish(AgentRunEvent(type="stream_completed"))
+            
+        except Exception as e:
+            await self.event_bus.publish(AgentRunEvent(type="stream_error", error=str(e)))
+            raise e
