@@ -2,122 +2,131 @@ import os
 from pathlib import Path
 
 
-def scan_python_files(source_paths, output_file):
+def generate_tree(directory, prefix="", is_last=True, output_lines=None, 
+                  show_hidden=False, max_depth=None, current_depth=0):
     """
-    扫描指定目录或文件列表中的所有Python文件,并将内容整合到一个文件中
+    生成目录树结构
     
     参数:
-        source_paths: 要扫描的源目录或文件路径列表
-        output_file: 输出文件路径
+        directory: 目录路径
+        prefix: 当前行的前缀
+        is_last: 是否是最后一个项目
+        output_lines: 输出行列表
+        show_hidden: 是否显示隐藏文件
+        max_depth: 最大深度限制
+        current_depth: 当前深度
     """
-    # 收集所有Python文件
-    python_files = []
+    if output_lines is None:
+        output_lines = []
     
-    for source in source_paths:
-        source_path = Path(source).resolve()
+    directory = Path(directory)
+    
+    # 检查深度限制
+    if max_depth is not None and current_depth >= max_depth:
+        return output_lines
+    
+    try:
+        # 获取目录内容并排序(目录在前,文件在后)
+        items = sorted(directory.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
         
-        # 检查路径是否存在
-        if not source_path.exists():
-            print(f"警告: 路径 '{source}' 不存在,跳过...")
-            continue
+        # 过滤隐藏文件
+        if not show_hidden:
+            items = [item for item in items if not item.name.startswith('.')]
         
-        # 如果是文件
-        if source_path.is_file():
-            if source_path.suffix == '.py' or source_path.suffix == '.toml':
-                python_files.append(source_path)
+        for index, item in enumerate(items):
+            is_last_item = (index == len(items) - 1)
+            
+            # 确定连接符号
+            connector = "└── " if is_last_item else "├── "
+            
+            # 添加当前项
+            if item.is_dir():
+                output_lines.append(f"{prefix}{connector}{item.name}/")
+                
+                # 递归处理子目录
+                extension = "    " if is_last_item else "│   "
+                generate_tree(item, prefix + extension, is_last_item, 
+                            output_lines, show_hidden, max_depth, current_depth + 1)
             else:
-                print(f"警告: '{source}' 不是Python文件,跳过...")
-        # 如果是目录
-        elif source_path.is_dir():
-            for root, dirs, files in os.walk(source_path):
-                for file in files:
-                    if file.endswith('.py'):
-                        file_path = Path(root) / file
-                        python_files.append(file_path)
+                output_lines.append(f"{prefix}{connector}{item.name}")
     
-    # 去重并排序
-    python_files = sorted(set(python_files))
+    except PermissionError:
+        output_lines.append(f"{prefix}[Permission Denied]")
     
-    if not python_files:
-        print(f"没有找到任何Python文件")
+    return output_lines
+
+
+def save_tree_to_file(directory, output_file, show_hidden=False, max_depth=None):
+    """
+    将目录树保存到文件
+    
+    参数:
+        directory: 要扫描的目录
+        output_file: 输出文件路径
+        show_hidden: 是否显示隐藏文件
+        max_depth: 最大深度限制
+    """
+    directory = Path(directory).resolve()
+    
+    if not directory.exists():
+        print(f"错误: 目录 '{directory}' 不存在!")
         return
     
-    # 获取当前工作目录
-    current_dir = Path.cwd()
+    if not directory.is_dir():
+        print(f"错误: '{directory}' 不是一个目录!")
+        return
     
-    # 写入输出文件
-    with open(output_file, 'w', encoding='utf-8') as out_f:
-        for index, py_file in enumerate(python_files, start=1):
-            # 计算相对于当前工作目录的路径
-            try:
-                display_path = py_file.relative_to(current_dir)
-            except ValueError:
-                # 如果无法计算相对路径，使用绝对路径
-                display_path = py_file
-            
-            # 写入文件头信息
-            out_f.write(f"[{index}] {display_path}\n")
-            out_f.write("```python\n")
-            
-            # 读取并写入Python文件内容
-            try:
-                with open(py_file, 'r', encoding='utf-8') as py_f:
-                    content = py_f.read()
-                    out_f.write(content)
-                    # 确保内容以换行结束
-                    if content and not content.endswith('\n'):
-                        out_f.write('\n')
-            except Exception as e:
-                out_f.write(f"# 读取文件时出错: {str(e)}\n")
-            
-            out_f.write("```\n\n")
+    print(f"正在扫描目录: {directory}")
     
-    print(f"成功! 共处理 {len(python_files)} 个Python文件")
-    print(f"输出文件: {output_file}")
+    # 生成目录树
+    tree_lines = [f"{directory.name}/"]
+    generate_tree(directory, "", True, tree_lines, show_hidden, max_depth)
+    
+    # 写入文件
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(tree_lines))
+    
+    print(f"成功! 共扫描 {len(tree_lines)} 行")
+    print(f"目录树已保存到: {output_file}")
+    
+    # 同时在控制台显示
+    print("\n目录结构预览:")
+    print("=" * 50)
+    for line in tree_lines[:50]:  # 只显示前50行
+        print(line)
+    if len(tree_lines) > 50:
+        print(f"... (还有 {len(tree_lines) - 50} 行,请查看输出文件)")
 
 
 def main():
     """主函数"""
-    print("Python文件扫描整合工具")
-    print("=" * 50)
-    print("支持输入多个目录或文件路径,用空格、逗号或分号分隔")
-    print("例如: /path/to/dir1 /path/to/file.py /path/to/dir2")
-    print("或者: /path/to/dir1, /path/to/file.py, /path/to/dir2")
+    print("目录结构扫描工具")
     print("=" * 50)
     
-    # 获取输入路径
-    paths_input = input("\n请输入要扫描的目录或文件路径: ").strip()
+    # 获取目录路径
+    directory = input("请输入要扫描的目录路径: ").strip()
     
-    # 分割路径(支持逗号、分号或空格分隔)
-    if ',' in paths_input:
-        source_paths = [p.strip() for p in paths_input.split(',')]
-    elif ';' in paths_input:
-        source_paths = [p.strip() for p in paths_input.split(';')]
-    else:
-        # 使用空格分割
-        source_paths = paths_input.split()
-    
-    # 过滤空路径
-    source_paths = [p for p in source_paths if p]
-    
-    if not source_paths:
-        print("错误: 未输入任何路径!")
+    if not directory:
+        print("错误: 未输入目录路径!")
         return
     
-    print(f"\n将扫描以下 {len(source_paths)} 个路径:")
-    for i, p in enumerate(source_paths, 1):
-        print(f"  {i}. {p}")
-    
     # 获取输出文件名
-    output_filename = input("\n请输入输出文件名 (默认: python_files_collection.txt): ").strip()
+    output_file = input("请输入输出文件名 (默认: directory_tree.txt): ").strip()
+    if not output_file:
+        output_file = "directory_tree.txt"
     
-    # 设置默认输出文件名
-    if not output_filename:
-        output_filename = "python_files_collection.txt"
+    # 是否显示隐藏文件
+    show_hidden_input = input("是否显示隐藏文件? (y/n, 默认: n): ").strip().lower()
+    show_hidden = show_hidden_input == 'y'
     
-    print(f"\n开始扫描...")
-    # 执行扫描
-    scan_python_files(source_paths, output_filename)
+    # 深度限制
+    max_depth_input = input("最大扫描深度 (留空表示无限制): ").strip()
+    max_depth = None
+    if max_depth_input.isdigit():
+        max_depth = int(max_depth_input)
+    
+    print("\n开始扫描...")
+    save_tree_to_file(directory, output_file, show_hidden, max_depth)
 
 
 if __name__ == "__main__":
