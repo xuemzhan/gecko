@@ -24,6 +24,7 @@
         "litellm",
         "metadatas",
         "milvus",
+        "multimodal",
         "mypy",
         "networkx",
         "nosetests",
