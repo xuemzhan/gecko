@@ -1,4 +1,4 @@
-# tests/unit/test_workflow.py
+# tests/compose/test_workflow.py
 """Workflow 模块测试"""
 import pytest
 from gecko.compose.workflow import Workflow, WorkflowContext, Next
@@ -18,9 +18,11 @@ def test_add_node():
     """测试添加节点"""
     wf = Workflow()
     
-    @wf.add_node("node_a", lambda ctx: "result_a")
+    # [修复] 移除装饰器语法，改为直接调用
     def node_a(ctx):
         return "result_a"
+        
+    wf.add_node("node_a", node_a)
     
     assert "node_a" in wf.nodes
     assert wf.nodes["node_a"] is node_a
@@ -96,10 +98,9 @@ def test_validate_success():
     assert is_valid is True
     assert len(wf.get_validation_errors()) == 0
 
-def test_unreachable_nodes_warning(caplog):
+def test_unreachable_nodes_warning(capsys):
     """测试孤立节点警告"""
-    import logging
-    caplog.set_level(logging.WARNING)
+    # [修复] 使用 capsys 替代 caplog，因为 structlog 可能直接输出到 stdout
     
     wf = Workflow()
     
@@ -110,8 +111,12 @@ def test_unreachable_nodes_warning(caplog):
     
     wf.validate()
     
+    # 获取标准输出
+    captured = capsys.readouterr()
+    combined_output = (captured.out + captured.err).lower()
+    
     # 应该有警告日志
-    assert any("unreachable" in record.message.lower() for record in caplog.records)
+    assert "unreachable" in combined_output
 
 # ========== 执行测试 ==========
 
@@ -253,7 +258,8 @@ async def test_execution_tracking():
     async def capture_wrapper(input_data):
         nonlocal captured_context
         ctx = WorkflowContext(input=input_data)
-        result = await wf._execute_loop(ctx)
+        # [修复] 手动调用内部方法时，补充 session_id=None
+        result = await wf._execute_loop(ctx, session_id=None)
         captured_context = ctx
         return result
     
