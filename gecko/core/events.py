@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-import inspect
-from typing import Any, Callable, Dict, List, Optional, Awaitable, Type
+import inspect # [修复] 补充导入
+from typing import Any, Callable, Dict, List, Optional, Awaitable
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger("gecko.events")
@@ -62,6 +62,7 @@ class EventBus:
             return
 
         # 3. 调度执行
+        # [修复] 确保 _safe_execute 只被定义一次且逻辑正确
         tasks = [self._safe_execute(h, event) for h in handlers]
         
         if wait:
@@ -71,15 +72,6 @@ class EventBus:
             for t in tasks:
                 asyncio.create_task(t)
 
-    async def _safe_execute(self, handler: EventHandler, event: BaseEvent):
-        """安全执行包裹器，防止 Handler 异常搞崩系统"""
-        try:
-            await handler(event)
-        except Exception as e:
-            logger.exception(f"Event handler failed for {event.type}: {e}")
-            # 可选：发布系统级错误事件
-            # await self.publish(SystemErrorEvent(...)) 
-            
     async def _safe_execute(self, handler: EventHandler, event: BaseEvent):
         """安全执行包裹器"""
         try:

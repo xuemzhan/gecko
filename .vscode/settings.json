@@ -16,6 +16,7 @@
         "executemany",
         "fetchrow",
         "filterwarnings",
+        "getsizeof",
         "htmlcov",
         "httpx",
         "ipynb",

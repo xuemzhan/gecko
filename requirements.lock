@@ -251,10 +251,13 @@ pydantic==2.12.4
     # via lancedb
     # via litellm
     # via openai
+    # via pydantic-settings
     # via qdrant-client
     # via sqlmodel
 pydantic-core==2.41.5
     # via pydantic
+pydantic-settings==2.12.0
+    # via gecko-ai
 pygments==2.19.2
     # via pytest
     # via rich
@@ -281,6 +284,7 @@ python-dateutil==2.9.0.post0
     # via posthog
 python-dotenv==1.2.1
     # via litellm
+    # via pydantic-settings
     # via pymilvus
     # via uvicorn
 pytz==2025.2
@@ -334,6 +338,8 @@ sqlalchemy==2.0.44
     # via sqlmodel
 sqlmodel==0.0.27
     # via gecko-ai
+structlog==25.5.0
+    # via gecko-ai
 sympy==1.14.0
     # via onnxruntime
 tenacity==9.1.2
@@ -378,6 +384,7 @@ typing-extensions==4.15.0
     # via typing-inspection
 typing-inspection==0.4.2
     # via pydantic
+    # via pydantic-settings
 tzdata==2025.2
     # via pandas
 urllib3==2.3.0
