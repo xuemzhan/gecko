@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from gecko.core.events import EventBus
 from gecko.core.memory import TokenMemory
+from gecko.core.protocols import ModelProtocol
 from gecko.core.toolbox import ToolBox
 
 @pytest.fixture
@@ -23,6 +24,14 @@ def mock_llm():
         choices=[MagicMock(message=MagicMock(content="Test Response", tool_calls=None))]
     ))
     return llm
+
+@pytest.fixture
+def model():
+    model = MagicMock(spec=ModelProtocol) 
+    model.acompletion = AsyncMock(return_value=MagicMock(
+        choices=[MagicMock(message=MagicMock(content="Test Response", tool_calls=None))]
+    ))
+    return model
 
 @pytest.fixture
 def memory():
