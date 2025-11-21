@@ -1,524 +1,636 @@
-# gecko/compose/workflow.py  
-"""  
-Workflow 引擎（优化版）  
-  
-核心改进：  
-1. 节点执行结果统一标准化，避免下游/持久化因类型不一致出错  
-2. `Next` 控制流可携带自定义输入，自动注入到下一个节点  
-3. 工作流上下文持久化使用安全序列化方法（pydantic_encoder）  
-4. Agent / Team / 普通函数节点统一接收 WorkflowContext，行为更一致  
-5. 状态持久化抽象成独立方法，捕获异常以免影响主流程  
-"""  
-  
-from __future__ import annotations  
-  
-import asyncio  
-import inspect  
-import time  
-from dataclasses import dataclass, field  
-from enum import Enum  
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple  
-  
-from pydantic import BaseModel  
-from pydantic.json import pydantic_encoder  
-  
-from gecko.compose.nodes import Next  
-from gecko.core.agent import Agent  
-from gecko.core.events import BaseEvent, EventBus  
-from gecko.core.exceptions import WorkflowCycleError, WorkflowError  
-from gecko.core.logging import get_logger  
-from gecko.core.message import Message  
-from gecko.core.utils import ensure_awaitable  
-from gecko.plugins.storage.interfaces import SessionInterface  
-  
-logger = get_logger(__name__)  
-  
-  
-# ========================= 事件定义 =========================  
-class WorkflowEvent(BaseEvent):  
-    """Workflow 专用事件对象，可被外部订阅"""  
-    pass  
-  
-  
-# ========================= 节点执行记录 =========================  
-class NodeStatus(Enum):  
-    PENDING = "pending"  
-    RUNNING = "running"  
-    SUCCESS = "success"  
-    FAILED = "failed"  
-    SKIPPED = "skipped"  
-  
-  
-@dataclass  
-class NodeExecution:  
-    """单个节点的执行记录（方便追踪和可视化）"""  
-    node_name: str  
-    status: NodeStatus = NodeStatus.PENDING  
-    input_data: Any = None  
-    output_data: Any = None  
-    error: Optional[str] = None  
-    start_time: float = 0.0  
-    end_time: float = 0.0  
-  
-    @property  
-    def duration(self) -> float:  
-        return max(0.0, self.end_time - self.start_time)  
-  
-  
-# ========================= 工作流上下文 =========================  
-@dataclass  
-class WorkflowContext:  
-    """  
-    工作流执行过程中共享的上下文对象  
-    - input: 初始输入  
-    - state: 节点之间共享的状态（开发者可自由使用）  
-    - history: 每个节点的输出以及 last_output  
-    - metadata: 附加信息（如 session_id、external trace id 等）  
-    - executions: 节点执行详情列表  
-    """  
-    input: Any  
-    state: Dict[str, Any] = field(default_factory=dict)  
-    history: Dict[str, Any] = field(default_factory=dict)  
-    metadata: Dict[str, Any] = field(default_factory=dict)  
-    executions: List[NodeExecution] = field(default_factory=list)  
-  
-    def add_execution(self, execution: NodeExecution):  
-        self.executions.append(execution)  
-  
-    def get_execution_summary(self) -> Dict[str, Any]:  
-        total_time = sum(e.duration for e in self.executions)  
-        status_counts = {  
-            status.value: sum(1 for e in self.executions if e.status == status)  
-            for status in NodeStatus  
-        }  
-        return {  
-            "total_nodes": len(self.executions),  
-            "total_time": total_time,  
-            "status_counts": status_counts,  
-            "node_details": [  
-                {  
-                    "name": e.node_name,  
-                    "status": e.status.value,  
-                    "duration": e.duration,  
-                    "error": e.error,  
-                }  
-                for e in self.executions  
-            ],  
-        }  
-  
-    def to_dict(self) -> Dict[str, Any]:  
-        """  
-        安全序列化上下文，以便持久化  
-        - 使用 pydantic_encoder 处理 Message / BaseModel 等复杂对象  
-        - history 仅保留字符串或 JSON 友好格式，防止过大或不可序列化  
-        """  
-        def _safe(value: Any) -> Any:  
-            try:  
-                return pydantic_encoder(value)  
-            except Exception:  
-                return str(value)[:200]  
-  
-        history_dump = {  
-            k: _safe(v)  
-            for k, v in self.history.items()  
-            if k == "last_output" or isinstance(k, str)  
-        }  
-  
-        return {  
-            "input": _safe(self.input),  
-            "state": {k: _safe(v) for k, v in self.state.items()},  
-            "history": history_dump,  
-            "metadata": {k: _safe(v) for k, v in self.metadata.items()},  
-        }  
-  
-  
-# ========================= 工作流引擎 =========================  
-class Workflow:  
-    def __init__(  
-        self,  
-        name: str = "Workflow",  
-        event_bus: Optional[EventBus] = None,  
-        storage: Optional[SessionInterface] = None,  
-        max_steps: int = 100,  
-        enable_retry: bool = False,  
-        max_retries: int = 3,  
-    ):  
-        self.name = name  
-        self.event_bus = event_bus or EventBus()  
-        self.storage = storage  
-        self.max_steps = max_steps  
-        self.enable_retry = enable_retry  
-        self.max_retries = max_retries  
-  
-        self.nodes: Dict[str, Callable] = {}  
-        self.edges: Dict[str, List[Tuple[str, Optional[Callable]]]] = {}  
-        self.entry_point: Optional[str] = None  
-  
-        self._validated = False  
-        self._validation_errors: List[str] = []  
-  
-    # ---------- DAG 构建 API ----------  
-    def add_node(self, name: str, func: Callable) -> "Workflow":  
-        if name in self.nodes:  
-            raise ValueError(f"Node '{name}' already exists")  
-        self.nodes[name] = func  
-        self._validated = False  
-        logger.debug("Node added", node=name)  
-        return self  
-  
-    def add_edge(  
-        self,  
-        source: str,  
-        target: str,  
-        condition: Optional[Callable[[WorkflowContext], bool]] = None,  
-    ) -> "Workflow":  
-        if source not in self.nodes:  
-            raise ValueError(f"Source node '{source}' not found")  
-        if target not in self.nodes:  
-            raise ValueError(f"Target node '{target}' not found")  
-  
-        self.edges.setdefault(source, []).append((target, condition))  
-        self._validated = False  
-        logger.debug("Edge added", source=source, target=target)  
-        return self  
-  
-    def set_entry_point(self, name: str) -> "Workflow":  
-        if name not in self.nodes:  
-            raise ValueError(f"Node '{name}' not found")  
-        self.entry_point = name  
-        self._validated = False  
-        return self  
-  
-    # ---------- DAG 验证 ----------  
-    def validate(self) -> bool:  
-        if self._validated:  
-            return len(self._validation_errors) == 0  
-  
-        self._validation_errors.clear()  
-  
-        if not self.entry_point:  
-            self._validation_errors.append("No entry point defined")  
-        elif self.entry_point not in self.nodes:  
-            self._validation_errors.append(f"Entry point '{self.entry_point}' not in nodes")  
-  
-        try:  
-            self._detect_cycles()  
-        except WorkflowCycleError as e:  
-            self._validation_errors.append(str(e))  
-  
-        unreachable = self._find_unreachable_nodes()  
-        if unreachable:  
-            logger.warning("Workflow has unreachable nodes", nodes=list(unreachable))  
-  
-        dead_nodes = self._find_dead_nodes()  
-        if dead_nodes:  
-            logger.warning("Workflow has dead-end nodes", nodes=list(dead_nodes))  
-  
-        self._validated = True  
-        if self._validation_errors:  
-            logger.error("Workflow validation failed", errors=self._validation_errors)  
-            return False  
-  
-        logger.info("Workflow validation passed", name=self.name)  
-        return True  
-  
-    def _detect_cycles(self):  
-        visited: Set[str] = set()  
-        rec_stack: Set[str] = set()  
-  
-        def dfs(node: str, path: List[str]):  
-            visited.add(node)  
-            rec_stack.add(node)  
-            path.append(node)  
-  
-            for neighbor, _ in self.edges.get(node, []):  
-                if neighbor not in visited:  
-                    dfs(neighbor, path)  
-                elif neighbor in rec_stack:  
-                    cycle_start = path.index(neighbor)  
-                    cycle = " → ".join(path[cycle_start:] + [neighbor])  
-                    raise WorkflowCycleError(f"Cycle detected: {cycle}")  
-  
-            rec_stack.remove(node)  
-            path.pop()  
-  
-        for node in self.nodes:  
-            if node not in visited:  
-                dfs(node, [])  
-  
-    def _find_unreachable_nodes(self) -> Set[str]:  
-        if not self.entry_point:  
-            return set(self.nodes.keys())  
-  
-        reachable: Set[str] = set()  
-        queue = [self.entry_point]  
-  
-        while queue:  
-            current = queue.pop(0)  
-            if current in reachable:  
-                continue  
-            reachable.add(current)  
-            for neighbor, _ in self.edges.get(current, []):  
-                if neighbor not in reachable:  
-                    queue.append(neighbor)  
-  
-        return set(self.nodes.keys()) - reachable  
-  
-    def _find_dead_nodes(self) -> Set[str]:  
-        """简单检测：没有出边且不是入口的节点"""  
-        dead = set()  
-        for node in self.nodes:  
-            if not self.edges.get(node) and node != self.entry_point:  
-                dead.add(node)  
-        return dead  
-  
-    def get_validation_errors(self) -> List[str]:  
-        return self._validation_errors.copy()  
-  
-    # ---------- 执行入口 ----------  
-    async def execute(self, input_data: Any, session_id: Optional[str] = None) -> Any:  
-        if not self.validate():  
-            errors = "\n".join(self._validation_errors)  
-            raise WorkflowError(f"Workflow validation failed:\n{errors}")  
-  
-        context = WorkflowContext(input=input_data)  
-        if session_id:  
-            context.metadata["session_id"] = session_id  
-  
-        await self.event_bus.publish(  
-            WorkflowEvent(type="workflow_started", data={"name": self.name, "input": str(input_data)[:100]})  
-        )  
-  
-        try:  
-            result = await self._execute_loop(context, session_id)  
-            await self.event_bus.publish(  
-                WorkflowEvent(  
-                    type="workflow_completed",  
-                    data={"name": self.name, "summary": context.get_execution_summary()},  
-                )  
-            )  
-            return result  
-        except Exception as e:  
-            await self.event_bus.publish(  
-                WorkflowEvent(type="workflow_error", error=str(e), data={"name": self.name})  
-            )  
-            raise  
-  
-    async def _execute_loop(self, context: WorkflowContext, session_id: Optional[str]) -> Any:  
-        current_node = self.entry_point  
-        steps = 0  
-  
-        while current_node and steps < self.max_steps:  
-            steps += 1  
-            node_name = current_node  
-  
-            logger.debug("Executing node", node=node_name, step=steps)  
-            result = await self._execute_node(node_name, context)  
-  
-            normalized = self._normalize_result(result)  
-            context.history[node_name] = normalized  
-            context.history["last_output"] = normalized  
-  
-            if isinstance(result, Next):  
-                current_node = result.node  
-                if result.input is not None:  
-                    normalized_input = self._normalize_result(result.input)  
-                    context.history["last_output"] = normalized_input  
-                    context.state["_next_input"] = normalized_input  
-            else:  
-                current_node = await self._find_next_node(node_name, context)  
-  
-            if self.storage and session_id:  
-                await self._persist_state(session_id, steps, node_name, context)  
-  
-        if steps >= self.max_steps:  
-            raise WorkflowError(  
-                f"Workflow exceeded max steps: {self.max_steps}",  
-                context={"steps": steps, "last_node": current_node},  
-            )  
-  
-        return context.history.get("last_output") 
+# gecko/compose/workflow.py
+"""
+Workflow 引擎
+
+提供基于 DAG（有向无环图）的任务编排能力，支持复杂的控制流和状态管理。
+
+核心功能：
+1. 节点编排：支持普通函数、Agent、Team 等多种节点类型混编
+2. 状态管理：基于 Pydantic 的强类型上下文，支持完整的序列化与持久化
+3. 控制流：支持条件分支、循环（通过 Next 指令）
+4. 智能绑定：自动根据函数签名注入 Context 或 Input
+5. 可观测性：详细的节点执行轨迹与统计
+
+优化日志：
+- [Fix] 修复参数注入逻辑，支持同时接收 Input 和 Context 的函数签名
+- [Fix] 将 WorkflowContext 升级为 BaseModel，彻底解决持久化数据截断问题
+- [Fix] 增加分支歧义检测，确保逻辑确定性
+- [Fix] 优化 Agent 间的数据流转 (Data Handover)，避免 Prompt 污染
+"""
+from __future__ import annotations
+
+import asyncio
+import inspect
+import time
+import uuid
+from enum import Enum
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union, Set
+
+from pydantic import BaseModel, Field, PrivateAttr
+
+from gecko.compose.nodes import Next
+from gecko.core.events import BaseEvent, EventBus
+from gecko.core.exceptions import WorkflowCycleError, WorkflowError
+from gecko.core.logging import get_logger
+from gecko.core.message import Message
+from gecko.core.utils import ensure_awaitable
+from gecko.plugins.storage.interfaces import SessionInterface
+
+logger = get_logger(__name__)
+
+
+# ========================= 事件定义 =========================
+
+class WorkflowEvent(BaseEvent):
+    """Workflow 专用事件对象"""
+    pass
+
+
+# ========================= 状态模型 =========================
+
+class NodeStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCESS = "success"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+class NodeExecution(BaseModel):
+    """
+    节点执行记录（轨迹追踪）
+    """
+    node_name: str
+    status: NodeStatus = NodeStatus.PENDING
+    input_data: Any = None
+    output_data: Any = None
+    error: Optional[str] = None
+    start_time: float = Field(default_factory=time.time)
+    end_time: float = 0.0
+
+    @property
+    def duration(self) -> float:
+        """计算执行耗时"""
+        if self.end_time == 0.0:
+            return 0.0
+        return max(0.0, self.end_time - self.start_time)
+
+
+class WorkflowContext(BaseModel):
+    """
+    工作流执行上下文
     
-    async def _persist_state(  
-        self,  
-        session_id: str,  
-        steps: int,  
-        last_node: Optional[str],  
-        context: WorkflowContext,  
-    ):  
-        """状态持久化统一入口"""  
-        try:  
-            await self.storage.set(  
-                f"workflow:{session_id}",  
-                {  
-                    "step": steps,  
-                    "last_node": last_node,  
-                    "context": context.to_dict(),  
-                },  
-            )  
-        except Exception as e:  
-            logger.warning("Failed to persist workflow state", error=str(e)) 
-  
-    async def _execute_node(self, node_name: str, context: WorkflowContext) -> Any:  
-        execution = NodeExecution(node_name=node_name, status=NodeStatus.RUNNING, start_time=time.time())  
-        await self.event_bus.publish(WorkflowEvent(type="node_started", data={"node": node_name}))  
-  
-        node_callable = self.nodes[node_name]  
-  
-        try:  
-            if self.enable_retry:  
-                result = await self._execute_with_retry(node_callable, context)  
-            else:  
-                result = await self._execute_once(node_callable, context)  
-  
-            execution.status = NodeStatus.SUCCESS  
-            execution.output_data = self._normalize_result(result)  
-            execution.end_time = time.time()  
-  
-            await self.event_bus.publish(  
-                WorkflowEvent(  
-                    type="node_completed",  
-                    data={"node": node_name, "duration": execution.duration, "result": str(result)[:100]},  
-                )  
-            )  
-            return result  
-  
-        except Exception as e:  
-            execution.status = NodeStatus.FAILED  
-            execution.error = str(e)  
-            execution.end_time = time.time()  
-  
-            await self.event_bus.publish(  
-                WorkflowEvent(type="node_error", error=str(e), data={"node": node_name})  
-            )  
-            raise WorkflowError(f"Node '{node_name}' execution failed: {e}", context={"node": node_name}) from e  
-  
-        finally:  
+    使用 Pydantic 模型确保类型安全和原生序列化支持。
+    """
+    execution_id: str = Field(
+        default_factory=lambda: uuid.uuid4().hex,
+        description="单次运行的唯一 ID"
+    )
+    input: Any = Field(..., description="工作流初始输入")
+    state: Dict[str, Any] = Field(
+        default_factory=dict, 
+        description="共享状态存储（用户自定义）"
+    )
+    history: Dict[str, Any] = Field(
+        default_factory=dict, 
+        description="节点历史输出记录"
+    )
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="元数据（如 session_id, trace_id）"
+    )
+    executions: List[NodeExecution] = Field(
+        default_factory=list,
+        description="完整执行轨迹"
+    )
+
+    def add_execution(self, execution: NodeExecution):
+        """添加执行记录"""
+        self.executions.append(execution)
+
+    def get_last_output(self) -> Any:
+        """获取上一个节点的输出（如果无历史则返回初始输入）"""
+        return self.history.get("last_output", self.input)
+
+    def get_summary(self) -> Dict[str, Any]:
+        """获取执行摘要"""
+        total_time = sum(e.duration for e in self.executions)
+        is_failed = any(e.status == NodeStatus.FAILED for e in self.executions)
+        return {
+            "execution_id": self.execution_id,
+            "total_nodes": len(self.executions),
+            "total_time": total_time,
+            "last_node": self.executions[-1].node_name if self.executions else None,
+            "status": "failed" if is_failed else "completed"
+        }
+
+
+# ========================= 工作流引擎 =========================
+
+class Workflow:
+    """
+    DAG 工作流引擎
+    """
+
+    def __init__(
+        self,
+        name: str = "Workflow",
+        event_bus: Optional[EventBus] = None,
+        storage: Optional[SessionInterface] = None,
+        max_steps: int = 100,
+        enable_retry: bool = False,
+        max_retries: int = 3,
+    ):
+        self.name = name
+        self.event_bus = event_bus or EventBus()
+        self.storage = storage
+        self.max_steps = max_steps
+        self.enable_retry = enable_retry
+        self.max_retries = max_retries
+
+        # 内部存储
+        self._nodes: Dict[str, Callable] = {}
+        # edges: source -> [(target, condition_func), ...]
+        self._edges: Dict[str, List[Tuple[str, Optional[Callable]]]] = {}
+        self._entry_point: Optional[str] = None
+
+        # 验证状态
+        self._validated = False
+        self._validation_errors: List[str] = []
+
+    # ========================= 构建 API =========================
+
+    def add_node(self, name: str, func: Callable) -> "Workflow":
+        """
+        添加节点
+        
+        参数:
+            name: 节点唯一名称
+            func: 可调用对象（函数、Agent、Team）
+        """
+        if name in self._nodes:
+            raise ValueError(f"Node '{name}' already exists")
+        self._nodes[name] = func
+        self._validated = False
+        logger.debug("Node added", workflow=self.name, node=name)
+        return self
+
+    def add_edge(
+        self,
+        source: str,
+        target: str,
+        condition: Optional[Callable[[WorkflowContext], bool]] = None,
+    ) -> "Workflow":
+        """
+        添加边（支持条件分支）
+        
+        参数:
+            source: 源节点名称
+            target: 目标节点名称
+            condition: 转移条件函数（接收 Context 返回 bool）
+        """
+        if source not in self._nodes:
+            raise ValueError(f"Source node '{source}' not found")
+        if target not in self._nodes:
+            raise ValueError(f"Target node '{target}' not found")
+
+        self._edges.setdefault(source, []).append((target, condition))
+        self._validated = False
+        logger.debug("Edge added", source=source, target=target, conditional=bool(condition))
+        return self
+
+    def set_entry_point(self, name: str) -> "Workflow":
+        """设置入口节点"""
+        if name not in self._nodes:
+            raise ValueError(f"Node '{name}' not found")
+        self._entry_point = name
+        self._validated = False
+        return self
+
+    # ========================= 验证逻辑 =========================
+
+    def validate(self) -> bool:
+        """验证工作流结构的合法性"""
+        if self._validated:
+            return len(self._validation_errors) == 0
+
+        self._validation_errors.clear()
+
+        # 1. 检查入口
+        if not self._entry_point:
+            self._validation_errors.append("No entry point defined")
+        elif self._entry_point not in self._nodes:
+            self._validation_errors.append(f"Entry point '{self._entry_point}' not in nodes")
+
+        # 2. 检查歧义分支 (同一节点存在多个无条件出边)
+        for node, edges in self._edges.items():
+            unconditional_edges = [t for t, c in edges if c is None]
+            if len(unconditional_edges) > 1:
+                self._validation_errors.append(
+                    f"Node '{node}' has ambiguous edges: multiple unconditional targets {unconditional_edges}"
+                )
+
+        # 3. 检查死循环 (静态检测)
+        try:
+            self._detect_cycles()
+        except WorkflowCycleError as e:
+            self._validation_errors.append(str(e))
+
+        # 4. 连通性警告
+        self._check_connectivity()
+
+        self._validated = True
+        if self._validation_errors:
+            logger.error("Workflow validation failed", errors=self._validation_errors)
+            return False
+
+        logger.info("Workflow validation passed", name=self.name)
+        return True
+
+    def _detect_cycles(self):
+        """DFS 检测环"""
+        visited = set()
+        recursion_stack = set()
+
+        def dfs(node: str, path: List[str]):
+            visited.add(node)
+            recursion_stack.add(node)
+            path.append(node)
+
+            for neighbor, _ in self._edges.get(node, []):
+                if neighbor not in visited:
+                    dfs(neighbor, path)
+                elif neighbor in recursion_stack:
+                    cycle_start = path.index(neighbor)
+                    cycle = " -> ".join(path[cycle_start:] + [neighbor])
+                    raise WorkflowCycleError(f"Cycle detected: {cycle}")
+
+            recursion_stack.remove(node)
+            path.pop()
+
+        for node in self._nodes:
+            if node not in visited:
+                dfs(node, [])
+
+    def _check_connectivity(self):
+        """检查不可达节点（仅警告）"""
+        if not self._entry_point:
+            return
+
+        reachable = set()
+        queue = [self._entry_point]
+        while queue:
+            curr = queue.pop(0)
+            if curr in reachable:
+                continue
+            reachable.add(curr)
+            for target, _ in self._edges.get(curr, []):
+                queue.append(target)
+        
+        unreachable = set(self._nodes.keys()) - reachable
+        if unreachable:
+            logger.warning("Unreachable nodes detected", nodes=list(unreachable))
+
+    # ========================= 执行引擎 =========================
+
+    async def execute(self, input_data: Any, session_id: Optional[str] = None) -> Any:
+        """
+        执行工作流
+        
+        参数:
+            input_data: 初始输入数据
+            session_id: 会话 ID（用于持久化和状态恢复）
+            
+        返回:
+            最终输出（Context 中的 last_output）
+        """
+        if not self.validate():
+            raise WorkflowError(f"Workflow validation failed:\n" + "\n".join(self._validation_errors))
+
+        # 初始化上下文
+        context = WorkflowContext(input=input_data)
+        if session_id:
+            context.metadata["session_id"] = session_id
+
+        await self.event_bus.publish(
+            WorkflowEvent(
+                type="workflow_started", 
+                data={"name": self.name, "execution_id": context.execution_id}
+            )
+        )
+
+        try:
+            await self._execute_loop(context, session_id)
+            
+            result = context.get_last_output()
+            await self.event_bus.publish(
+                WorkflowEvent(
+                    type="workflow_completed",
+                    data={"name": self.name, "summary": context.get_summary()},
+                )
+            )
+            return result
+            
+        except Exception as e:
+            logger.exception("Workflow execution failed")
+            await self.event_bus.publish(
+                WorkflowEvent(type="workflow_error", error=str(e), data={"name": self.name})
+            )
+            raise
+
+    async def _execute_loop(self, context: WorkflowContext, session_id: Optional[str]):
+        """核心执行循环"""
+        current_node = self._entry_point
+        steps = 0
+
+        while current_node and steps < self.max_steps:
+            steps += 1
+            logger.debug("Executing step", step=steps, node=current_node)
+
+            # 1. 执行节点（带异常捕获与重试）
+            result = await self._execute_node_safe(current_node, context)
+
+            # 2. 处理结果与控制流 (Next)
+            if isinstance(result, Next):
+                # 处理跳转
+                current_node = result.node
+                # 如果 Next 携带了新输入，更新 last_output
+                if result.input is not None:
+                    normalized_input = self._normalize_result(result.input)
+                    context.history["last_output"] = normalized_input
+                    context.state["_next_input"] = normalized_input
+            else:
+                # 普通 DAG 流转
+                normalized = self._normalize_result(result)
+                context.history[current_node] = normalized
+                context.history["last_output"] = normalized
+                
+                # 寻找下一个节点
+                current_node = await self._find_next_node(current_node, context)
+
+            # 3. 状态持久化
+            if self.storage and session_id:
+                await self._persist_state(session_id, steps, current_node, context)
+
+        if steps >= self.max_steps:
+            raise WorkflowError(
+                f"Workflow exceeded max steps: {self.max_steps}",
+                context={"last_node": current_node}
+            )
+
+    async def _execute_node_safe(self, node_name: str, context: WorkflowContext) -> Any:
+        """节点执行包装器：负责状态记录、重试和错误处理"""
+        execution = NodeExecution(node_name=node_name, status=NodeStatus.RUNNING)
+        await self.event_bus.publish(WorkflowEvent(type="node_started", data={"node": node_name}))
+
+        try:
+            node_func = self._nodes[node_name]
+            
+            # 执行逻辑（含重试）
+            if self.enable_retry:
+                result = await self._execute_with_retry(node_func, context)
+            else:
+                result = await self._run_any_node(node_func, context)
+            
+            # 如果是 Next 对象，不在这里进行序列化，直接返回给 Loop 处理
+            if isinstance(result, Next):
+                execution.output_data = f"Next(node={result.node})"
+                execution.status = NodeStatus.SUCCESS
+            else:
+                # 规范化结果以便记录在 trace 中
+                normalized = self._normalize_result(result)
+                execution.output_data = normalized
+                result = normalized
+
+            execution.status = NodeStatus.SUCCESS
+            
+            await self.event_bus.publish(
+                WorkflowEvent(
+                    type="node_completed", 
+                    data={"node": node_name, "duration": execution.duration}
+                )
+            )
+            return result
+
+        except Exception as e:
+            execution.status = NodeStatus.FAILED
+            execution.error = str(e)
+            
+            await self.event_bus.publish(
+                WorkflowEvent(type="node_error", error=str(e), data={"node": node_name})
+            )
+            # 重新抛出异常以中断 loop (或者触发全局错误处理)
+            raise WorkflowError(f"Node '{node_name}' failed: {e}") from e
+            
+        finally:
+            execution.end_time = time.time()
             context.add_execution(execution)
-    
-    async def _run_agent_node(self, agent: Agent, context: WorkflowContext) -> Any:  
-        """  
-        Agent 节点默认读取 last_output 作为输入；  
-        如果上一节点通过 Next.input 传递了自定义输入，则优先使用  
-        """  
-        user_input = context.state.pop("_next_input", None) or context.history.get("last_output", context.input)  
-  
-        if isinstance(user_input, str):  
-            user_input = Message.user(user_input)  
-        elif isinstance(user_input, dict):  
-            user_input = Message(**user_input)  
-        elif isinstance(user_input, list) and user_input and isinstance(user_input[0], dict):  
-            user_input = [Message(**msg) for msg in user_input]  
-  
-        output = await agent.run(user_input)  
-        return output.model_dump() if hasattr(output, "model_dump") else output  
-  
-    async def _find_next_node(self, current: str, context: WorkflowContext) -> Optional[str]:  
-        edges = self.edges.get(current, [])  
-        for target, condition in edges:  
-            if condition is None:  
-                return target  
-            try:  
-                if inspect.iscoroutinefunction(condition):  
-                    if await condition(context):  
-                        return target  
-                else:  
-                    if condition(context):  
-                        return target  
-            except Exception as e:  
-                logger.error("Condition evaluation failed", source=current, target=target, error=str(e))  
-        return None  
-  
-    # 在 Workflow 类里增加一个通用执行方法  
-    async def _execute_once(self, node_callable: Callable, context: WorkflowContext) -> Any:  
-        if isinstance(node_callable, Agent):  
-            return await self._run_agent_node(node_callable, context)  
-        if callable(node_callable):  
-            return await ensure_awaitable(node_callable, context)  
-        raise WorkflowError(f"Node '{node_callable}' is not callable")  
-    
-    async def _execute_with_retry(self, func: Callable, context: WorkflowContext) -> Any:  
-        last_error = None  
-        for attempt in range(self.max_retries):  
-            try:  
-                return await self._execute_once(func, context)  
-            except Exception as e:  
-                last_error = e  
-                logger.warning(  
-                    "Node execution failed, retrying",  
-                    attempt=attempt + 1,  
-                    max_retries=self.max_retries,  
-                    error=str(e),  
-                )  
-                if attempt < self.max_retries - 1:  
-                    await asyncio.sleep(2 ** attempt)  
-        # 所有重试都失败  
-        raise last_error    
-  
-    def _normalize_result(self, result: Any) -> Any:  
-        """  
-        将节点输出转换为可序列化/可在历史中保存的格式  
-        - BaseModel -> dict  
-        - AgentOutput -> content/dict  
-        - Message -> OpenAI 字典  
-        - 原生类型保持不变  
-        - 其他对象转为字符串（并截断）  
-        """  
-        if isinstance(result, BaseModel):  
-            return result.model_dump()  
-        if hasattr(result, "model_dump"):  
-            data = result.model_dump()  
-            return data.get("content", data)  
-        if isinstance(result, Message):  
-            return result.to_openai_format()  
-        if isinstance(result, (str, int, float, bool, type(None))):  
-            return result  
-        if isinstance(result, (list, dict)):  
-            return result  
-        return str(result)[:500]  
-  
-    async def _persist_state(  
-        self,  
-        session_id: str,  
-        steps: int,  
-        current_node: Optional[str],  
-        context: WorkflowContext,  
-    ):  
-        """状态持久化的统一入口，使用 try/except 避免影响主流程"""  
-        try:  
-            await self.storage.set(  
-                f"workflow:{session_id}",  
-                {  
-                    "step": steps,  
-                    "last_node": current_node,  
-                    "context": context.to_dict(),  
-                },  
-            )  
-        except Exception as e:  
-            logger.warning("Failed to persist workflow state", error=str(e))  
-  
-    # ---------- 可视化/调试 ----------  
-    def to_mermaid(self) -> str:  
-        lines = ["graph TD"]  
-        for node in self.nodes:  
-            label = f"[{node}]" if node == self.entry_point else f"({node})"  
-            lines.append(f"    {node}{label}")  
-        for source, targets in self.edges.items():  
-            for target, condition in targets:  
-                label = f"|condition|" if condition else ""  
-                lines.append(f"    {source} --{label}--> {target}")  
-        return "\n".join(lines)  
-  
-    def print_structure(self):  
-        print(f"\n=== Workflow: {self.name} ===")  
-        print(f"Entry Point: {self.entry_point}")  
-        print(f"\nNodes ({len(self.nodes)}):")  
-        for node in self.nodes:  
-            print(f"  - {node}")  
-  
-        print(f"\nEdges ({sum(len(v) for v in self.edges.values())}):")  
-        for source, targets in self.edges.items():  
-            for target, condition in targets:  
-                cond_str = " [conditional]" if condition else ""  
-                print(f"  - {source} → {target}{cond_str}")  
-        print()  
+
+    # ========================= 节点调度逻辑 (核心) =========================
+
+    async def _run_any_node(self, node_callable: Callable, context: WorkflowContext) -> Any:
+        """
+        通用节点执行器 (Duck Typing & Smart Binding)
+        
+        支持:
+        1. Agent/Team (具备 run 方法的对象)
+        2. 普通函数 (自动注入 context/input/none)
+        
+        修复：智能处理参数绑定，支持同时需要 Input 和 Context 的场景
+        """
+        # 1. 智能体对象 (Agent or Team)
+        if hasattr(node_callable, "run") and callable(node_callable.run):
+            return await self._run_intelligent_object(node_callable, context)
+        
+        # 2. 普通可调用对象
+        if callable(node_callable):
+            sig = inspect.signature(node_callable)
+            params = sig.parameters
+            kwargs = {}
+            args = []
+            
+            # 获取当前输入数据
+            current_input = context.state.pop("_next_input", None) or context.get_last_output()
+            
+            # A. 注入 Context
+            if "context" in params:
+                kwargs["context"] = context
+            elif "workflow_context" in params:
+                kwargs["workflow_context"] = context
+                
+            # B. 注入 Input (Input Injection)
+            # 找到除 context, self 之外的参数，通常是第一个位置参数或特定的参数名
+            # 这里采取简单策略：如果有剩余参数位置，则将 Input 作为第一个位置参数传入
+            
+            # 过滤掉已处理的 context 参数
+            remaining_params = [
+                name for name, p in params.items() 
+                if name not in ("context", "workflow_context", "self")
+                and p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            ]
+            
+            if remaining_params:
+                # 如果有剩余参数，假设第一个是用来接收 input 的
+                args.append(current_input)
+            elif not kwargs:
+                # 如果既不需要 Context 也没有其他参数（无参函数），直接调用
+                pass
+                
+            # 执行
+            return await ensure_awaitable(node_callable, *args, **kwargs)
+            
+        raise WorkflowError(f"Node '{node_callable}' is not callable")
+
+    async def _run_intelligent_object(self, obj: Any, context: WorkflowContext) -> Any:
+        """
+        执行 Agent/Team 对象
+        
+        优化: 智能处理数据流转 (Data Handover)
+        """
+        # 1. 获取输入 (优先使用 Next 传递的，否则用上一步输出)
+        raw_input = context.state.pop("_next_input", None) or context.get_last_output()
+        
+        # 2. 数据清洗 (Data Handover Fix)
+        # 如果上一个节点返回的是 AgentOutput (dict)，且当前 Agent 需要文本输入，
+        # 我们尝试提取 content，避免将整个 JSON 结构扔给 LLM。
+        agent_input = raw_input
+        if isinstance(raw_input, dict):
+            # 如果有 content 且没有 role (说明不是 Message 对象，而是 Output 字典)
+            if "content" in raw_input and "role" not in raw_input:
+                agent_input = raw_input["content"]
+        
+        # 3. 执行
+        output = await obj.run(agent_input)
+        
+        # 4. 结果处理
+        if hasattr(output, "model_dump"):
+            return output.model_dump()
+        return output
+
+    async def _execute_with_retry(self, func: Callable, context: WorkflowContext) -> Any:
+        """重试逻辑"""
+        last_error = None
+        for attempt in range(self.max_retries):
+            try:
+                return await self._run_any_node(func, context)
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    "Node retry triggered",
+                    attempt=attempt + 1,
+                    error=str(e)
+                )
+                if attempt < self.max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+        raise last_error
+
+    # ========================= 辅助方法 =========================
+
+    async def _find_next_node(self, current: str, context: WorkflowContext) -> Optional[str]:
+        """
+        寻找下一个节点
+        
+        包含歧义检测：不允许同时满足多个无条件路径
+        """
+        edges = self._edges.get(current, [])
+        candidates = []
+        
+        for target, condition in edges:
+            should_go = False
+            if condition is None:
+                should_go = True
+            else:
+                try:
+                    if inspect.iscoroutinefunction(condition):
+                        should_go = await condition(context)
+                    else:
+                        should_go = condition(context)
+                except Exception as e:
+                    logger.error("Condition evaluation failed", source=current, target=target, error=str(e))
+            
+            if should_go:
+                candidates.append(target)
+        
+        if len(candidates) == 0:
+            return None
+        
+        # 歧义检测
+        if len(candidates) > 1:
+            raise WorkflowError(
+                f"Ambiguous branching from '{current}': multiple conditions met for targets {candidates}. "
+                "Workflow logic must be deterministic."
+            )
+            
+        return candidates[0]
+
+    def _normalize_result(self, result: Any) -> Any:
+        """
+        标准化结果 (Pydantic Friendly)
+        """
+        if isinstance(result, BaseModel):
+            return result.model_dump()
+        if hasattr(result, "model_dump"):
+            return result.model_dump()
+        if isinstance(result, Message):
+            return result.to_openai_format()
+        return result
+
+    async def _persist_state(
+        self,
+        session_id: str,
+        steps: int,
+        current_node: Optional[str],
+        context: WorkflowContext,
+    ):
+        """
+        状态持久化
+        
+        使用 Pydantic 的 mode='json' 确保完整序列化，不进行截断。
+        """
+        try:
+            # mode='json' 会将 UUID, Enum 等转换为字符串
+            context_data = context.model_dump(mode="json")
+            
+            await self.storage.set(
+                f"workflow:{session_id}",
+                {
+                    "step": steps,
+                    "last_node": current_node,
+                    "context": context_data,
+                    "updated_at": time.time(),
+                },
+            )
+        except Exception as e:
+            logger.warning("Failed to persist workflow state", session_id=session_id, error=str(e))
+
+    # ========================= 可视化 =========================
+
+    def to_mermaid(self) -> str:
+        """生成 Mermaid 流程图代码"""
+        lines = ["graph TD"]
+        for node in self._nodes:
+            # 入口节点使用双圆圈
+            shape_start = "((" if node == self._entry_point else "("
+            shape_end = "))" if node == self._entry_point else ")"
+            lines.append(f"    {node}{shape_start}{node}{shape_end}")
+            
+        for source, targets in self._edges.items():
+            for target, condition in targets:
+                label = "|condition|" if condition else ""
+                lines.append(f"    {source} --{label}--> {target}")
+        return "\n".join(lines)
+
+    def print_structure(self):
+        """打印工作流结构"""
+        print(f"\n=== Workflow: {self.name} ===")
+        print(f"Entry Point: {self._entry_point}")
+        print(f"\nNodes ({len(self._nodes)}):")
+        for node in self._nodes:
+            print(f"  - {node}")
+
+        print(f"\nEdges ({sum(len(v) for v in self._edges.values())}):")
+        for source, targets in self._edges.items():
+            for target, condition in targets:
+                cond_str = " [conditional]" if condition else ""
+                print(f"  - {source} -> {target}{cond_str}")
+        print()
