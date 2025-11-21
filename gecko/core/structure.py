@@ -159,8 +159,23 @@ class StructureEngine:
         
         简化版实现，处理常见情况
         """
-        # 暂时保持原样，复杂的展开可以后续实现
-        return schema
+        defs = schema.pop("$defs", {})
+        if not defs:
+            return schema
+            
+        def resolve_ref(obj):
+            if isinstance(obj, dict):
+                if "$ref" in obj:
+                    ref_key = obj["$ref"].split("/")[-1]
+                    if ref_key in defs:
+                        # 递归解析引用
+                        return resolve_ref(defs[ref_key])
+                return {k: resolve_ref(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [resolve_ref(item) for item in obj]
+            return obj
+
+        return resolve_ref(schema)
     
     # ===== 解析方法 =====
     
@@ -277,73 +292,58 @@ class StructureEngine:
         text = text.strip()
         attempts = []
         
-        # 策略 A: 直接 JSON
+        # 0. 快速失败检查 (Fail-Fast)
+        if not text or ('{' not in text and '[' not in text):
+            raise StructureParseError(
+                "Content does not contain JSON-like structure (missing '{' or '[')",
+                raw_content=text
+            )
+
+        # 策略 A: 直接解析 (最快)
         try:
             data = json.loads(text)
-            return model_class(**data)
-        except json.JSONDecodeError as e:
-            attempts.append({
-                "strategy": "direct_json",
-                "error": f"JSON 解码失败: {str(e)}"
-            })
-        except ValidationError as e:
-            attempts.append({
-                "strategy": "direct_json_validation",
-                "error": f"验证失败: {str(e)}"
-            })
+            return cls.validate(data, model_class)
+        except Exception as e:
+            attempts.append({"strategy": "direct_json", "error": str(e)})
         
         # 策略 B: Markdown 代码块
-        markdown_patterns = [
-            r"```json\s*([\s\S]*?)```",
-            r"```\s*([\s\S]*?)```",
-        ]
+        markdown_pattern = r"```(?:\w+)?\s*([\s\S]*?)```"
+        for match in re.finditer(markdown_pattern, text):
+            candidate = match.group(1).strip()
+            try:
+                data = json.loads(candidate)
+                return cls.validate(data, model_class)
+            except Exception as e:
+                attempts.append({"strategy": "markdown", "error": str(e)})
         
-        for pattern_idx, pattern in enumerate(markdown_patterns):
-            for match_idx, match in enumerate(re.finditer(pattern, text)):
-                candidate = match.group(1).strip()
-                try:
-                    data = json.loads(candidate)
-                    return model_class(**data)
-                except Exception as e:
-                    attempts.append({
-                        "strategy": f"markdown_{pattern_idx}_{match_idx}",
-                        "error": str(e)[:100]
-                    })
-        
-        # 策略 C: 暴力括号匹配
+        # 策略 C: 暴力括号匹配 (限制尝试次数)
         json_candidates = cls._extract_braced_json(text)
         for idx, candidate in enumerate(json_candidates):
             try:
                 data = json.loads(candidate)
-                return model_class(**data)
+                return cls.validate(data, model_class)
             except Exception as e:
-                attempts.append({
-                    "strategy": f"braced_{idx}",
-                    "error": str(e)[:100]
-                })
+                if idx < 3: # 仅记录前3次
+                    attempts.append({"strategy": f"braced_{idx}", "error": str(e)})
         
-        # 策略 D: 清理并重试（如果启用 auto_fix）
+        # 策略 D: 清理并重试
         if auto_fix:
             cleaned = cls._clean_json_string(text)
-            if cleaned != text:  # 有清理操作
+            if cleaned != text:
                 try:
                     data = json.loads(cleaned)
                     logger.info("Parsed after cleaning", model=model_class.__name__)
-                    return model_class(**data)
+                    return cls.validate(data, model_class)
                 except Exception as e:
-                    attempts.append({
-                        "strategy": "cleaned_json",
-                        "error": str(e)[:100]
-                    })
+                    attempts.append({"strategy": "cleaned_json", "error": str(e)})
         
-        # 所有策略都失败
-        error = StructureParseError(
-            f"无法从文本中提取有效的 JSON",
+        # 构建错误详情
+        error_details = "\n".join(f"  - {a['strategy']}: {a['error'][:100]}" for a in attempts)
+        raise StructureParseError(
+            f"无法解析为 {model_class.__name__}。尝试了 {len(attempts)} 种策略:\n{error_details}",
             attempts=attempts,
             raw_content=text
         )
-        error.attempts = attempts
-        raise error
     
     @staticmethod
     def _extract_braced_json(text: str) -> List[str]:
@@ -358,7 +358,12 @@ class StructureEngine:
         stack = []
         start = None
         
-        for idx, ch in enumerate(text):
+        # 简单优化：只在看起来像 JSON 的区域搜索
+        search_start = text.find('{')
+        if search_start == -1:
+            return []
+            
+        for idx, ch in enumerate(text[search_start:], start=search_start):
             if ch == "{":
                 if not stack:
                     start = idx
@@ -368,10 +373,12 @@ class StructureEngine:
                 if not stack and start is not None:
                     candidates.append(text[start:idx + 1])
                     start = None
+                    # 限制最大候选数量，防止DoS
+                    if len(candidates) >= 5:
+                        break
         
-        # 按长度降序排序（更长的 JSON 可能更完整）
+        # 按长度降序排序
         candidates.sort(key=len, reverse=True)
-        
         return candidates
     
     @staticmethod
