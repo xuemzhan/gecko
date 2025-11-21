@@ -23,7 +23,6 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set
 
 from pydantic import BaseModel, Field
@@ -38,19 +37,7 @@ logger = get_logger(__name__)
 # ===== 会话元数据 =====
 
 class SessionMetadata(BaseModel):
-    """
-    会话元数据
-    
-    属性:
-        session_id: 会话唯一标识
-        created_at: 创建时间戳
-        updated_at: 最后更新时间戳
-        accessed_at: 最后访问时间戳
-        access_count: 访问次数
-        ttl: 生存时间（秒），None 表示永不过期
-        tags: 会话标签
-        custom: 自定义元数据
-    """
+    """会话元数据"""
     session_id: str = Field(..., description="会话 ID")
     created_at: float = Field(default_factory=time.time, description="创建时间")
     updated_at: float = Field(default_factory=time.time, description="更新时间")
@@ -69,12 +56,7 @@ class SessionMetadata(BaseModel):
         return age > self.ttl
     
     def time_to_expire(self) -> Optional[float]:
-        """
-        获取距离过期的剩余时间（秒）
-        
-        返回:
-            剩余时间，None 表示永不过期，负数表示已过期
-        """
+        """获取距离过期的剩余时间（秒）"""
         if self.ttl is None:
             return None
         
@@ -100,27 +82,10 @@ class Session:
     """
     会话对象
     
-    管理单个会话的状态和元数据。
-    
-    示例:
-        ```python
-        # 创建会话
-        session = Session(session_id="user_123")
-        
-        # 设置状态
-        session.set("user_name", "Alice")
-        session.set("preferences", {"theme": "dark"})
-        
-        # 获取状态
-        name = session.get("user_name")
-        
-        # 检查过期
-        if not session.is_expired():
-            print("会话有效")
-        
-        # 持久化
-        await session.save()
-        ```
+    优化点：
+    1. get/set/delete 等同步方法不发布事件（避免未 await 的协程）
+    2. get() 不自动 touch（避免计数不可预测）
+    3. 仅在异步方法（save/load/destroy）中发布事件
     """
     
     def __init__(
@@ -132,17 +97,6 @@ class Session:
         event_bus: Optional[EventBus] = None,
         auto_save: bool = True,
     ):
-        """
-        初始化会话
-        
-        参数:
-            session_id: 会话 ID（None 则自动生成）
-            state: 初始状态
-            storage: 存储后端（可选）
-            ttl: 生存时间（秒）
-            event_bus: 事件总线（可选）
-            auto_save: 是否自动保存到存储
-        """
         self.session_id = session_id or self._generate_id()
         self.state: Dict[str, Any] = state or {}
         self.storage = storage
@@ -158,7 +112,7 @@ class Session:
         # 并发锁
         self._lock = asyncio.Lock()
         
-        # 标记为已修改（用于优化持久化）
+        # 标记为已修改
         self._dirty = False
         
         logger.debug("Session created", session_id=self.session_id)
@@ -168,62 +122,35 @@ class Session:
         """生成唯一会话 ID"""
         return f"session_{uuid.uuid4().hex[:16]}"
     
-    # ===== 状态管理 =====
+    # ===== 状态管理（同步方法，不发布事件）=====
     
     def get(self, key: str, default: Any = None) -> Any:
         """
-        获取状态值
+        获取状态值（不自动更新访问计数）
         
-        参数:
-            key: 键
-            default: 默认值
-        
-        返回:
-            状态值
+        如需记录访问，显式调用 touch()
         """
-        self.metadata.touch()
         return self.state.get(key, default)
     
     def set(self, key: str, value: Any):
-        """
-        设置状态值
-        
-        参数:
-            key: 键
-            value: 值
-        """
+        """设置状态值（不发布事件）"""
         self.state[key] = value
         self.metadata.updated_at = time.time()
-        self.metadata.touch()
         self._dirty = True
         
-        # 发布事件
-        self.event_bus.publish(SessionEvent(
-            type="session_updated",
-            data={"session_id": self.session_id, "key": key}
-        ))
-        
-        # 自动保存
+        # 自动保存（在后台任务中，会发布事件）
         if self.auto_save and self.storage:
-            asyncio.create_task(self.save())
+            asyncio.create_task(self._auto_save())
     
     def delete(self, key: str) -> bool:
-        """
-        删除状态值
-        
-        参数:
-            key: 键
-        
-        返回:
-            是否成功删除
-        """
+        """删除状态值（不发布事件）"""
         if key in self.state:
             del self.state[key]
             self.metadata.updated_at = time.time()
             self._dirty = True
             
             if self.auto_save and self.storage:
-                asyncio.create_task(self.save())
+                asyncio.create_task(self._auto_save())
             
             return True
         return False
@@ -235,21 +162,26 @@ class Session:
         self._dirty = True
         
         if self.auto_save and self.storage:
-            asyncio.create_task(self.save())
+            asyncio.create_task(self._auto_save())
     
     def update(self, data: Dict[str, Any]):
-        """
-        批量更新状态
-        
-        参数:
-            data: 要更新的数据
-        """
+        """批量更新状态"""
         self.state.update(data)
         self.metadata.updated_at = time.time()
         self._dirty = True
         
         if self.auto_save and self.storage:
-            asyncio.create_task(self.save())
+            asyncio.create_task(self._auto_save())
+    
+    def touch(self):
+        """
+        手动更新访问时间和计数
+        
+        应在有意义的访问点调用（如获取会话时）
+        """
+        self.metadata.touch()
+    
+    # ===== 字典接口 =====
     
     def keys(self) -> List[str]:
         """获取所有键"""
@@ -282,12 +214,7 @@ class Session:
         return self.metadata.is_expired()
     
     def extend_ttl(self, extra_seconds: int):
-        """
-        延长生存时间
-        
-        参数:
-            extra_seconds: 额外的秒数
-        """
+        """延长生存时间"""
         if self.metadata.ttl is not None:
             self.metadata.ttl += extra_seconds
             logger.debug(
@@ -297,9 +224,7 @@ class Session:
             )
     
     def renew(self):
-        """
-        重置会话（从当前时间重新计算 TTL）
-        """
+        """重置会话（从当前时间重新计算 TTL）"""
         self.metadata.created_at = time.time()
         logger.debug("Session renewed", session_id=self.session_id)
     
@@ -319,7 +244,16 @@ class Session:
         """检查是否有标签"""
         return tag in self.metadata.tags
     
-    # ===== 持久化 =====
+    # ===== 持久化（异步方法，可发布事件）=====
+    
+    async def _auto_save(self):
+        """
+        内部自动保存方法（捕获异常，避免影响主流程）
+        """
+        try:
+            await self.save()
+        except Exception as e:
+            logger.error("Auto-save failed", session_id=self.session_id, error=str(e))
     
     async def save(self, force: bool = False):
         """
@@ -342,7 +276,8 @@ class Session:
                 
                 logger.debug("Session saved", session_id=self.session_id)
                 
-                self.event_bus.publish(SessionEvent(
+                # ✅ 在异步上下文中发布事件
+                await self.event_bus.publish(SessionEvent(
                     type="session_saved",
                     data={"session_id": self.session_id}
                 ))
@@ -354,12 +289,7 @@ class Session:
                 )
     
     async def load(self) -> bool:
-        """
-        从存储加载会话
-        
-        返回:
-            是否成功加载
-        """
+        """从存储加载会话"""
         if not self.storage:
             return False
         
@@ -374,7 +304,8 @@ class Session:
                 
                 logger.debug("Session loaded", session_id=self.session_id)
                 
-                self.event_bus.publish(SessionEvent(
+                # ✅ 在异步上下文中发布事件
+                await self.event_bus.publish(SessionEvent(
                     type="session_loaded",
                     data={"session_id": self.session_id}
                 ))
@@ -389,16 +320,15 @@ class Session:
                 return False
     
     async def destroy(self):
-        """
-        销毁会话（从存储中删除）
-        """
+        """销毁会话（从存储中删除）"""
         if self.storage:
             async with self._lock:
                 try:
                     await self.storage.delete(self.session_id)
                     logger.info("Session destroyed", session_id=self.session_id)
                     
-                    self.event_bus.publish(SessionEvent(
+                    # ✅ 在异步上下文中发布事件
+                    await self.event_bus.publish(SessionEvent(
                         type="session_destroyed",
                         data={"session_id": self.session_id}
                     ))
@@ -414,12 +344,7 @@ class Session:
     # ===== 序列化 =====
     
     def to_dict(self) -> Dict[str, Any]:
-        """
-        序列化为字典
-        
-        返回:
-            包含状态和元数据的字典
-        """
+        """序列化为字典"""
         return {
             "state": self.state,
             "metadata": self.metadata.model_dump(),
@@ -429,8 +354,7 @@ class Session:
         """
         从字典反序列化
         
-        参数:
-            data: 数据字典
+        注意：不触发 touch()，保持原始访问计数
         """
         self.state = data.get("state", {})
         
@@ -439,22 +363,14 @@ class Session:
             self.metadata = SessionMetadata(**metadata_data)
     
     def clone(self, new_id: Optional[str] = None) -> Session:
-        """
-        克隆会话
-        
-        参数:
-            new_id: 新会话 ID（None 则自动生成）
-        
-        返回:
-            新的 Session 实例
-        """
+        """克隆会话"""
         cloned = Session(
             session_id=new_id,
             state=self.state.copy(),
             storage=self.storage,
             ttl=self.metadata.ttl,
             event_bus=self.event_bus,
-            auto_save=False,  # 克隆时不自动保存
+            auto_save=False,
         )
         
         # 复制标签
@@ -466,12 +382,9 @@ class Session:
     # ===== 调试信息 =====
     
     def get_info(self) -> Dict[str, Any]:
-        """
-        获取会话信息（用于调试/监控）
+        """获取会话信息"""
+        from datetime import datetime
         
-        返回:
-            会话信息字典
-        """
         return {
             "session_id": self.session_id,
             "state_keys": len(self.state),
@@ -502,53 +415,23 @@ class Session:
 # ===== 会话管理器 =====
 
 class SessionManager:
-    """
-    会话管理器
-    
-    负责管理多个会话的生命周期、持久化和清理。
-    
-    示例:
-        ```python
-        # 创建管理器
-        manager = SessionManager(storage=storage)
-        
-        # 创建会话
-        session = await manager.create_session(ttl=3600)
-        
-        # 获取会话
-        session = await manager.get_session(session_id)
-        
-        # 清理过期会话
-        await manager.cleanup_expired()
-        ```
-    """
+    """会话管理器"""
     
     def __init__(
         self,
         storage: Optional[SessionInterface] = None,
         default_ttl: Optional[int] = None,
         auto_cleanup: bool = True,
-        cleanup_interval: int = 300,  # 5 分钟
+        cleanup_interval: int = 300,
     ):
-        """
-        初始化会话管理器
-        
-        参数:
-            storage: 存储后端
-            default_ttl: 默认 TTL（秒）
-            auto_cleanup: 是否自动清理过期会话
-            cleanup_interval: 清理间隔（秒）
-        """
         self.storage = storage
         self.default_ttl = default_ttl
         self.auto_cleanup = auto_cleanup
         self.cleanup_interval = cleanup_interval
         
-        # 内存缓存（session_id -> Session）
         self._sessions: Dict[str, Session] = {}
         self._lock = asyncio.Lock()
         
-        # 自动清理任务
         self._cleanup_task: Optional[asyncio.Task] = None
         
         if auto_cleanup:
@@ -577,17 +460,7 @@ class SessionManager:
         ttl: Optional[int] = None,
         **initial_state
     ) -> Session:
-        """
-        创建新会话
-        
-        参数:
-            session_id: 会话 ID（None 则自动生成）
-            ttl: 生存时间（None 则使用默认值）
-            **initial_state: 初始状态
-        
-        返回:
-            Session 实例
-        """
+        """创建新会话"""
         async with self._lock:
             session = Session(
                 session_id=session_id,
@@ -613,12 +486,7 @@ class SessionManager:
         """
         获取会话
         
-        参数:
-            session_id: 会话 ID
-            create_if_missing: 如果不存在是否创建
-        
-        返回:
-            Session 实例，如果不存在返回 None
+        自动更新访问时间和计数
         """
         # 1. 检查内存缓存
         if session_id in self._sessions:
@@ -630,6 +498,9 @@ class SessionManager:
                 if create_if_missing:
                     return await self.create_session(session_id=session_id)
                 return None
+            
+            # ✅ 在管理器级别 touch（有意义的访问点）
+            session.touch()
             
             return session
         
@@ -651,6 +522,9 @@ class SessionManager:
                 async with self._lock:
                     self._sessions[session_id] = session
                 
+                # ✅ touch
+                session.touch()
+                
                 return session
         
         # 3. 创建新会话（如果允许）
@@ -660,15 +534,7 @@ class SessionManager:
         return None
     
     async def destroy_session(self, session_id: str) -> bool:
-        """
-        销毁会话
-        
-        参数:
-            session_id: 会话 ID
-        
-        返回:
-            是否成功
-        """
+        """销毁会话"""
         async with self._lock:
             session = self._sessions.pop(session_id, None)
             
@@ -685,12 +551,7 @@ class SessionManager:
         return False
     
     async def cleanup_expired(self) -> int:
-        """
-        清理所有过期会话
-        
-        返回:
-            清理的会话数量
-        """
+        """清理所有过期会话"""
         expired_ids = []
         
         async with self._lock:
@@ -715,7 +576,7 @@ class SessionManager:
         return list(self._sessions.values())
     
     async def shutdown(self):
-        """关闭管理器（取消清理任务，保存所有会话）"""
+        """关闭管理器"""
         if self._cleanup_task:
             self._cleanup_task.cancel()
             try:
