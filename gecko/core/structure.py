@@ -229,7 +229,10 @@ class StructureEngine:
             return cls._extract_json(content, model_class, strict=strict, auto_fix=auto_fix)
         except Exception as e:
             # 收集所有尝试的错误
-            if hasattr(e, 'attempts'):
+            # [修复] 增加 and e.attempts 判断
+            # 如果子异常有 attempts 且不为空，说明是深层策略失败，合并历史
+            # 否则（如快速失败），将其视为当前步骤的一个错误记录下来
+            if hasattr(e, 'attempts') and e.attempts:
                 attempts.extend(e.attempts)
             else:
                 attempts.append({
