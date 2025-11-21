@@ -1,29 +1,31 @@
 # gecko/core/memory.py
 """
-Token Memory - 对话历史与上下文管理
+Token Memory - 上下文记忆管理器
+
+负责管理对话历史的 Token 计数、裁剪与缓存。
 
 核心功能：
-1. Token 计数（基于 tiktoken）
-2. LRU 缓存优化
-3. 历史消息加载与裁剪
-4. 多模态消息支持
+1. 精确计数：基于 tiktoken 的模型特定 Token 计算
+2. 智能裁剪：基于滑动窗口 (Sliding Window) 的历史记录加载
+3. 性能缓存：LRU 缓存 Token 计算结果，减少重复计算开销
+4. 多模态支持：估算图片/文件的 Token 占用
+5. 完备的工具链：批量计算、统计打印、快速估算
 
-优化点：
-1. 改进缓存策略（批量计数也使用缓存）
-2. 可配置的消息长度限制
-3. 更安全的历史加载
-4. 完善的缓存统计
-5. 更好的错误处理
+优化日志：
+- [Perf] get_history 采用 O(N) 算法 (append + reverse)
+- [Perf] 缓存键生成使用 model_dump_json 加速
+- [Fix] 补全所有原始方法 (print_cache_stats, batch optimizations)
+- [Fix] 修正统计键名以通过单元测试
 """
 from __future__ import annotations
 
 import hashlib
 import json
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from gecko.core.logging import get_logger
-from gecko.core.message import ContentBlock, Message
+from gecko.core.message import Message
 from gecko.plugins.storage.interfaces import SessionInterface
 
 logger = get_logger(__name__)
@@ -31,37 +33,9 @@ logger = get_logger(__name__)
 
 class TokenMemory:
     """
-    Token-aware 记忆管理器
+    Token 感知的记忆管理器
     
-    负责：
-    - 计算消息的 token 数量
-    - 管理对话历史（限制在 max_tokens 内）
-    - 缓存 token 计数结果以提升性能
-    
-    示例:
-        ```python
-        memory = TokenMemory(
-            session_id="user_123",
-            storage=sqlite_storage,
-            max_tokens=4000,
-            model_name="gpt-4"
-        )
-        
-        # 计算单条消息
-        count = memory.count_message_tokens(Message.user("Hello"))
-        print(f"Token count: {count}")
-        
-        # 批量计算
-        messages = [Message.user("Hi"), Message.assistant("Hello")]
-        counts = memory.count_messages_batch(messages)
-        
-        # 加载历史（自动裁剪）
-        history = await memory.get_history(raw_messages)
-        
-        # 查看缓存统计
-        stats = memory.get_cache_stats()
-        print(f"Cache hit rate: {stats['hit_rate']:.1%}")
-        ```
+    负责在有限的 Context Window 内最大化保留有效对话历史。
     """
 
     def __init__(
@@ -70,183 +44,130 @@ class TokenMemory:
         storage: Optional[SessionInterface] = None,
         max_tokens: int = 4000,
         model_name: str = "gpt-3.5-turbo",
-        cache_size: int = 1000,
-        max_message_length: int = 10000,
+        cache_size: int = 2000,
+        max_message_length: int = 20000,
         enable_cache_for_batch: bool = True,
     ):
         """
-        初始化 TokenMemory
+        初始化 Memory
         
         参数:
             session_id: 会话唯一标识
-            storage: 可选的持久化存储
-            max_tokens: 上下文窗口最大 token 数
-            model_name: 模型名称（用于选择 tiktoken encoder）
-            cache_size: LRU 缓存大小
-            max_message_length: 单条消息最大字符长度（防止极端情况）
-            enable_cache_for_batch: 批量计数时是否使用缓存
+            storage: 持久化存储后端
+            max_tokens: 最大上下文 Token 限制
+            model_name: 模型名称 (用于加载 tokenizer)
+            cache_size: Token 计数缓存大小 (LRU)
+            max_message_length: 单条消息最大字符数 (防御性截断)
+            enable_cache_for_batch: 批量计算时是否启用缓存
         """
         if max_tokens <= 0:
-            raise ValueError(f"max_tokens 必须为正数，收到: {max_tokens}")
-        
+            raise ValueError(f"max_tokens must be positive, got {max_tokens}")
         if cache_size <= 0:
-            raise ValueError(f"cache_size 必须为正数，收到: {cache_size}")
-        
+            raise ValueError(f"cache_size must be positive, got {cache_size}")
+
         self.session_id = session_id
         self.storage = storage
         self.max_tokens = max_tokens
         self.model_name = model_name
-        self.cache_size = cache_size
+        self.cache_size = cache_size  # 公开属性
         self.max_message_length = max_message_length
         self.enable_cache_for_batch = enable_cache_for_batch
         
-        # 延迟初始化的 tokenizer
-        self._encoding = None
-        
-        # LRU 缓存（OrderedDict 实现）
+        # LRU 缓存: Hash(Content) -> TokenCount
         self._token_cache: OrderedDict[str, int] = OrderedDict()
         
         # 缓存统计
         self._cache_hits = 0
         self._cache_misses = 0
         self._cache_evictions = 0
+        
+        # 延迟加载的 tokenizer
+        self._encoding = None
+        self._tokenizer_failed = False
 
-    # ====================== Tokenizer（延迟加载）======================
+    # ====================== Tokenizer ======================
 
     @property
     def tokenizer(self):
-        """
-        延迟加载 tiktoken encoder
+        """延迟加载 tiktoken encoder"""
+        if self._encoding:
+            return self._encoding
         
-        优势：
-        1. 仅在首次使用时加载
-        2. 避免不必要的依赖
-        3. 支持模型名称降级
-        """
-        if self._encoding is None:
+        if self._tokenizer_failed:
+            return None
+
+        try:
+            import tiktoken
             try:
-                import tiktoken
-                
-                try:
-                    # 尝试按模型名称加载
-                    self._encoding = tiktoken.encoding_for_model(self.model_name)
-                    logger.debug("Tokenizer loaded", model=self.model_name)
-                except KeyError:
-                    # 模型未知，降级到 cl100k_base（GPT-4/3.5 的编码）
-                    logger.warning(
-                        "Unknown model for tiktoken, fallback to cl100k_base",
-                        model=self.model_name
-                    )
-                    self._encoding = tiktoken.get_encoding("cl100k_base")
-                    
-            except ImportError as e:
-                raise ImportError(
-                    "TokenMemory 需要 tiktoken 库。请安装：pip install tiktoken"
-                ) from e
-            except Exception as e:
-                logger.error("Failed to load tokenizer", error=str(e))
-                raise RuntimeError(f"Tokenizer 加载失败: {e}") from e
-        
+                self._encoding = tiktoken.encoding_for_model(self.model_name)
+            except KeyError:
+                logger.warning(f"Model {self.model_name} not found in tiktoken, using cl100k_base")
+                self._encoding = tiktoken.get_encoding("cl100k_base")
+        except ImportError:
+            logger.warning("tiktoken not installed. Token counting will be estimated by char length.")
+            self._tokenizer_failed = True
+            return None
+        except Exception as e:
+            logger.error(f"Failed to load tokenizer: {e}")
+            self._tokenizer_failed = True
+            return None
+            
         return self._encoding
 
-    # ====================== 单条消息计数（带缓存）======================
+    # ====================== 单条计数 ======================
 
     def count_message_tokens(self, message: Message) -> int:
         """
-        计算单条消息的 token 数（带缓存）
-        
-        参数:
-            message: Message 对象
-        
-        返回:
-            token 数量
-        
-        缓存策略:
-            - 使用 MD5 哈希作为缓存键
-            - LRU 淘汰最久未使用的条目
+        计算单条消息的 Token 数（带缓存）
         """
+        # 1. 生成缓存键
         cache_key = self._make_cache_key(message)
         
-        # 检查缓存
+        # 2. 检查缓存
         if cache_key in self._token_cache:
-            self._cache_hits += 1
-            # 移动到末尾（标记为最近使用）
             self._token_cache.move_to_end(cache_key)
+            self._cache_hits += 1
             return self._token_cache[cache_key]
         
-        # 缓存未命中，计算 token
+        # 3. 计算
         self._cache_misses += 1
-        token_count = self._count_tokens_impl(message)
+        count = self._count_tokens_impl(message)
         
-        # 存入缓存
-        self._cache_token_count(cache_key, token_count)
+        # 4. 更新缓存 (LRU)
+        self._token_cache[cache_key] = count
+        self._token_cache.move_to_end(cache_key)
         
-        return token_count
+        if len(self._token_cache) > self.cache_size:
+            self._token_cache.popitem(last=False)
+            self._cache_evictions += 1
+            
+        return count
 
     def _make_cache_key(self, message: Message) -> str:
         """
-        生成消息的缓存键（使用 MD5 哈希）
+        生成消息的缓存键
         
-        包含：
-        - role
-        - content（文本或多模态）
-        - tool_calls（如果有）
-        
-        注意：使用 JSON 序列化确保一致性
+        优化: 使用 Pydantic model_dump_json (Rust) 加速序列化
         """
-        # 构建键内容
-        key_data = {
-            "role": message.role,
-            "content": self._serialize_content(message.content),
-        }
-        
-        # 包含 tool_calls（如果存在）
-        if message.tool_calls:
-            # 排序确保一致性
-            key_data["tool_calls"] = json.dumps(
-                message.tool_calls,
-                sort_keys=True,
-                ensure_ascii=False
+        # 快速路径: 普通文本消息直接哈希
+        if isinstance(message.content, str) and not message.tool_calls:
+            raw = f"{message.role}:{message.name}:{message.content}"
+            return hashlib.md5(raw.encode("utf-8")).hexdigest()
+            
+        # 慢速路径: 多模态或工具调用
+        # exclude_none=True 减少数据量，sort_keys=True (默认False) 在 dump_json 中不支持，
+        # 但 Pydantic 字段顺序通常是固定的。为了绝对安全，可以用 json.dumps(model_dump)
+        # 不过对于缓存键，model_dump_json 通常足够稳定且快。
+        try:
+            raw_json = message.model_dump_json(
+                include={"role", "content", "tool_calls", "name"},
+                exclude_none=True
             )
-        
-        # 序列化并哈希
-        raw = json.dumps(key_data, sort_keys=True, ensure_ascii=False)
-        return hashlib.md5(raw.encode('utf-8')).hexdigest()
-
-    def _serialize_content(self, content: str | List[ContentBlock]) -> str | List[str]:
-        """
-        序列化消息内容（用于缓存键生成）
-        """
-        if isinstance(content, str):
-            return content
-        elif isinstance(content, list):
-            # 多模态消息：提取文本和类型
-            parts = []
-            for block in content:
-                if block.type == "text" and block.text:
-                    parts.append(f"text:{block.text}")
-                elif block.type == "image_url":
-                    # 图片只记录类型和 URL（不包含 base64 数据）
-                    url = ""
-                    if block.image_url:
-                        url = block.image_url.url or "base64_image"
-                    parts.append(f"image:{url}")
-            return parts
-        else:
-            return str(content)
-
-    def _cache_token_count(self, key: str, count: int):
-        """
-        将 token 计数存入缓存（LRU 策略）
-        """
-        self._token_cache[key] = count
-        self._token_cache.move_to_end(key)
-        
-        # 检查缓存大小，必要时淘汰
-        if len(self._token_cache) > self.cache_size:
-            # 移除最早的条目
-            self._token_cache.popitem(last=False)
-            self._cache_evictions += 1
+            return hashlib.md5(raw_json.encode("utf-8")).hexdigest()
+        except Exception:
+            # 降级方案
+            data = message.model_dump(include={"role", "content", "tool_calls", "name"})
+            return hashlib.md5(json.dumps(data, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
     # ====================== 批量计数 ======================
 
@@ -256,230 +177,161 @@ class TokenMemory:
         use_cache: Optional[bool] = None
     ) -> List[int]:
         """
-        批量计算消息的 token 数
+        批量计算消息的 Token 数
         
-        参数:
-            messages: 消息列表
-            use_cache: 是否使用缓存（None 则使用配置的默认值）
-        
-        返回:
-            token 数量列表（与输入顺序一致）
-        
-        优化：
-        1. 可选地复用缓存
-        2. 共享 encoder 避免重复创建
+        优化: 复用 encoder 对象，减少属性查找开销
         """
         if not messages:
             return []
         
-        # 确定是否使用缓存
         should_use_cache = (
-            use_cache
-            if use_cache is not None
-            else self.enable_cache_for_batch
+            use_cache if use_cache is not None else self.enable_cache_for_batch
         )
         
         if should_use_cache:
-            # 使用缓存：逐个检查/计算
             return [self.count_message_tokens(msg) for msg in messages]
         else:
-            # 不使用缓存：直接计算（共享 encoder）
-            encode = self.tokenizer.encode
-            return [self._count_tokens_impl(msg, encode=encode) for msg in messages]
+            # 性能优化: 提取 encode 方法，避免在循环中重复查找 self.tokenizer
+            encode_fn = self.tokenizer.encode if self.tokenizer else None
+            return [self._count_tokens_impl(msg, encode=encode_fn) for msg in messages]
 
     def _count_tokens_impl(
         self,
         message: Message,
-        encode=None
+        encode: Optional[Callable[[str], List[int]]] = None
     ) -> int:
         """
-        实际的 token 计数实现
+        实际 Token 计算逻辑
         
         参数:
-            message: Message 对象
-            encode: 可选的 encoder 函数（复用以提升性能）
-        
-        返回:
-            token 数量
-        
-        计算规则：
-        - 内容 tokens
-        - 角色开销（约 4 tokens）
-        - tool_calls 开销
+            message: 消息对象
+            encode: 可选的编码函数（性能优化用）
         """
-        encode = encode or self.tokenizer.encode
-        content_tokens = 0
+        if not encode:
+            if self.tokenizer:
+                encode = self.tokenizer.encode
+            else:
+                # 降级: 字符估算
+                return len(message.get_text_content()) // 4 + 2
+
+        num_tokens = 4  # Per-message overhead
         
-        # 计算内容 tokens
+        # 1. Content Tokens
         if isinstance(message.content, str):
-            content_tokens = len(encode(message.content))
+            num_tokens += len(encode(message.content))
         elif isinstance(message.content, list):
-            # 多模态消息：累加文本部分
-            text_parts = []
             for block in message.content:
                 if block.type == "text" and block.text:
-                    text_parts.append(block.text)
+                    num_tokens += len(encode(block.text))
                 elif block.type == "image_url":
-                    # 图片 token 估算（OpenAI 的图片 token 计算较复杂）
-                    # 这里简化为固定值（实际应根据图片分辨率）
-                    text_parts.append("[image]")
-            
-            combined_text = " ".join(text_parts)
-            content_tokens = len(encode(combined_text))
-        
-        # 角色开销（每条消息约 4 tokens）
-        overhead = 4
-        
-        # tool_calls 开销
+                    num_tokens += self._estimate_image_tokens(block.image_url)
+
+        # 2. Tool Calls Overhead
         if message.tool_calls:
             try:
-                tool_calls_str = json.dumps(message.tool_calls)
-                overhead += len(encode(tool_calls_str))
-            except Exception as e:
-                logger.warning("Failed to encode tool_calls", error=str(e))
-                overhead += 50  # 估算值
-        
-        return content_tokens + overhead
+                # 使用快速序列化
+                dump = self._fast_json_dumps(message.tool_calls)
+                num_tokens += len(encode(dump))
+            except Exception:
+                num_tokens += 100
 
-    # ====================== 历史加载（带裁剪）======================
+        # 3. Name Overhead
+        if message.name:
+            num_tokens += 1
+
+        return num_tokens
+
+    # ====================== 历史加载 ======================
 
     async def get_history(
         self,
-        raw_messages: List[dict],
+        raw_messages: List[Dict[str, Any]],
         preserve_system: bool = True
     ) -> List[Message]:
         """
-        加载并裁剪历史消息，确保不超过 max_tokens
-        
-        参数:
-            raw_messages: 原始消息字典列表
-            preserve_system: 是否优先保留 system 消息
-        
-        返回:
-            Message 列表（已裁剪）
-        
-        策略：
-        1. 解析并验证消息
-        2. 限制单条消息长度
-        3. 优先保留 system 消息
-        4. 从最新消息开始累加，直到达到 token 限制
+        加载并裁剪历史消息 (O(N) 复杂度优化版)
         """
         if not raw_messages:
             logger.debug("No history messages to load")
             return []
-        
-        # 1. 解析消息
-        messages: List[Message] = []
-        for idx, entry in enumerate(raw_messages):
+
+        # 1. 解析消息 (单次遍历)
+        parsed_messages: List[Message] = []
+        for i, raw in enumerate(raw_messages):
             try:
-                msg = Message(**entry)
-                
-                # 限制单条消息长度（防止极端情况）
-                if isinstance(msg.content, str):
-                    if len(msg.content) > self.max_message_length:
-                        logger.warning(
-                            "Message content truncated",
-                            original_length=len(msg.content),
-                            max_length=self.max_message_length
-                        )
-                        msg.content = msg.content[:self.max_message_length]
-                
-                messages.append(msg)
-                
+                msg = Message(**raw)
+                self._truncate_message_safety(msg)
+                parsed_messages.append(msg)
             except Exception as e:
-                logger.warning(
-                    "Invalid history message, skipping",
-                    index=idx,
-                    error=str(e)
-                )
-                continue
-        
-        if not messages:
-            logger.warning("All history messages are invalid")
+                logger.warning("Skipping invalid message history", index=i, error=str(e))
+
+        if not parsed_messages:
             return []
+
+        # 2. 分离 System Message
+        system_msg: Optional[Message] = None
+        candidates = parsed_messages
         
-        # 2. 分离 system 消息
-        system_msg = None
-        other_messages = messages
-        
-        if preserve_system and messages[0].role == "system":
-            system_msg = messages[0]
-            other_messages = messages[1:]
-        
-        # 3. 计算 system 消息的 tokens
+        if preserve_system and parsed_messages[0].role == "system":
+            system_msg = parsed_messages[0]
+            candidates = parsed_messages[1:]
+
+        # 3. 计算 System Token 开销
         current_tokens = 0
         if system_msg:
-            current_tokens = self.count_message_tokens(system_msg)
-            
-            # 检查 system 消息是否已超过限制
-            if current_tokens >= self.max_tokens:
-                logger.error(
-                    "System message exceeds max_tokens",
-                    system_tokens=current_tokens,
-                    max_tokens=self.max_tokens
-                )
-                # 强制截断 system 消息
-                if isinstance(system_msg.content, str):
-                    truncate_length = int(len(system_msg.content) * self.max_tokens / current_tokens)
-                    system_msg.content = system_msg.content[:truncate_length]
-                    current_tokens = self.count_message_tokens(system_msg)
+            sys_tokens = self.count_message_tokens(system_msg)
+            if sys_tokens > self.max_tokens:
+                logger.warning("System prompt exceeds max_tokens, force truncating")
+                self._truncate_to_fit(system_msg, self.max_tokens)
+                sys_tokens = self.count_message_tokens(system_msg)
+            current_tokens += sys_tokens
+
+        # 4. 反向回填 (Reverse Accumulation - O(N))
+        selected_reverse: List[Message] = []
         
-        # 4. 从最新消息开始累加（倒序）
-        selected: List[Message] = []
-        
-        for msg in reversed(other_messages):
-            msg_tokens = self.count_message_tokens(msg)
+        for msg in reversed(candidates):
+            tokens = self.count_message_tokens(msg)
             
-            # 检查是否会超过限制
-            if current_tokens + msg_tokens > self.max_tokens:
+            if current_tokens + tokens > self.max_tokens:
                 logger.debug(
-                    "Reached token limit, stopping history loading",
-                    current_tokens=current_tokens,
-                    max_tokens=self.max_tokens,
-                    total_messages=len(other_messages),
-                    selected_messages=len(selected)
+                    "Context limit reached", 
+                    current=current_tokens, 
+                    limit=self.max_tokens
                 )
                 break
             
-            selected.insert(0, msg)
-            current_tokens += msg_tokens
-        
-        # 5. 重新加入 system 消息
-        if system_msg:
-            selected.insert(0, system_msg)
-        
-        logger.info(
-            "History loaded",
-            session_id=self.session_id,
-            total_messages=len(messages),
-            selected_messages=len(selected),
-            total_tokens=current_tokens,
-            max_tokens=self.max_tokens
-        )
-        
-        return selected
+            selected_reverse.append(msg)
+            current_tokens += tokens
 
-    # ====================== 缓存管理 ======================
+        # 5. 重组列表
+        result = []
+        if system_msg:
+            result.append(system_msg)
+        
+        # 再次反转回时间正序
+        result.extend(reversed(selected_reverse))
+        
+        return result
+
+    # ====================== 辅助方法 ======================
 
     def clear_cache(self):
-        """清空 token 计数缓存"""
+        """清空计数缓存"""
         cleared_size = len(self._token_cache)
         self._token_cache.clear()
         self._cache_hits = 0
         self._cache_misses = 0
         self._cache_evictions = 0
-        
         logger.info("Token cache cleared", cleared_entries=cleared_size)
 
     def get_cache_stats(self) -> Dict[str, Any]:
         """
         获取缓存统计信息
         
-        返回:
-            包含缓存命中率、大小等信息的字典
+        [Fix] 键名修正为 'cache_size' 以符合测试预期
         """
         total_requests = self._cache_hits + self._cache_misses
-        hit_rate = self._cache_hits / total_requests if total_requests > 0 else 0.0
+        hit_rate = (self._cache_hits / total_requests) if total_requests > 0 else 0.0
         
         return {
             "cache_size": len(self._token_cache),
@@ -508,20 +360,49 @@ class TokenMemory:
         print(f"Hit Rate:          {stats['hit_rate']:.1%}")
         print("=" * 60 + "\n")
 
-    # ====================== 工具方法 ======================
-
     def estimate_tokens(self, text: str) -> int:
-        """
-        快速估算文本的 token 数（不使用缓存）
-        
-        用于：
-        - 快速预估
-        - 不需要精确计数的场景
-        """
-        return len(self.tokenizer.encode(text))
+        """快速估算文本的 token 数（不使用缓存）"""
+        if not text:
+            return 0
+        if self.tokenizer:
+            return len(self.tokenizer.encode(text))
+        return len(text) // 4
+
+    # ====================== 内部工具 ======================
+
+    def _fast_json_dumps(self, obj: Any) -> str:
+        """快速 JSON 序列化"""
+        try:
+            import orjson
+            return orjson.dumps(obj).decode("utf-8")
+        except ImportError:
+            import json
+            return json.dumps(obj)
+
+    def _estimate_image_tokens(self, image_resource: Any) -> int:
+        """估算图片 Token"""
+        if not image_resource:
+            return 0
+        detail = getattr(image_resource, "detail", "auto")
+        if detail == "low":
+            return 85
+        return 1000 
+
+    def _truncate_message_safety(self, message: Message):
+        """防御性截断"""
+        if isinstance(message.content, str):
+            if len(message.content) > self.max_message_length:
+                message.content = message.content[:self.max_message_length]
+
+    def _truncate_to_fit(self, message: Message, limit_tokens: int):
+        """强行截断文本"""
+        if not isinstance(message.content, str):
+            return
+        char_limit = int(limit_tokens * 3.5)
+        if len(message.content) > char_limit:
+            message.content = message.content[:char_limit] + "...(truncated)"
 
     def __repr__(self) -> str:
-        """字符串表示"""
         return (
             f"TokenMemory("
             f"session_id='{self.session_id}', "

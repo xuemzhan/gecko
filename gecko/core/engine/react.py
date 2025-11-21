@@ -1,23 +1,27 @@
 # gecko/core/engine/react.py
 """
-ReActEngine - 推理与行动引擎
+ReAct 推理引擎
+
+实现了 ReAct (Reason + Act) 认知架构，负责协调 LLM 与工具箱的交互循环。
+
+核心功能：
+1. 推理循环：基于 Thought-Action-Observation 模式的自动执行
+2. 流式输出：支持低延迟的 Token 级流式响应，同时保持工具调用的完整性
+3. 结构化输出：支持将推理结果解析为强类型的 Pydantic 对象
+4. 稳健性设计：内置死循环检测、观测值截断、错误反馈与自动重试
 
 优化日志：
-1. 集成 StructureEngine 的新 API，移除冗余的解析逻辑
-2. 修复 ExecutionStats 统计缺失问题
-3. 优化 ExecutionContext 上下文管理
-4. 增强工具执行的错误反馈机制
-5. 统一普通推理和流式推理的底层逻辑
-6. 修复流式输出记忆丢失问题
-7. 修复结构化输出时 tool_choice 过于严格导致无法调用其他工具的问题
-8. 增加 Prompt 引导以强制结构化输出工具调用
+- [Fix] 重构 step_stream: 移除 Peek 机制，显著降低首字延迟 (TTFT)
+- [Fix] 修复 Jinja2 模板语法，正确处理字典属性访问
+- [Fix] 完善生命周期钩子 (on_turn_start/end) 在流式模式下的覆盖
+- [Feat] 增加工具调用死循环检测 (Hash-based loop detection)
+- [Feat] 增加工具观测值 (Observation) 智能截断
 """
-
 from __future__ import annotations
 
-import asyncio
 import json
 import time
+from datetime import datetime
 from typing import (
     Any,
     AsyncIterator,
@@ -25,19 +29,19 @@ from typing import (
     Dict,
     List,
     Optional,
-    Tuple,
     Type,
     TypeVar,
+    Union,
 )
 
 from pydantic import BaseModel
 
 from gecko.core.engine.base import CognitiveEngine
-from gecko.core.output import AgentOutput
 from gecko.core.exceptions import AgentError, ModelError
 from gecko.core.logging import get_logger
-from gecko.core.message import Message
 from gecko.core.memory import TokenMemory
+from gecko.core.message import Message
+from gecko.core.output import AgentOutput
 from gecko.core.prompt import PromptTemplate
 from gecko.core.structure import StructureEngine, StructureParseError
 from gecko.core.toolbox import ToolBox
@@ -47,30 +51,43 @@ logger = get_logger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 
+# 默认 ReAct 提示词模板
+# 包含时间注入和工具列表渲染
 DEFAULT_REACT_TEMPLATE = """You are a helpful AI assistant.
+Current Time: {{ current_time }}
+
 Available Tools:
 {% for tool in tools %}
-- {{ tool.function.name }}: {{ tool.function.description }}
+- {{ tool['function']['name'] }}: {{ tool['function']['description'] }}
 {% endfor %}
 
 Answer the user's request. Use tools if necessary.
+If you use a tool, just output the tool call format.
 """
 
 
 class ExecutionContext:
     """
-    执行上下文：封装每一轮 ReAct 循环的状态
+    执行上下文
+    
+    封装每一轮 ReAct 循环的运行时状态，用于在 Engine 内部传递数据。
     """
 
     def __init__(self, messages: List[Message]):
         self.messages = messages.copy()  # 浅拷贝，避免污染原始列表
         self.turn = 0
         self.metadata: Dict[str, Any] = {}
+        
+        # 状态追踪：用于死循环检测
+        self.last_tool_calls_hash: Optional[int] = None
+        self.consecutive_tool_error_count: int = 0
 
     def add_message(self, message: Message):
+        """追加消息到当前上下文"""
         self.messages.append(message)
 
     def get_last_message(self) -> Optional[Message]:
+        """获取最后一条消息"""
         return self.messages[-1] if self.messages else None
 
 
@@ -85,14 +102,32 @@ class ReActEngine(CognitiveEngine):
         toolbox: ToolBox,
         memory: TokenMemory,
         max_turns: int = 5,
-        system_prompt: str | PromptTemplate | None = None,
+        max_observation_length: int = 2000,
+        system_prompt: Union[str, PromptTemplate, None] = None,
         on_turn_start: Optional[Callable[[ExecutionContext], Any]] = None,
         on_turn_end: Optional[Callable[[ExecutionContext], Any]] = None,
         on_tool_execute: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
         **kwargs,
     ):
+        """
+        初始化 ReAct 引擎
+        
+        参数:
+            model: LLM 模型实例 (需实现 ModelProtocol)
+            toolbox: 工具箱实例
+            memory: 记忆管理器
+            max_turns: 最大思考轮数 (防止无限循环)
+            max_observation_length: 工具输出的最大字符数 (防止 Context 爆炸)
+            system_prompt: 自定义系统提示词
+            on_turn_start: 每一轮开始时的钩子
+            on_turn_end: 每一轮结束时的钩子
+            on_tool_execute: 工具执行前的钩子
+        """
         super().__init__(model, toolbox, memory, **kwargs)
         self.max_turns = max_turns
+        self.max_observation_length = max_observation_length
+        
+        # Hooks
         self.on_turn_start = on_turn_start
         self.on_turn_end = on_turn_end
         self.on_tool_execute = on_tool_execute
@@ -110,11 +145,9 @@ class ReActEngine(CognitiveEngine):
         self._supports_stream = self._check_streaming_support()
 
     def _check_function_calling_support(self) -> bool:
-        # 优先检查显式属性，其次检查方法
         if hasattr(self.model, "_supports_function_calling"):
             return getattr(self.model, "_supports_function_calling")
-        # 默认假设实现了 ModelProtocol 且没有抛错
-        return True
+        return True  # 默认假设支持，运行时报错再处理
 
     def _check_streaming_support(self) -> bool:
         return hasattr(self.model, "astream")
@@ -128,16 +161,21 @@ class ReActEngine(CognitiveEngine):
         strategy: str = "auto",
         max_retries: int = 2,
         **kwargs,
-    ) -> AgentOutput | T:
+    ) -> Union[AgentOutput, T]:
         """
-        核心推理入口
+        执行单次推理任务 (同步等待模式)
+        
+        流程:
+        1. 验证输入 & Hook
+        2. 构建上下文 (Context) & 参数
+        3. 执行 ReAct 循环 (Reasoning Loop)
+        4. 处理结构化输出 (如果需要)
+        5. 保存记忆 & Hook
         """
         start_time = time.time()
 
-        # 1. 验证输入
+        # 1. 验证与 Hook
         self.validate_input(input_messages)
-
-        # 2. Hook: Before Step
         await self.before_step(input_messages, **kwargs)
 
         logger.info(
@@ -147,45 +185,31 @@ class ReActEngine(CognitiveEngine):
         )
 
         try:
-            # 增强结构化输出的 Prompt 引导
-            augmented_messages = input_messages
-            if response_model and self._supports_functions:
-                structure_tool_name = StructureEngine.to_openai_tool(response_model)[
-                    "function"
-                ]["name"]
-                instruction = (
-                    f"\nIMPORTANT: You MUST call the '{structure_tool_name}' function to provide your final answer. "
-                    "Do not reply with text only."
-                )
-                augmented_messages = input_messages.copy()
-                augmented_messages.append(Message.user(instruction))
-
-            # 3. 构建上下文
+            # 2. 预处理与上下文构建
+            augmented_messages = self._augment_messages_for_structure(
+                input_messages, response_model
+            )
             context = await self._build_execution_context(augmented_messages)
-
-            # 4. 构建 LLM 参数
+            
             llm_params = self._build_llm_params(response_model, strategy)
-            llm_params.update(kwargs)  # 合并额外参数
+            llm_params.update(kwargs)
 
-            # 5. 运行推理循环 (ReAct Loop)
+            # 3. 运行推理循环
             final_output = await self._run_reasoning_loop(
                 context, llm_params, response_model
             )
 
-            # 6. 结构化输出处理 (如果需要)
-            result = final_output
+            # 4. 结构化输出处理
+            result: Union[AgentOutput, T] = final_output
             if response_model:
                 result = await self._handle_structured_output(
                     final_output, response_model, context, llm_params, max_retries
                 )
 
-            # 7. 保存上下文到记忆
-            # 注意：保存的是原始 context，包含为了引导而添加的指令
-            # 如果不希望污染长期记忆，可以在这里做过滤，但为了简单起见暂且保留
+            # 5. 保存与收尾
             await self._save_context(context)
 
-            # 8. Hook: After Step
-            # 注意：如果返回的是结构化对象，我们需要包装成 AgentOutput 给 hook
+            # 触发 after_step (需将 T 转换为 AgentOutput 以兼容 Hook 签名)
             hook_output = (
                 result
                 if isinstance(result, AgentOutput)
@@ -193,10 +217,9 @@ class ReActEngine(CognitiveEngine):
             )
             await self.after_step(input_messages, hook_output, **kwargs)
 
-            # 9. 统计更新
-            duration = time.time() - start_time
+            # 统计
             if self.stats:
-                self.stats.add_step(duration)
+                self.stats.add_step(time.time() - start_time)
 
             return result
 
@@ -211,7 +234,11 @@ class ReActEngine(CognitiveEngine):
         self, input_messages: List[Message], **kwargs
     ) -> AsyncIterator[str]:
         """
-        流式推理入口
+        执行流式推理任务
+        
+        特点:
+        - 立即返回首个 Token (Low Latency)
+        - 遇到工具调用时暂停输出，执行工具后继续流式生成
         """
         if not self._supports_stream:
             raise AgentError("当前模型不支持流式输出")
@@ -219,36 +246,21 @@ class ReActEngine(CognitiveEngine):
         start_time = time.time()
         await self.before_step(input_messages, **kwargs)
 
+        # 构建上下文
         context = await self._build_execution_context(input_messages)
         llm_params = self._build_llm_params(None, "auto")
         llm_params.update(kwargs)
 
         try:
-            # 1. Peek 检查
-            needs_tools, peek_response = await self._check_needs_tools(
-                context, llm_params
-            )
+            # 进入递归流式循环
+            async for token in self._run_streaming_loop(context, llm_params):
+                yield token
 
-            if needs_tools:
-                # 如果需要工具，先在内部跑完 ReAct 循环
-                await self._execute_one_turn(context, llm_params, None)
-                # 工具执行完后，生成最终回复，此时可以流式
-            elif peek_response:
-                # 如果 Peek 已经拿到了文本回复，直接 yield
-                msg = self._parse_llm_response(peek_response)
-                yield msg.content or ""
-                return
-
-            # 2. 流式输出最终回复
-            async for chunk in self._stream_final_response(context, llm_params):
-                yield chunk
-
-            # 3. 统计与保存
+            # 保存记忆
             await self._save_context(context)
 
-            duration = time.time() - start_time
             if self.stats:
-                self.stats.add_step(duration)
+                self.stats.add_step(time.time() - start_time)
 
         except Exception as e:
             if self.stats:
@@ -257,64 +269,7 @@ class ReActEngine(CognitiveEngine):
             await self.on_error(e, input_messages, **kwargs)
             raise
 
-    # ===================== 上下文与参数构建 =====================
-
-    async def _build_execution_context(
-        self, input_messages: List[Message]
-    ) -> ExecutionContext:
-        """构建包含历史记录和系统提示词的上下文"""
-        # 加载历史
-        history = await self._load_history()
-
-        # 准备系统消息
-        system_msg = None
-        has_system = any(m.role == "system" for m in input_messages) or any(
-            m.role == "system" for m in history
-        )
-
-        if not has_system:
-            system_content = self.prompt_template.format(
-                tools=self.toolbox.to_openai_schema()
-            )
-            system_msg = Message.system(system_content)
-
-        # 组合消息: System + History + Input
-        all_messages = []
-        if system_msg:
-            all_messages.append(system_msg)
-        all_messages.extend(history)
-        all_messages.extend(input_messages)
-
-        return ExecutionContext(all_messages)
-
-    def _build_llm_params(
-        self, response_model: Optional[Type[T]], strategy: str
-    ) -> Dict[str, Any]:
-        """构建传递给 LLM 的参数 (Tools, Output Format)"""
-        params: Dict[str, Any] = {}
-
-        # 1. 注入工具
-        tools_schema = self.toolbox.to_openai_schema()
-        if tools_schema and self._supports_functions:
-            params["tools"] = tools_schema
-            params["tool_choice"] = "auto"
-
-        # 2. 注入结构化输出要求
-        if response_model:
-            if strategy in {"auto", "function_calling"} and self._supports_functions:
-                # 使用 Tool Calling 方式提取结构
-                structure_tool = StructureEngine.to_openai_tool(response_model)
-                params.setdefault("tools", []).append(structure_tool)
-                params["tool_choice"] = "auto"
-            else:
-                # 使用 JSON Mode
-                params["response_format"] = {"type": "json_object"}
-                if not self._supports_functions:
-                    logger.warning("模型不支持 Function Calling，降级为 JSON Mode")
-
-        return params
-
-    # ===================== 推理循环 (The Loop) =====================
+    # ===================== 推理循环逻辑 =====================
 
     async def _run_reasoning_loop(
         self,
@@ -322,24 +277,53 @@ class ReActEngine(CognitiveEngine):
         llm_params: Dict[str, Any],
         response_model: Optional[Type[T]],
     ) -> AgentOutput:
-        """ReAct 主循环"""
-
+        """
+        ReAct 主循环 (同步模式)
+        
+        负责：调用 LLM -> 解析响应 -> 检测死循环 -> 执行工具 -> 更新上下文
+        """
         while context.turn < self.max_turns:
             context.turn += 1
 
+            # Hook: Turn Start
             if self.on_turn_start:
                 await ensure_awaitable(self.on_turn_start, context)
 
-            should_continue = await self._execute_one_turn(
-                context, llm_params, response_model
-            )
+            # 1. LLM 推理
+            response = await self._call_llm(context, llm_params)
+            assistant_msg = self._parse_llm_response(response)
 
-            if self.on_turn_end:
-                await ensure_awaitable(self.on_turn_end, context)
-
-            if not should_continue:
+            # 2. 死循环检测
+            if self._detect_infinite_loop(assistant_msg, context):
+                logger.warning("Detected infinite tool loop, breaking.")
                 break
 
+            context.add_message(assistant_msg)
+            context.metadata["last_response"] = response
+
+            # 3. 终止条件检查
+            # 条件 A: 是结构化提取 (Implicit Tool Call)
+            if response_model and self._is_structure_extraction(
+                assistant_msg, response_model
+            ):
+                await self._trigger_turn_end(context)
+                break
+
+            # 条件 B: 无工具调用 (纯文本回复)
+            if not assistant_msg.tool_calls:
+                await self._trigger_turn_end(context)
+                break
+
+            # 4. 执行工具
+            if self.stats:
+                self.stats.tool_calls += len(assistant_msg.tool_calls)
+
+            await self._execute_tool_calls(assistant_msg.tool_calls, context)
+
+            # Hook: Turn End
+            await self._trigger_turn_end(context)
+
+        # 循环结束，返回最后结果
         last_msg = context.get_last_message()
         if not last_msg:
             return AgentOutput(content="No response generated.")
@@ -350,131 +334,361 @@ class ReActEngine(CognitiveEngine):
             tool_calls=last_msg.tool_calls or [],
         )
 
-    async def _execute_one_turn(
-        self,
-        context: ExecutionContext,
-        llm_params: Dict[str, Any],
-        response_model: Optional[Type[T]],
-    ) -> bool:
+    async def _run_streaming_loop(
+        self, context: ExecutionContext, llm_params: Dict[str, Any]
+    ) -> AsyncIterator[str]:
         """
-        执行单轮推理
-        返回: should_continue (bool)
+        ReAct 流式循环 (递归模式)
+        
+        负责：消费 Stream Chunks -> 累积工具调用 -> 执行工具 -> 递归调用自身
         """
-        response = await self._call_llm(context, llm_params)
-        context.metadata["last_response"] = response
+        if context.turn >= self.max_turns:
+            return
 
-        assistant_msg = self._parse_llm_response(response)
+        context.turn += 1
+        
+        # Hook: Turn Start
+        if self.on_turn_start:
+            await ensure_awaitable(self.on_turn_start, context)
+
+        messages_payload = [m.to_openai_format() for m in context.messages]
+        
+        # 状态累积器
+        collected_content = []
+        tool_calls_data: List[Dict[str, Any]] = []
+
+        # 1. 消费流
+        async for chunk in self.model.astream(messages=messages_payload, **llm_params):
+            delta = self._extract_delta(chunk)
+
+            # A. 文本内容：实时 Yield
+            content = delta.get("content")
+            if content:
+                collected_content.append(content)
+                yield content
+
+            # B. 工具调用：后台累积
+            if delta.get("tool_calls"):
+                self._accumulate_tool_chunks(tool_calls_data, delta["tool_calls"])
+
+        # 2. 组装完整消息
+        final_text = "".join(collected_content)
+        assistant_msg = Message.assistant(content=final_text)
+        
+        # 清洗无效的工具调用
+        if tool_calls_data:
+            valid_calls = [
+                tc for tc in tool_calls_data 
+                if tc["function"]["name"] or tc["function"]["arguments"]
+            ]
+            if valid_calls:
+                assistant_msg.tool_calls = valid_calls
+
+        # 3. 死循环检测
+        if self._detect_infinite_loop(assistant_msg, context):
+            logger.warning("Infinite loop detected in stream, stopping.")
+            context.add_message(assistant_msg)
+            return
+
         context.add_message(assistant_msg)
 
-        if response_model and self._is_structure_extraction(
-            assistant_msg, response_model
-        ):
-            return False
-
+        # 4. 分支处理
         if assistant_msg.tool_calls:
+            # Case A: 有工具调用 -> 执行并递归
             if self.stats:
                 self.stats.tool_calls += len(assistant_msg.tool_calls)
 
-            tool_executed = await self._execute_tool_calls(
-                assistant_msg.tool_calls, context
-            )
-            return tool_executed
+            await self._execute_tool_calls(assistant_msg.tool_calls, context)
+            await self._trigger_turn_end(context)
+            
+            # 递归：进入下一轮
+            async for token in self._run_streaming_loop(context, llm_params):
+                yield token
+        else:
+            # Case B: 结束
+            await self._trigger_turn_end(context)
 
-        return False
+    # ===================== 辅助逻辑 =====================
+    
+    def _normalize_tool_call(self, tool_call: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        [New Helper] 规范化工具调用数据结构 (Adapter Pattern)
+        
+        目标：将 LLM 的原始输出统一转换为 ToolBox.execute_many 所需的扁平格式。
+        兼容：
+        1. OpenAI 嵌套格式: {"function": {"name": "...", "arguments": "..."}}
+        2. 扁平格式: {"name": "...", "arguments": {...}}
+        3. 参数类型: JSON String 或 Dict
+        """
+        # 1. 提取 Name 和 Arguments
+        func_block = tool_call.get("function")
+        
+        # 优先尝试 OpenAI 嵌套结构
+        if func_block and isinstance(func_block, dict):
+            name = func_block.get("name")
+            raw_args = func_block.get("arguments", "{}")
+        else:
+            # 降级尝试扁平结构
+            name = tool_call.get("name")
+            raw_args = tool_call.get("arguments", "{}")
 
-    # ===================== 工具执行逻辑 =====================
+        # 2. 安全解析参数 (JSON String -> Dict)
+        if isinstance(raw_args, str):
+            try:
+                # 处理常见的 JSON 格式问题 (如包含换行符)
+                parsed_args = json.loads(raw_args)
+            except json.JSONDecodeError:
+                logger.warning(f"Failed to parse tool arguments for '{name}': {raw_args}")
+                # 解析失败返回空字典，让 ToolBox 抛出参数校验错误，而不是在这里崩溃
+                parsed_args = {} 
+        else:
+            parsed_args = raw_args if isinstance(raw_args, dict) else {}
+
+        # 3. 返回标准扁平格式
+        return {
+            "id": tool_call.get("id", ""), # ID 丢失也允许执行
+            "name": name,
+            "arguments": parsed_args,
+        }
 
     async def _execute_tool_calls(
         self, tool_calls: List[Dict[str, Any]], context: ExecutionContext
-    ) -> bool:
+    ):
         """
-        执行工具列表并将结果作为 Tool Message 加入 Context
+        批量执行工具
+        
+        改进：使用 _normalize_tool_call 解耦数据清洗逻辑
         """
-        results = await self.toolbox.execute_many(tool_calls)
+        # 1. 数据规范化 (Normalization)
+        flat_tool_calls = [self._normalize_tool_call(tc) for tc in tool_calls]
 
-        has_execution = False
+        # 2. 批量执行 (Execution)
+        results = await self.toolbox.execute_many(flat_tool_calls)
+
+        # 3. 处理结果与副作用 (Side Effects)
         for res in results:
-            has_execution = True
-
             if self.on_tool_execute:
                 await ensure_awaitable(self.on_tool_execute, res.tool_name, {})
 
+            content = res.result
+            # 观测值截断
+            if len(content) > self.max_observation_length:
+                logger.warning(
+                    "Truncating tool output",
+                    tool=res.tool_name,
+                    original_len=len(content),
+                    limit=self.max_observation_length,
+                )
+                content = (
+                    content[: self.max_observation_length]
+                    + f"\n...(truncated, total {len(content)} chars)"
+                )
+
             tool_msg = Message.tool_result(
                 tool_call_id=res.call_id,
-                content=res.result,
+                content=content,
                 tool_name=res.tool_name,
             )
             context.add_message(tool_msg)
 
+            # 错误反馈策略
             if res.is_error:
-                feedback = f"Tool '{res.tool_name}' failed: {res.result}. Please try again or use another tool."
-                context.add_message(Message.user(feedback))
+                context.consecutive_tool_error_count += 1
+                if context.consecutive_tool_error_count >= 3:
+                    context.add_message(
+                        Message.user(
+                            "System: Too many tool errors. Please stop using this tool or change parameters."
+                        )
+                    )
+            else:
+                context.consecutive_tool_error_count = 0
 
-        return has_execution
-
-    # ===================== 结构化输出处理 =====================
-
-    def _is_structure_extraction(self, message: Message, model_class: Type[T]) -> bool:
-        if not message.tool_calls or not self._supports_functions:
+    
+    def _detect_infinite_loop(
+        self, message: Message, context: ExecutionContext
+    ) -> bool:
+        """检测是否连续以相同参数调用同一工具"""
+        if not message.tool_calls:
             return False
 
-        extraction_tool_name = StructureEngine.to_openai_tool(model_class)["function"][
-            "name"
-        ]
-        return any(
-            tc.get("function", {}).get("name") == extraction_tool_name
-            for tc in message.tool_calls
+        try:
+            # 计算工具调用的指纹 (Name + Args)
+            calls_dump = json.dumps(
+                [
+                    {
+                        "name": tc["function"]["name"],
+                        "args": tc["function"]["arguments"],
+                    }
+                    for tc in message.tool_calls
+                ],
+                sort_keys=True,
+            )
+            current_hash = hash(calls_dump)
+
+            if context.last_tool_calls_hash == current_hash:
+                logger.warning("Infinite tool loop detected", calls=calls_dump)
+                return True
+
+            context.last_tool_calls_hash = current_hash
+            return False
+        except Exception:
+            # 如果 JSON 解析失败或其他错误，保守放行
+            return False
+
+    async def _trigger_turn_end(self, context: ExecutionContext):
+        """触发 Turn End Hook"""
+        if self.on_turn_end:
+            await ensure_awaitable(self.on_turn_end, context)
+
+    def _accumulate_tool_chunks(self, target_list: List[Dict], chunks: List[Dict]):
+        """
+        合并流式工具调用片段 (OpenAI Protocol)
+        """
+        for tc_chunk in chunks:
+            index = tc_chunk.get("index")
+            
+            # 确保列表长度足够
+            if index is not None:
+                while len(target_list) <= index:
+                    target_list.append(
+                        {
+                            "id": "",
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        }
+                    )
+            
+            # 获取目标引用
+            target = (
+                target_list[index]
+                if index is not None and index < len(target_list)
+                else (target_list[-1] if target_list else None)
+            )
+
+            if target:
+                if tc_chunk.get("id"):
+                    target["id"] += tc_chunk["id"]
+                
+                func_chunk = tc_chunk.get("function", {})
+                if func_chunk.get("name"):
+                    target["function"]["name"] += func_chunk["name"]
+                if func_chunk.get("arguments"):
+                    target["function"]["arguments"] += func_chunk["arguments"]
+
+    # ----------------- 上下文构建 -----------------
+
+    async def _build_execution_context(
+        self, input_messages: List[Message]
+    ) -> ExecutionContext:
+        """加载历史并构建包含 System Prompt 的上下文"""
+        history = await self._load_history()
+
+        system_msg = None
+        # 检查是否已存在 System Prompt
+        has_system = any(m.role == "system" for m in input_messages) or any(
+            m.role == "system" for m in history
         )
 
-    async def _handle_structured_output(
-        self,
-        output: AgentOutput,
-        response_model: Type[T],
-        context: ExecutionContext,
-        llm_params: Dict[str, Any],
-        max_retries: int,
-    ) -> T:
+        if not has_system:
+            # 动态渲染 System Prompt
+            template_vars = {
+                "tools": self.toolbox.to_openai_schema(),
+                "current_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            system_content = self.prompt_template.format_safe(**template_vars)
+            system_msg = Message.system(system_content)
 
-        for attempt in range(max_retries + 1):
-            try:
-                return await StructureEngine.parse(
-                    content=output.content,
-                    model_class=response_model,
-                    raw_tool_calls=output.tool_calls,
-                    auto_fix=True,
+        all_messages = []
+        if system_msg:
+            all_messages.append(system_msg)
+        all_messages.extend(history)
+        all_messages.extend(input_messages)
+
+        return ExecutionContext(all_messages)
+
+    async def _load_history(self) -> List[Message]:
+        """从 Memory 加载历史记录"""
+        if not self.memory.storage:
+            return []
+        try:
+            data = await self.memory.storage.get(self.memory.session_id)
+            if data and "messages" in data:
+                return await self.memory.get_history(data["messages"])
+        except Exception:
+            return []
+        return []
+
+    async def _save_context(self, context: ExecutionContext):
+        """保存上下文到 Memory"""
+        if not self.memory.storage:
+            return
+        try:
+            messages_data = [m.to_openai_format() for m in context.messages]
+            await self.memory.storage.set(
+                self.memory.session_id, {"messages": messages_data}
+            )
+        except Exception as e:
+            logger.warning("Failed to save context", error=str(e))
+
+    # ----------------- LLM 交互 -----------------
+
+    def _build_llm_params(
+        self, response_model: Optional[Type[T]], strategy: str
+    ) -> Dict[str, Any]:
+        """构建传递给 LLM 的参数"""
+        params: Dict[str, Any] = {}
+        tools_schema = self.toolbox.to_openai_schema()
+
+        if tools_schema and self._supports_functions:
+            params["tools"] = tools_schema
+            params["tool_choice"] = "auto"
+
+        if response_model:
+            if strategy in {"auto", "function_calling"} and self._supports_functions:
+                structure_tool = StructureEngine.to_openai_tool(response_model)
+                existing_names = {
+                    t["function"]["name"] for t in params.get("tools", [])
+                }
+                if structure_tool["function"]["name"] not in existing_names:
+                    params.setdefault("tools", []).append(structure_tool)
+                params["tool_choice"] = "auto"
+            else:
+                params["response_format"] = {"type": "json_object"}
+
+        return params
+
+    def _augment_messages_for_structure(
+        self, messages: List[Message], response_model: Optional[Type[T]]
+    ) -> List[Message]:
+        """注入结构化输出引导指令"""
+        if not response_model or not self._supports_functions:
+            return messages
+
+        structure_tool_name = StructureEngine.to_openai_tool(response_model)[
+            "function"
+        ]["name"]
+        instruction = (
+            f"\nIMPORTANT: You MUST call the '{structure_tool_name}' function to provide your final answer. "
+            "Do not reply with text only."
+        )
+
+        augmented = messages.copy()
+        # 尝试追加到最后一条 User 消息
+        for i in range(len(augmented) - 1, -1, -1):
+            if augmented[i].role == "user":
+                original = augmented[i]
+                new_content = str(original.content) + instruction
+                augmented[i] = Message(
+                    role="user", content=new_content, name=original.name
                 )
-            except StructureParseError as e:
-                if attempt >= max_retries:
-                    logger.error(
-                        "Structured parsing failed after retries", error=str(e)
-                    )
-                    raise AgentError(f"Failed to parse structured output: {e}")
+                return augmented
 
-                logger.warning(
-                    "Parsing failed, retrying with feedback", attempt=attempt
-                )
-
-                feedback_msg = Message.user(
-                    f"The previous response could not be parsed into the expected format. "
-                    f"Error: {e}. Please try again."
-                )
-                context.add_message(feedback_msg)
-
-                response = await self._call_llm(context, llm_params)
-                msg = self._parse_llm_response(response)
-                context.add_message(msg)
-
-                output = AgentOutput(
-                    content=msg.content or "",
-                    tool_calls=msg.tool_calls or [],
-                    raw=response,
-                )
-
-        raise AgentError("Structured parsing failed unexpectedly")
-
-    # ===================== 辅助方法 =====================
+        # 否则新增一条 User 消息
+        augmented.append(Message.user(instruction))
+        return augmented
 
     async def _call_llm(self, context: ExecutionContext, params: Dict[str, Any]) -> Any:
+        """调用 LLM API"""
         messages_payload = [m.to_openai_format() for m in context.messages]
         try:
             return await ensure_awaitable(
@@ -484,6 +698,7 @@ class ReActEngine(CognitiveEngine):
             raise ModelError(f"LLM API call failed: {e}") from e
 
     def _parse_llm_response(self, response: Any) -> Message:
+        """解析 LLM 响应为 Message 对象"""
         if hasattr(response, "choices") and response.choices:
             choice = response.choices[0]
             message_data = choice.message
@@ -505,78 +720,58 @@ class ReActEngine(CognitiveEngine):
 
         raise ModelError("Invalid LLM response format")
 
-    async def _check_needs_tools(
-        self, context: ExecutionContext, llm_params: Dict[str, Any]
-    ) -> Tuple[bool, Optional[Any]]:
-        peek_params = llm_params.copy()
+    def _extract_delta(self, chunk: Any) -> Dict[str, Any]:
+        """从 Stream Chunk 中提取 delta"""
+        if hasattr(chunk, "choices") and chunk.choices:
+            choice = chunk.choices[0]
+            if isinstance(choice, dict):
+                return choice.get("delta", {})
+            return getattr(choice, "delta", {})
+        return {}
 
-        try:
-            response = await self._call_llm(context, peek_params)
-            msg = self._parse_llm_response(response)
+    def _is_structure_extraction(self, message: Message, model_class: Type[T]) -> bool:
+        """判断当前是否为结构化提取的工具调用"""
+        if not message.tool_calls or not self._supports_functions:
+            return False
+        extraction_tool_name = StructureEngine.to_openai_tool(model_class)["function"][
+            "name"
+        ]
+        return any(
+            tc.get("function", {}).get("name") == extraction_tool_name
+            for tc in message.tool_calls
+        )
 
-            if msg.tool_calls:
+    async def _handle_structured_output(
+        self,
+        output: AgentOutput,
+        response_model: Type[T],
+        context: ExecutionContext,
+        llm_params: Dict[str, Any],
+        max_retries: int,
+    ) -> T:
+        """处理结构化输出解析与自动重试"""
+        for attempt in range(max_retries + 1):
+            try:
+                return await StructureEngine.parse(
+                    content=output.content,
+                    model_class=response_model,
+                    raw_tool_calls=output.tool_calls,
+                    auto_fix=True,
+                )
+            except StructureParseError as e:
+                if attempt >= max_retries:
+                    raise AgentError(f"Failed to parse structured output: {e}")
+
+                # 重试反馈
+                feedback_msg = Message.user(
+                    f"Error parsing response: {e}. Please ensure strict JSON format."
+                )
+                context.add_message(feedback_msg)
+                response = await self._call_llm(context, llm_params)
+                msg = self._parse_llm_response(response)
                 context.add_message(msg)
-                return True, None
+                output = AgentOutput(
+                    content=msg.content or "", tool_calls=msg.tool_calls or []
+                )
 
-            return False, response
-        except Exception:
-            return False, None
-
-    async def _stream_final_response(
-        self, context: ExecutionContext, llm_params: Dict[str, Any]
-    ) -> AsyncIterator[str]:
-        messages_payload = [m.to_openai_format() for m in context.messages]
-        full_content = []
-
-        try:
-            async for chunk in self.model.astream(
-                messages=messages_payload, **llm_params
-            ):
-                content = None
-                if hasattr(chunk, "content"):
-                    content = chunk.content
-                elif hasattr(chunk, "delta"):
-                    content = chunk.delta.get("content")
-                elif hasattr(chunk, "choices") and chunk.choices:
-                    delta = (
-                        chunk.choices[0].get("delta", {})
-                        if isinstance(chunk.choices[0], dict)
-                        else chunk.choices[0].delta
-                    )
-                    content = (
-                        getattr(delta, "content", None)
-                        if not isinstance(delta, dict)
-                        else delta.get("content")
-                    )
-
-                if content:
-                    full_content.append(content)
-                    yield content
-
-        finally:
-            if full_content:
-                final_text = "".join(full_content)
-                context.add_message(Message.assistant(content=final_text))
-                context.metadata["last_response"] = final_text
-
-    async def _save_context(self, context: ExecutionContext):
-        if not self.memory.storage:
-            return
-        try:
-            messages_data = [m.to_openai_format() for m in context.messages]
-            await self.memory.storage.set(
-                self.memory.session_id, {"messages": messages_data}
-            )
-        except Exception as e:
-            logger.warning("Failed to save context", error=str(e))
-
-    async def _load_history(self) -> List[Message]:
-        if not self.memory.storage:
-            return []
-        try:
-            data = await self.memory.storage.get(self.memory.session_id)
-            if data and "messages" in data:
-                return await self.memory.get_history(data["messages"])
-        except Exception:
-            return []
-        return []
+        raise AgentError("Structured parsing failed")

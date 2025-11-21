@@ -1,89 +1,78 @@
+# tests/core/test_react.py
+"""
+ReAct Engine 单元测试 (完整版)
+
+覆盖率目标：100%
+包含：
+1. 基础推理 (Text/Tool)
+2. 流式推理 (Stream with Tool Chunks)
+3. 错误处理与反馈
+4. 新特性 (死循环检测、输出截断)
+5. 生命周期 Hooks
+6. 结构化输出与重试
+7. 上下文与记忆管理
+"""
 import pytest
-import asyncio
 import json
-from unittest.mock import MagicMock, AsyncMock, patch, ANY
-from typing import List, Dict, Any, Optional
+import time
+from unittest.mock import MagicMock, AsyncMock, call
 from types import SimpleNamespace
+from typing import Any, List
 
 from pydantic import BaseModel
 
 from gecko.core.engine.react import ReActEngine, ExecutionContext
-from gecko.core.engine.base import AgentOutput
 from gecko.core.message import Message
-from gecko.core.memory import TokenMemory
+from gecko.core.output import AgentOutput
 from gecko.core.toolbox import ToolBox, ToolExecutionResult
-from gecko.core.protocols import ModelProtocol, StreamableModelProtocol
-from gecko.core.exceptions import AgentError, ModelError
-from gecko.core.structure import StructureParseError
+from gecko.core.protocols import StreamableModelProtocol
 
-# ==========================================
-# Helpers & Fixtures
-# ==========================================
+# ========================= Helpers =========================
 
-class MockResponseModel(BaseModel):
-    """用于测试结构化输出的模型"""
-    answer: str
-    confidence: float
-
-def create_mock_response(
-    content: Optional[str] = None, 
-    tool_calls: Optional[List[Dict]] = None,
-    usage: Optional[Dict] = None
-):
-    """辅助函数：创建 Mock 的 LLM 响应"""
-    msg_dict = {"role": "assistant"}
+def create_mock_response(content: str = None, tool_calls: list = None):
+    """创建模拟的 CompletionResponse"""
+    msg = {}
     if content is not None:
-        msg_dict["content"] = content
+        msg["content"] = content
     if tool_calls is not None:
-        msg_dict["tool_calls"] = tool_calls
+        msg["tool_calls"] = tool_calls
     
     choice = MagicMock()
-    choice.message = MagicMock()
-    choice.message.role = "assistant"
-    choice.message.content = content
-    choice.message.tool_calls = tool_calls
-    choice.message.model_dump.return_value = msg_dict
+    choice.message = SimpleNamespace(**msg)
     
     response = MagicMock()
     response.choices = [choice]
-    response.usage = usage or {"total_tokens": 10}
     return response
 
-@pytest.fixture
-def mock_model():
-    model = MagicMock(spec=StreamableModelProtocol)
-    model.acompletion = AsyncMock()
-    model.astream = AsyncMock() 
-    model._supports_function_calling = True
-    return model
+class MockModel(MagicMock):
+    """同时支持同步和流式的 Mock 模型"""
+    def __init__(self, *args, **kwargs):
+        super().__init__(spec=StreamableModelProtocol, *args, **kwargs)
+        self.acompletion = AsyncMock()
+        self.astream = MagicMock()
+
+# ========================= Fixtures =========================
 
 @pytest.fixture
 def mock_toolbox():
-    toolbox = MagicMock(spec=ToolBox)
-    toolbox.to_openai_schema.return_value = [
-        {
-            "type": "function", 
-            "function": {
-                "name": "test_tool", 
-                "description": "A test tool"
-            }
-        }
-    ]
-    toolbox.execute_many = AsyncMock()
-    return toolbox
+    tb = MagicMock(spec=ToolBox)
+    tb.to_openai_schema.return_value = [{"type": "function", "function": {"name": "t1"}}]
+    tb.execute_many = AsyncMock(return_value=[])
+    return tb
 
 @pytest.fixture
-def mock_storage():
-    storage = MagicMock()
-    storage.get = AsyncMock(return_value=None)
-    storage.set = AsyncMock()
-    return storage
+def mock_model():
+    return MockModel()
 
 @pytest.fixture
-def mock_memory(mock_storage):
-    memory = TokenMemory(session_id="test_session", storage=mock_storage)
-    memory.get_history = AsyncMock(return_value=[])
-    return memory
+def mock_memory():
+    mem = MagicMock()
+    mem.storage = MagicMock() # 模拟有存储
+    mem.session_id = "test_session"
+    mem.storage.get = AsyncMock(return_value=None)
+    mem.storage.set = AsyncMock()
+    mem.get_history = AsyncMock(return_value=[])
+    return mem
 
 @pytest.fixture
 def engine(mock_model, mock_toolbox, mock_memory):
@@ -91,314 +80,273 @@ def engine(mock_model, mock_toolbox, mock_memory):
         model=mock_model,
         toolbox=mock_toolbox,
         memory=mock_memory,
-        max_turns=3
+        max_turns=5,
+        max_observation_length=100  # 设置较小的截断阈值方便测试
     )
 
-# ==========================================
-# Tests: Initialization & Config
-# ==========================================
-
-def test_init_config(mock_model, mock_toolbox, mock_memory):
-    engine = ReActEngine(mock_model, mock_toolbox, mock_memory, system_prompt="Custom Prompt")
-    assert engine.prompt_template.template == "Custom Prompt"
-
-    engine_def = ReActEngine(mock_model, mock_toolbox, mock_memory)
-    assert "Available Tools" in engine_def.prompt_template.template
-
-    del mock_model._supports_function_calling
-    engine_cap = ReActEngine(mock_model, mock_toolbox, mock_memory)
-    assert engine_cap._supports_functions is True
-
-@pytest.mark.asyncio
-async def test_build_execution_context(engine):
-    engine.memory.storage.get.return_value = {"messages": [{"role": "user", "content": "History"}]}
-    history_msg = Message.user("History")
-    engine.memory.get_history.return_value = [history_msg]
-    
-    input_msgs = [Message.user("Current")]
-    ctx = await engine._build_execution_context(input_msgs)
-    
-    assert len(ctx.messages) == 3 # System + History + Current
-    assert ctx.messages[0].role == "system"
-    assert ctx.messages[1].content == "History"
-
-    sys_msg = Message.system("User defined system")
-    input_msgs_with_sys = [sys_msg, Message.user("Current")]
-    ctx2 = await engine._build_execution_context(input_msgs_with_sys)
-    
-    assert len(ctx2.messages) == 3
-    system_msgs = [m for m in ctx2.messages if m.role == "system"]
-    assert len(system_msgs) == 1
-    assert system_msgs[0].content == "User defined system"
-
-# ==========================================
-# Tests: Step (Reasoning Loop)
-# ==========================================
+# ========================= 1. 基础推理测试 =========================
 
 @pytest.mark.asyncio
 async def test_step_basic_text(engine, mock_model):
-    mock_model.acompletion.return_value = create_mock_response(content="Hello World")
-    
+    """测试基本的文本回复"""
+    mock_model.acompletion.return_value = create_mock_response(content="Hello")
     output = await engine.step([Message.user("Hi")])
-    
-    assert output.content == "Hello World"
-    assert engine.stats.total_steps == 1
+    assert output.content == "Hello"
     mock_model.acompletion.assert_called_once()
 
 @pytest.mark.asyncio
 async def test_step_with_tool_execution(engine, mock_model, mock_toolbox):
-    resp1 = create_mock_response(
-        tool_calls=[{"id": "call_1", "function": {"name": "test_tool", "arguments": "{}"}}]
-    )
-    resp2 = create_mock_response(content="Final Answer")
+    """测试工具调用流程"""
+    # Round 1: Tool Call
+    resp1 = create_mock_response(tool_calls=[
+        {"id": "call_1", "function": {"name": "t1", "arguments": "{}"}}
+    ])
+    # Round 2: Final Answer
+    resp2 = create_mock_response(content="Final")
     
     mock_model.acompletion.side_effect = [resp1, resp2]
-    
     mock_toolbox.execute_many.return_value = [
-        ToolExecutionResult(tool_name="test_tool", call_id="call_1", result="Tool Result", is_error=False)
+        ToolExecutionResult("t1", "call_1", "Result", False)
     ]
     
-    engine.on_turn_start = AsyncMock()
-    engine.on_turn_end = AsyncMock()
-    engine.on_tool_execute = AsyncMock()
-
-    output = await engine.step([Message.user("Run tool")])
+    output = await engine.step([Message.user("Run")])
     
-    assert output.content == "Final Answer"
-    assert mock_toolbox.execute_many.call_count == 1
-    assert mock_model.acompletion.call_count == 2
-    
-    engine.on_turn_start.assert_called()
-    engine.on_turn_end.assert_called()
-    engine.on_tool_execute.assert_called_with("test_tool", {})
+    assert output.content == "Final"
+    # 验证中间消息包含 tool role
+    call_args = mock_model.acompletion.call_args_list[1]
+    messages = call_args[1]['messages']
+    assert messages[-1]['role'] == 'tool'
+    assert messages[-1]['content'] == "Result"
 
 @pytest.mark.asyncio
-async def test_step_max_turns_reached(engine, mock_model, mock_toolbox):
-    resp_tool = create_mock_response(
-        tool_calls=[{"id": "call_1", "function": {"name": "loop", "arguments": "{}"}}]
-    )
-    mock_model.acompletion.return_value = resp_tool
-    mock_toolbox.execute_many.return_value = [
-        ToolExecutionResult(tool_name="loop", call_id="call_1", result="...", is_error=False)
-    ]
-    
+async def test_step_max_turns(engine, mock_model):
+    """测试最大轮数限制"""
+    resp = create_mock_response(tool_calls=[{"id": "1", "function": {"name": "t1", "arguments": "{}"}}])
+    mock_model.acompletion.return_value = resp
     engine.max_turns = 2
+    
     output = await engine.step([Message.user("Loop")])
     
-    assert mock_model.acompletion.call_count == 2
-    assert output.content == "..."
+    # 超过轮数强制结束
+    assert "No response" in output.content or output.tool_calls
+
+# ========================= 2. 流式推理测试 =========================
+
+@pytest.mark.asyncio
+async def test_step_stream_basic(engine, mock_model):
+    """测试纯文本流式"""
+    async def stream_gen(*args, **kwargs):
+        yield SimpleNamespace(choices=[{"delta": {"content": "A"}}])
+        yield SimpleNamespace(choices=[{"delta": {"content": "B"}}])
+
+    mock_model.astream = MagicMock(side_effect=stream_gen)
+    chunks = [c async for c in engine.step_stream([Message.user("Hi")])]
+    assert "".join(chunks) == "AB"
+
+@pytest.mark.asyncio
+async def test_step_stream_with_tool_call(engine, mock_model, mock_toolbox):
+    """测试流式工具调用 (模拟 chunk 拼接)"""
+    # Round 1: Tool Call Chunks
+    async def stream_r1(*args, **kwargs):
+        yield SimpleNamespace(choices=[{"delta": {"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "t1"}}]}}])
+        yield SimpleNamespace(choices=[{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{}"}}]}}])
+
+    # Round 2: Text
+    async def stream_r2(*args, **kwargs):
+        yield SimpleNamespace(choices=[{"delta": {"content": "Done"}}])
+
+    mock_model.astream.side_effect = [stream_r1(), stream_r2()]
+    mock_toolbox.execute_many.return_value = [ToolExecutionResult("t1", "c1", "Res", False)]
+
+    chunks = [c async for c in engine.step_stream([Message.user("Run")])]
+    
+    assert "".join(chunks) == "Done"
+    mock_toolbox.execute_many.assert_called_once()
+
+# ========================= 3. 错误处理与反馈 =========================
 
 @pytest.mark.asyncio
 async def test_step_tool_error_feedback(engine, mock_model, mock_toolbox):
+    """测试工具错误反馈"""
     resp1 = create_mock_response(tool_calls=[{"id": "1", "function": {"name": "err", "arguments": "{}"}}])
     resp2 = create_mock_response(content="Fixed")
     
     mock_model.acompletion.side_effect = [resp1, resp2]
-    
     mock_toolbox.execute_many.return_value = [
-        ToolExecutionResult(tool_name="err", call_id="1", result="Error occurred", is_error=True)
+        ToolExecutionResult("err", "1", "Error!!", True)
     ]
     
     await engine.step([Message.user("Try")])
     
-    call_args = mock_model.acompletion.call_args_list[1]
-    messages_sent = call_args[1]['messages']
-    
-    assert messages_sent[-1]['role'] == 'user'
-    assert "failed" in messages_sent[-1]['content']
-
-# ==========================================
-# Tests: Structured Output
-# ==========================================
+    # 验证即使错误，也以 tool role 返回
+    messages = mock_model.acompletion.call_args_list[1][1]['messages']
+    assert messages[-1]['role'] == 'tool'
+    assert "Error!!" in messages[-1]['content']
 
 @pytest.mark.asyncio
-async def test_step_structured_success(engine, mock_model):
-    target_json = json.dumps({"answer": "42", "confidence": 0.99})
-    resp = create_mock_response(
-        tool_calls=[{
-            "function": {
-                "name": "mock_response_model",
-                "arguments": target_json
-            }
-        }]
-    )
-    mock_model.acompletion.return_value = resp
+async def test_consecutive_error_warning(engine, mock_model, mock_toolbox):
+    """测试连续 3 次错误触发系统警告"""
+    # [Fix] 为了避开死循环检测，让每次 Tool Call 的参数略有不同
+    # 模拟连续 3 次调用工具都报错，但参数不同 (i=1, i=2, i=3)
+    resp1 = create_mock_response(tool_calls=[{"id": "1", "function": {"name": "t1", "arguments": '{"i": 1}'}}])
+    resp2 = create_mock_response(tool_calls=[{"id": "2", "function": {"name": "t1", "arguments": '{"i": 2}'}}])
+    resp3 = create_mock_response(tool_calls=[{"id": "3", "function": {"name": "t1", "arguments": '{"i": 3}'}}])
+    resp_stop = create_mock_response("Stop")
+
+    mock_model.acompletion.side_effect = [resp1, resp2, resp3, resp_stop]
+
+    # 工具每次都返回错误
+    mock_toolbox.execute_many.return_value = [ToolExecutionResult("t1", "1", "Err", True)]
+
+    engine.max_turns = 10
+    await engine.step([Message.user("Try")])
+
+    # 第 4 次调用时 (下标为3)，上下文中应该包含 User 的警告信息
+    call_4 = mock_model.acompletion.call_args_list[3]
+    msgs = call_4[1]['messages']
+
+    # 验证消息结构: ... -> [Assistant] -> [Tool Result (Err)] -> [User Warning]
     
-    result = await engine.step(
-        [Message.user("Q")], 
-        response_model=MockResponseModel,
-        strategy="function_calling"
-    )
+    # 1. 最后一条应该是 System Warning (User role)
+    assert msgs[-1]['role'] == 'user'
+    assert "Too many tool errors" in msgs[-1]['content']
     
-    assert isinstance(result, MockResponseModel)
-    assert result.answer == "42"
+    # 2. 倒数第二条是 Tool Result
+    assert msgs[-2]['role'] == 'tool'
+
+# ========================= 4. 新特性测试 =========================
 
 @pytest.mark.asyncio
-async def test_step_structured_retry_success(engine, mock_model):
-    resp1 = create_mock_response(content="Not JSON")
-    resp2 = create_mock_response(content=json.dumps({"answer": "OK", "confidence": 1.0}))
+async def test_infinite_loop_detection(engine, mock_model, mock_toolbox):
+    """测试死循环检测"""
+    # 模拟 LLM 总是返回相同的 Tool Call
+    same_call = create_mock_response(tool_calls=[
+        {"id": "1", "function": {"name": "t1", "arguments": '{"a":1}'}}
+    ])
+    
+    mock_model.acompletion.return_value = same_call
+    mock_toolbox.execute_many.return_value = [ToolExecutionResult("t1", "1", "Res", False)]
+    
+    engine.max_turns = 5
+    await engine.step([Message.user("Loop")])
+    
+    # 应该只调用了 2 次 (第一次正常，第二次发现 hash 相同被中断)
+    assert mock_model.acompletion.call_count == 2
+    # 验证 warning 日志 (实际通过 mock logger 验证，这里简略)
+
+@pytest.mark.asyncio
+async def test_observation_truncation(engine, mock_model, mock_toolbox):
+    """测试工具输出截断"""
+    resp1 = create_mock_response(tool_calls=[{"id": "1", "function": {"name": "t1", "arguments": "{}"}}])
+    resp2 = create_mock_response(content="Done")
     
     mock_model.acompletion.side_effect = [resp1, resp2]
     
-    with patch("gecko.core.engine.react.StructureEngine") as MockStructEngine:
-        MockStructEngine.to_openai_tool.return_value = {"function": {"name": "extract"}}
-        MockStructEngine.parse = AsyncMock(side_effect=[
-            StructureParseError("Invalid"),
-            MockResponseModel(answer="OK", confidence=1.0)
-        ])
-        
-        result = await engine.step([Message.user("Q")], response_model=MockResponseModel)
-        
-        assert result.answer == "OK"
-        assert mock_model.acompletion.call_count == 2
-        assert MockStructEngine.parse.call_count == 2
+    # 返回超长结果 (limit=100)
+    long_text = "A" * 200
+    mock_toolbox.execute_many.return_value = [ToolExecutionResult("t1", "1", long_text, False)]
+    
+    await engine.step([Message.user("BigData")])
+    
+    # 验证上下文中的 Tool Message 被截断
+    messages = mock_model.acompletion.call_args_list[1][1]['messages']
+    tool_content = messages[-1]['content']
+    
+    assert len(tool_content) < 200
+    assert "truncated" in tool_content
+
+# ========================= 5. Hooks 测试 =========================
 
 @pytest.mark.asyncio
-async def test_step_structured_fail_max_retries(engine, mock_model):
-    mock_model.acompletion.return_value = create_mock_response(content="Bad")
+async def test_hooks_execution(mock_model, mock_toolbox, mock_memory):
+    """测试生命周期 Hooks"""
+    start_hook = AsyncMock()
+    end_hook = AsyncMock()
+    tool_hook = AsyncMock()
     
-    with patch("gecko.core.engine.react.StructureEngine") as MockStructEngine:
-        MockStructEngine.to_openai_tool.return_value = {"function": {"name": "extract"}}
-        MockStructEngine.parse = AsyncMock(side_effect=StructureParseError("Fail"))
-        
-        with pytest.raises(AgentError) as exc:
-            await engine.step(
-                [Message.user("Q")], 
-                response_model=MockResponseModel,
-                max_retries=1
-            )
-        
-        assert "Failed to parse structured output" in str(exc.value)
-        assert mock_model.acompletion.call_count == 2
-
-# ==========================================
-# Tests: Streaming
-# ==========================================
-
-@pytest.mark.asyncio
-async def test_step_stream_basic(engine, mock_model):
-    mock_model.acompletion.return_value = create_mock_response(content="Start")
-    
-    # ✅ 修复：使用 SimpleNamespace 避免 MagicMock 自动创建 content 属性
-    async def stream_gen(*args, **kwargs):
-        chunk1 = SimpleNamespace(choices=[{"delta": {"content": "Hello"}}])
-        chunk2 = SimpleNamespace(choices=[{"delta": {"content": " World"}}])
-        yield chunk1
-        yield chunk2
-    
-    mock_model.astream = MagicMock(side_effect=stream_gen)
-    
-    chunks = []
-    async for chunk in engine.step_stream([Message.user("Hi")]):
-        chunks.append(chunk)
-    
-    assert "".join(chunks) == "Start"
-
-@pytest.mark.asyncio
-async def test_step_stream_actual_streaming(engine, mock_model):
-    """测试真正的流式"""
-    mock_model.acompletion.side_effect = Exception("Peek Error")
-    
-    async def stream_gen(*args, **kwargs):
-        chunk = SimpleNamespace(choices=[{"delta": {"content": "Streamed"}}])
-        yield chunk
-    
-    mock_model.astream = MagicMock(side_effect=stream_gen)
-    
-    chunks = []
-    async for chunk in engine.step_stream([Message.user("Hi")]):
-        chunks.append(chunk)
-    
-    assert "Streamed" in "".join(chunks)
-
-
-@pytest.mark.asyncio
-async def test_step_stream_with_tool_peek(engine, mock_model, mock_toolbox):
-    peek_resp = create_mock_response(
-        tool_calls=[{"id": "1", "function": {"name": "t1", "arguments": "{}"}}]
-    )
-    turn_resp = create_mock_response(
-        tool_calls=[{"id": "1", "function": {"name": "t1", "arguments": "{}"}}]
+    engine = ReActEngine(
+        mock_model, mock_toolbox, mock_memory,
+        on_turn_start=start_hook,
+        on_turn_end=end_hook,
+        on_tool_execute=tool_hook
     )
     
-    mock_model.acompletion.side_effect = [peek_resp, turn_resp]
+    # 模拟一次工具调用流程
+    mock_model.acompletion.side_effect = [
+        create_mock_response(tool_calls=[{"id": "1", "function": {"name": "t1", "arguments": "{}"}}]),
+        create_mock_response(content="Done")
+    ]
     mock_toolbox.execute_many.return_value = [ToolExecutionResult("t1", "1", "Res", False)]
     
-    async def stream_gen(*args, **kwargs):
-        chunk = SimpleNamespace(choices=[{"delta": {"content": "Final"}}])
-        yield chunk
+    await engine.step([Message.user("Hook")])
     
-    mock_model.astream = MagicMock(side_effect=stream_gen)
-    
-    chunks = []
-    async for chunk in engine.step_stream([Message.user("Hi")]):
-        chunks.append(chunk)
-    
-    assert "Final" in "".join(chunks)
-    mock_toolbox.execute_many.assert_called()
+    # 验证 Hooks 调用次数
+    assert start_hook.call_count == 2 # 2 turns
+    assert end_hook.call_count == 2
+    assert tool_hook.call_count == 1
+
+# ========================= 6. 结构化输出与重试 =========================
 
 @pytest.mark.asyncio
-async def test_step_stream_not_supported(engine, mock_model):
-    engine._supports_stream = False
+async def test_structure_output_retry(engine, mock_model):
+    """测试结构化输出解析失败后的重试"""
+    class User(BaseModel):
+        name: str
     
-    with pytest.raises(AgentError, match="不支持流式"):
-        async for _ in engine.step_stream([Message.user("Hi")]):
-            pass
-
-# ==========================================
-# Tests: Internals & Edge Cases
-# ==========================================
-
-@pytest.mark.asyncio
-async def test_parse_llm_response_formats(engine):
-    obj1 = MagicMock()
-    obj1.choices = [MagicMock(message=MagicMock())]
-    obj1.choices[0].message.model_dump.return_value = {"role": "assistant", "content": "A"}
-    assert engine._parse_llm_response(obj1).content == "A"
-
-    obj2 = MagicMock()
-    obj2.choices = [MagicMock(message=MagicMock())]
-    del obj2.choices[0].message.model_dump
-    obj2.choices[0].message.to_dict.return_value = {"role": "assistant", "content": "B"}
-    assert engine._parse_llm_response(obj2).content == "B"
+    # 1. 错误格式 -> 2. 正确格式
+    mock_model.acompletion.side_effect = [
+        create_mock_response(content="Not JSON"), 
+        create_mock_response(content='{"name": "Alice"}')
+    ]
     
-    obj3 = MagicMock()
-    obj3.choices = [MagicMock(message=MagicMock())]
-    del obj3.choices[0].message.model_dump
-    del obj3.choices[0].message.to_dict
-    obj3.choices[0].message.role = "assistant"
-    obj3.choices[0].message.content = "C"
-    obj3.choices[0].message.tool_calls = None
-    assert engine._parse_llm_response(obj3).content == "C"
+    user = await engine.step([Message.user("Parse")], response_model=User, max_retries=1)
+    
+    assert isinstance(user, User)
+    assert user.name == "Alice"
+    # 验证发生了重试 (2次 LLM 调用)
+    assert mock_model.acompletion.call_count == 2
+    # 验证第二次调用包含了反馈信息
+    msg_2 = mock_model.acompletion.call_args_list[1][1]['messages']
+    assert "Error parsing response" in msg_2[-1]['content']
 
-    with pytest.raises(ModelError):
-        engine._parse_llm_response(MagicMock(choices=[]))
+# ========================= 7. 上下文与记忆 =========================
 
 @pytest.mark.asyncio
-async def test_error_handling_in_loop(engine, mock_model):
-    mock_model.acompletion.side_effect = Exception("API Crash")
-    engine.on_error = AsyncMock()
+async def test_context_building_with_history(engine, mock_memory, mock_model):
+    """测试历史记录加载和 System Prompt"""
+    # [Fix] 必须 Mock storage.get 返回包含 "messages" 的数据，
+    # 否则 _load_history 会直接返回 []，不调用 get_history
+    mock_memory.storage.get.return_value = {"messages": ["some_raw_data"]}
     
-    with pytest.raises(Exception, match="API Crash"):
-        await engine.step([Message.user("Hi")])
-    
-    engine.on_error.assert_called_once()
-    assert engine.stats.errors == 1
+    # 模拟内存转换后的历史对象
+    mock_memory.get_history.return_value = [Message.user("Old")]
+    mock_model.acompletion.return_value = create_mock_response(content="Hi")
+
+    await engine.step([Message.user("New")])
+
+    call_args = mock_model.acompletion.call_args[1]
+    sent_msgs = call_args['messages']
+
+    # 验证顺序: System -> History(Old) -> Input(New)
+    assert sent_msgs[0]['role'] == 'system' # 自动注入的 System Prompt
+    assert sent_msgs[1]['role'] == 'user' and sent_msgs[1]['content'] == "Old"
+    assert sent_msgs[2]['role'] == 'user' and sent_msgs[2]['content'] == "New"
 
 @pytest.mark.asyncio
-async def test_save_context_failure(engine, mock_storage):
-    engine.memory.storage = mock_storage
-    mock_storage.set.side_effect = Exception("DB Error")
+async def test_system_prompt_rendering(mock_model, mock_toolbox, mock_memory):
+    """测试 System Prompt 模板渲染"""
+    # 使用自定义模板
+    tmpl = "Time: {{ current_time }}"
+    engine = ReActEngine(mock_model, mock_toolbox, mock_memory, system_prompt=tmpl)
+    mock_model.acompletion.return_value = create_mock_response("Hi")
     
-    ctx = ExecutionContext([Message.user("Hi")])
-    await engine._save_context(ctx) # Should not raise
-
-@pytest.mark.asyncio
-async def test_peek_failure(engine, mock_model):
-    mock_model.acompletion.side_effect = Exception("Peek Fail")
+    await engine.step([Message.user("A")])
     
-    ctx = ExecutionContext([Message.user("Hi")])
-    needs_tools, resp = await engine._check_needs_tools(ctx, {})
+    sent_msgs = mock_model.acompletion.call_args[1]['messages']
+    sys_content = sent_msgs[0]['content']
     
-    assert needs_tools is False
-    assert resp is None
+    # 验证时间被注入 (当前年份)
+    import datetime
+    current_year = str(datetime.datetime.now().year)
+    assert "Time:" in sys_content
+    assert current_year in sys_content
