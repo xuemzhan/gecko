@@ -1,35 +1,35 @@
-# gecko/plugins/tools/registry.py
-from __future__ import annotations
-
-from typing import Dict, List
-from gecko.plugins.tools.base import BaseTool, ToolProtocol
-
-class ToolRegistry:
-    """全局工具注册表（单例）"""
-    _tools: Dict[str, ToolProtocol] = {}
-
-    @classmethod
-    def register(cls, tool: ToolProtocol):
-        if tool.name in cls._tools:
-            raise ValueError(f"工具 '{tool.name}' 已注册")
-        cls._tools[tool.name] = tool
-
-    @classmethod
-    def get(cls, name: str) -> ToolProtocol | None:
-        return cls._tools.get(name)
-
-    @classmethod
-    def list_all(cls) -> List[ToolProtocol]:
-        return list(cls._tools.values())
-
-def tool(cls):
-    """
-    装饰器：自动注册工具实例
-    用法：@tool 放在 BaseTool 子类上
-    """
-    if not issubclass(cls, BaseTool):
-        raise TypeError("@tool 只能用于 BaseTool 子类")
-    
-    instance = cls()
-    ToolRegistry.register(instance)
-    return cls
+from __future__ import annotations  
+  
+from typing import Dict, List, Optional, Type  
+  
+from gecko.plugins.tools.base import BaseTool  
+  
+  
+class ToolRegistry:  
+    _tools: Dict[str, BaseTool | Type[BaseTool]] = {}  
+  
+    @classmethod  
+    def register(cls, tool: BaseTool | Type[BaseTool], *, replace: bool = True):  
+        instance = tool if isinstance(tool, BaseTool) else tool()  
+        if instance.name in cls._tools and not replace:  
+            raise ValueError(f"工具 '{instance.name}' 已注册")  
+        cls._tools[instance.name] = tool  # 保留原对象（类或实例）  
+  
+    @classmethod  
+    def get(cls, name: str) -> Optional[BaseTool]:  
+        tool = cls._tools.get(name)  
+        if tool is None:  
+            return None  
+        if isinstance(tool, type):  
+            tool = tool()  
+            cls._tools[name] = tool  
+        return tool  
+  
+    @classmethod  
+    def list_all(cls) -> List[str]:  
+        return list(cls._tools.keys())  
+  
+  
+def tool(cls: Type[BaseTool]):  
+    ToolRegistry.register(cls, replace=True)  
+    return cls  

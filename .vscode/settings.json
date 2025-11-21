@@ -9,6 +9,7 @@
         "asyncpg",
         "autouse",
         "celerybeat",
+        "coro",
         "DDGS",
         "dmypy",
         "duckduckgo",

@@ -19,7 +19,7 @@ classifiers = [
 # 核心依赖（移出 project，Rye 推荐写法）
 dependencies = [
     "pydantic>=2.9,<3.0",
-    "anyio>=4.6,<5.0",
+    "anyio>=4.11.0",
     "typing-extensions>=4.12",
     "pluggy>=1.5",
     "networkx>=3.3,<4.0",

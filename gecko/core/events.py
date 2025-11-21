@@ -1,86 +1,113 @@
-# gecko/core/events.py
-from __future__ import annotations
-import asyncio
-import logging
-import time
-import inspect # [修复] 补充导入
-from typing import Any, Callable, Dict, List, Optional, Awaitable
-from pydantic import BaseModel, Field
-
-logger = logging.getLogger("gecko.events")
-
-class BaseEvent(BaseModel):
-    type: str
-    timestamp: float = Field(default_factory=time.time)
-    data: Dict[str, Any] = {}
-    error: Optional[str] = None
-
-# 定义处理器类型
-EventHandler = Callable[[BaseEvent], Awaitable[None]]
-
-class EventBus:
-    """
-    企业级事件总线
-    特性：
-    1. 异步并发处理 (fire-and-forget 或 wait)
-    2. 错误隔离 (Handler 崩溃不影响主流程)
-    3. 中间件支持 (用于全链路追踪/日志)
-    """
-    def __init__(self):
-        self._subscribers: Dict[str, List[EventHandler]] = {}
-        self._middlewares: List[Callable[[BaseEvent], Awaitable[BaseEvent]]] = []
-
-    def subscribe(self, event_type: str, handler: EventHandler):
-        if event_type not in self._subscribers:
-            self._subscribers[event_type] = []
-        self._subscribers[event_type].append(handler)
-        return self
-
-    def add_middleware(self, mw: Callable):
-        self._middlewares.append(mw)
-
-    async def publish(self, event: BaseEvent, wait: bool = False):
-        """
-        发布事件
-        :param wait: 是否等待所有处理器执行完毕 (True用于关键流程，False用于日志/监控)
-        """
-        # 1. 执行中间件
-        try:
-            for mw in self._middlewares:
-                event = await mw(event)
-                if not event: return # 中间件拦截
-        except Exception as e:
-            logger.error(f"Middleware error: {e}")
-
-        # 2. 查找订阅者
-        handlers = self._subscribers.get(event.type, [])
-        if not handlers:
-            # 支持通配符 "*" 订阅
-            handlers = self._subscribers.get("*", [])
-
-        if not handlers:
-            return
-
-        # 3. 调度执行
-        # [修复] 确保 _safe_execute 只被定义一次且逻辑正确
-        tasks = [self._safe_execute(h, event) for h in handlers]
-        
-        if wait:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        else:
-            # Fire and forget: 放入后台任务，防止阻塞主流程
-            for t in tasks:
-                asyncio.create_task(t)
-
-    async def _safe_execute(self, handler: EventHandler, event: BaseEvent):
-        """安全执行包裹器"""
-        try:
-            if inspect.iscoroutinefunction(handler):
-                await handler(event)
-            else:
-                # 兼容同步函数：在线程池中运行，或者直接调用（如果耗时短）
-                # 考虑到 EventBus 应该是高吞吐的，直接调用可能阻塞 Loop
-                # 但为了兼容性，先直接调用
-                handler(event)
-        except Exception as e:
-            logger.exception(f"Event handler failed for {event.type}: {e}")
+# gecko/core/events.py  
+"""  
+事件总线（升级版）  
+  
+特性：  
+1. BaseEvent 使用 Pydantic，所有字段默认安全可序列化  
+2. Middleware 可修改事件；返回 None 表示拦截  
+3. 订阅者支持异步/同步函数；错误被捕获并记录  
+4. wait=False 时后台任务异常依然可追踪  
+5. 支持 unsubscribe，便于测试或动态注销  
+"""  
+  
+from __future__ import annotations  
+  
+import asyncio  
+import inspect  
+import time  
+from typing import Any, Awaitable, Callable, Dict, List, Optional  
+  
+from pydantic import BaseModel, Field  
+  
+from gecko.core.logging import get_logger  
+  
+logger = get_logger(__name__)  
+  
+# ===== 事件模型 =====  
+class BaseEvent(BaseModel):  
+    type: str  
+    timestamp: float = Field(default_factory=time.time)  
+    data: Dict[str, Any] = Field(default_factory=dict)  
+    error: Optional[str] = None  
+  
+  
+EventHandler = Callable[[BaseEvent], Awaitable[None]]  
+Middleware = Callable[[BaseEvent], Awaitable[BaseEvent | None]]  
+  
+  
+class EventBus:  
+    def __init__(self):  
+        self._subscribers: Dict[str, List[EventHandler]] = {}  
+        self._middlewares: List[Middleware] = []  
+  
+    # --- 订阅管理 ---  
+    def subscribe(self, event_type: str, handler: EventHandler):  
+        if not callable(handler):  
+            raise TypeError("Event handler 必须是可调用的")  
+        self._subscribers.setdefault(event_type, []).append(handler)  
+        return self  
+  
+    def unsubscribe(self, event_type: str, handler: EventHandler):  
+        handlers = self._subscribers.get(event_type, [])  
+        if handler in handlers:  
+            handlers.remove(handler)  
+        return self  
+  
+    def add_middleware(self, middleware: Middleware):  
+        self._middlewares.append(middleware)  
+        return self  
+  
+    # --- 发布事件 ---  
+    async def publish(self, event: BaseEvent, wait: bool = False):  
+        # 1. 依次执行中间件，可修改事件或拦截  
+        try:  
+            for mw in self._middlewares:  
+                new_event = await mw(event)  
+                if new_event is None:  
+                    logger.debug("Event blocked by middleware", event_type=event.type)  
+                    return  
+                event = new_event  
+        except Exception as e:  
+            logger.error("Middleware error", error=str(e))  
+            return  # 中间件异常直接终止，避免传播不一致事件  
+  
+        # 2. 查找订阅者（支持通配符 "*")  
+        handlers = self._subscribers.get(event.type) or self._subscribers.get("*", [])  
+        if not handlers:  
+            return  
+  
+        tasks = [self._safe_execute(handler, event) for handler in handlers]  
+  
+        if wait:  
+            await asyncio.gather(*tasks, return_exceptions=True)  
+        else:  
+            for coro in tasks:  
+                asyncio.create_task(self._log_task_exception(coro))  
+  
+    async def _safe_execute(self, handler: EventHandler, event: BaseEvent):  
+        try:  
+            if inspect.iscoroutinefunction(handler):  
+                await handler(event)  
+            else:  
+                handler(event)  
+        except Exception as e:  
+            logger.exception("Event handler failed", event_type=event.type, error=str(e))  
+  
+    async def _log_task_exception(self, coro):  
+        try:  
+            await coro  
+        except Exception as e:  
+            logger.exception("Background event handler failed", error=str(e))  
+  
+  
+# ==== 示例：常见事件类型 ====  
+  
+  
+class AgentRunEvent(BaseEvent):  
+    """Agent 运行过程事件"""  
+    pass  
+  
+  
+class WorkflowEvent(BaseEvent):  
+    """Workflow 运行过程事件"""  
+    pass  
