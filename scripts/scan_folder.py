@@ -3,7 +3,7 @@ from pathlib import Path
 
 
 def generate_tree(directory, prefix="", is_last=True, output_lines=None, 
-                  show_hidden=False, max_depth=None, current_depth=0):
+                  show_hidden=False, max_depth=None, current_depth=0, exclude_dirs=None):
     """
     生成目录树结构
     
@@ -15,7 +15,10 @@ def generate_tree(directory, prefix="", is_last=True, output_lines=None,
         show_hidden: 是否显示隐藏文件
         max_depth: 最大深度限制
         current_depth: 当前深度
+        exclude_dirs: 要排除的文件夹名称集合
     """
+    if exclude_dirs is None:
+        exclude_dirs = set()
     if output_lines is None:
         output_lines = []
     
@@ -33,6 +36,9 @@ def generate_tree(directory, prefix="", is_last=True, output_lines=None,
         if not show_hidden:
             items = [item for item in items if not item.name.startswith('.')]
         
+        # 过滤排除的文件夹
+        items = [item for item in items if not (item.is_dir() and item.name in exclude_dirs)]
+        
         for index, item in enumerate(items):
             is_last_item = (index == len(items) - 1)
             
@@ -46,7 +52,7 @@ def generate_tree(directory, prefix="", is_last=True, output_lines=None,
                 # 递归处理子目录
                 extension = "    " if is_last_item else "│   "
                 generate_tree(item, prefix + extension, is_last_item, 
-                            output_lines, show_hidden, max_depth, current_depth + 1)
+                            output_lines, show_hidden, max_depth, current_depth + 1, exclude_dirs)
             else:
                 output_lines.append(f"{prefix}{connector}{item.name}")
     
@@ -56,7 +62,7 @@ def generate_tree(directory, prefix="", is_last=True, output_lines=None,
     return output_lines
 
 
-def save_tree_to_file(directory, output_file, show_hidden=False, max_depth=None):
+def save_tree_to_file(directory, output_file, show_hidden=False, max_depth=None, exclude_dirs=None):
     """
     将目录树保存到文件
     
@@ -65,7 +71,10 @@ def save_tree_to_file(directory, output_file, show_hidden=False, max_depth=None)
         output_file: 输出文件路径
         show_hidden: 是否显示隐藏文件
         max_depth: 最大深度限制
+        exclude_dirs: 要排除的文件夹名称集合
     """
+    if exclude_dirs is None:
+        exclude_dirs = set()
     directory = Path(directory).resolve()
     
     if not directory.exists():
@@ -77,10 +86,12 @@ def save_tree_to_file(directory, output_file, show_hidden=False, max_depth=None)
         return
     
     print(f"正在扫描目录: {directory}")
+    if exclude_dirs:
+        print(f"排除的文件夹: {', '.join(sorted(exclude_dirs))}")
     
     # 生成目录树
     tree_lines = [f"{directory.name}/"]
-    generate_tree(directory, "", True, tree_lines, show_hidden, max_depth)
+    generate_tree(directory, "", True, tree_lines, show_hidden, max_depth, 0, exclude_dirs)
     
     # 写入文件
     with open(output_file, 'w', encoding='utf-8') as f:
@@ -125,8 +136,19 @@ def main():
     if max_depth_input.isdigit():
         max_depth = int(max_depth_input)
     
+    # 排除的文件夹
+    exclude_input = input("要排除的文件夹名称 (多个用逗号或空格分隔,留空表示不排除): ").strip()
+    exclude_dirs = set()
+    if exclude_input:
+        # 支持逗号或空格分隔
+        if ',' in exclude_input:
+            exclude_dirs = {name.strip() for name in exclude_input.split(',') if name.strip()}
+        else:
+            exclude_dirs = {name.strip() for name in exclude_input.split() if name.strip()}
+        print(f"将排除以下文件夹: {', '.join(sorted(exclude_dirs))}")
+    
     print("\n开始扫描...")
-    save_tree_to_file(directory, output_file, show_hidden, max_depth)
+    save_tree_to_file(directory, output_file, show_hidden, max_depth, exclude_dirs)
 
 
 if __name__ == "__main__":

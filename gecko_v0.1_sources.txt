@@ -1,0 +1,4540 @@
+[1] gecko/__init__.py
+```python
+# gecko/__init__.py
+from __future__ import annotations
+
+from gecko.core.agent import Agent
+from gecko.core.builder import AgentBuilder
+from gecko.core.message import Message
+
+# 自动清理 LiteLLM 异步客户端，彻底消除 RuntimeWarning
+import atexit
+import asyncio
+import litellm # type: ignore
+
+def _cleanup_litellm():
+    async def _close():
+        try:
+            if hasattr(litellm, "async_http_handler") and litellm.async_http_handler:
+                await litellm.async_http_handler.client.close()
+        except:
+            pass
+    try:
+        asyncio.run(_close())
+    except:
+        pass
+
+atexit.register(_cleanup_litellm)
+
+__version__ = "0.1.0"
+__all__ = ["Agent", "AgentBuilder", "Message"]
+```
+
+[2] gecko/compose/__init__.py
+```python
+# gecko/compose/__init__.py
+# 导出核心 API，确保用户一键导入
+from gecko.compose.workflow import Workflow
+from gecko.compose.team import Team
+from gecko.compose.nodes import step, ensure_awaitable, Next
+
+__all__ = ["Workflow", "Team", "step", "ensure_awaitable", "Next"]
+```
+
+[3] gecko/compose/nodes.py
+```python
+# gecko/compose/nodes.py
+from __future__ import annotations
+import asyncio
+from typing import Any, Callable, List, Optional
+from pydantic import BaseModel
+
+# [新增] 控制流指令
+class Next(BaseModel):
+    """
+    节点返回值指令：明确指示 Workflow 跳转到下一个节点
+    """
+    node: str
+    input: Optional[Any] = None  # 可选：修改传递给下个节点的输入
+
+# [保留] 辅助函数
+async def ensure_awaitable(func: Callable, *args, **kwargs) -> Any:
+    if asyncio.iscoroutinefunction(func):
+        return await func(*args, **kwargs)
+    result = func(*args, **kwargs)
+    if asyncio.iscoroutine(result):
+        return await result
+    return result
+
+# [保留] 装饰器 (略微简化，适配新机制)
+def step(name: Optional[str] = None):
+    def decorator(func: Callable):
+        func._is_step = True
+        func._step_name = name or func.__name__
+        return func
+    return decorator
+
+# Loop 和 Parallel 可以暂时保留，但在新引擎中可能不再作为特殊节点，
+# 而是作为普通节点内部的逻辑，或者通过 Next 实现循环。
+# 为了兼容性，我们暂且保留原定义，但建议后续通过 Next 实现循环。
+```
+
+[4] gecko/compose/team.py
+```python
+# gecko/compose/team.py
+from __future__ import annotations
+import asyncio
+import anyio
+from typing import List, Any, Dict, Union
+from gecko.core.agent import Agent
+# 假设 WorkflowContext 在运行时作为 Any 传入，这里做 duck typing
+
+class Team:
+    """
+    并行执行多个 Agent，聚合结果
+    """
+    def __init__(self, members: List[Agent]):
+        self.members = members
+
+    # [新增] __call__ 方法，使 Team 实例可被直接调用，满足 Workflow 节点协议
+    async def __call__(self, context_or_input: Any) -> List[Any]:
+        """
+        允许 Team 实例像函数一样被调用：await team(context)
+        """
+        return await self.execute(context_or_input)
+
+    async def execute(self, context_or_input: Any) -> List[Any]:
+        """
+        执行 Team 逻辑
+        """
+        # 解析输入：兼容直接传值或 WorkflowContext 对象
+        # 使用 getattr 避免循环导入 WorkflowContext 定义
+        if hasattr(context_or_input, "history") and hasattr(context_or_input, "input"):
+            # 是 WorkflowContext，尝试获取上一步输出，否则取全局 input
+            history = getattr(context_or_input, "history", {})
+            inp = history.get("last_output", getattr(context_or_input, "input", None))
+        else:
+            inp = context_or_input
+
+        results = [None] * len(self.members)
+
+        async def _run_one(idx, agent):
+            # Agent.run 现在健壮地处理 str 或 Message
+            res = await agent.run(inp)
+            results[idx] = res.content
+
+        # 并发执行
+        async with anyio.create_task_group() as tg:
+            for idx, agent in enumerate(self.members):
+                tg.start_soon(_run_one, idx, agent)
+
+        return results
+```
+
+[5] gecko/compose/workflow.py
+```python
+# gecko/compose/workflow.py  
+"""  
+Workflow 引擎（优化版）  
+  
+核心改进：  
+1. 节点执行结果统一标准化，避免下游/持久化因类型不一致出错  
+2. `Next` 控制流可携带自定义输入，自动注入到下一个节点  
+3. 工作流上下文持久化使用安全序列化方法（pydantic_encoder）  
+4. Agent / Team / 普通函数节点统一接收 WorkflowContext，行为更一致  
+5. 状态持久化抽象成独立方法，捕获异常以免影响主流程  
+"""  
+  
+from __future__ import annotations  
+  
+import asyncio  
+import inspect  
+import time  
+from dataclasses import dataclass, field  
+from enum import Enum  
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple  
+  
+from pydantic import BaseModel  
+from pydantic.json import pydantic_encoder  
+  
+from gecko.compose.nodes import Next  
+from gecko.core.agent import Agent  
+from gecko.core.events import BaseEvent, EventBus  
+from gecko.core.exceptions import WorkflowCycleError, WorkflowError  
+from gecko.core.logging import get_logger  
+from gecko.core.message import Message  
+from gecko.core.utils import ensure_awaitable  
+from gecko.plugins.storage.interfaces import SessionInterface  
+  
+logger = get_logger(__name__)  
+  
+  
+# ========================= 事件定义 =========================  
+class WorkflowEvent(BaseEvent):  
+    """Workflow 专用事件对象，可被外部订阅"""  
+    pass  
+  
+  
+# ========================= 节点执行记录 =========================  
+class NodeStatus(Enum):  
+    PENDING = "pending"  
+    RUNNING = "running"  
+    SUCCESS = "success"  
+    FAILED = "failed"  
+    SKIPPED = "skipped"  
+  
+  
+@dataclass  
+class NodeExecution:  
+    """单个节点的执行记录（方便追踪和可视化）"""  
+    node_name: str  
+    status: NodeStatus = NodeStatus.PENDING  
+    input_data: Any = None  
+    output_data: Any = None  
+    error: Optional[str] = None  
+    start_time: float = 0.0  
+    end_time: float = 0.0  
+  
+    @property  
+    def duration(self) -> float:  
+        return max(0.0, self.end_time - self.start_time)  
+  
+  
+# ========================= 工作流上下文 =========================  
+@dataclass  
+class WorkflowContext:  
+    """  
+    工作流执行过程中共享的上下文对象  
+    - input: 初始输入  
+    - state: 节点之间共享的状态（开发者可自由使用）  
+    - history: 每个节点的输出以及 last_output  
+    - metadata: 附加信息（如 session_id、external trace id 等）  
+    - executions: 节点执行详情列表  
+    """  
+    input: Any  
+    state: Dict[str, Any] = field(default_factory=dict)  
+    history: Dict[str, Any] = field(default_factory=dict)  
+    metadata: Dict[str, Any] = field(default_factory=dict)  
+    executions: List[NodeExecution] = field(default_factory=list)  
+  
+    def add_execution(self, execution: NodeExecution):  
+        self.executions.append(execution)  
+  
+    def get_execution_summary(self) -> Dict[str, Any]:  
+        total_time = sum(e.duration for e in self.executions)  
+        status_counts = {  
+            status.value: sum(1 for e in self.executions if e.status == status)  
+            for status in NodeStatus  
+        }  
+        return {  
+            "total_nodes": len(self.executions),  
+            "total_time": total_time,  
+            "status_counts": status_counts,  
+            "node_details": [  
+                {  
+                    "name": e.node_name,  
+                    "status": e.status.value,  
+                    "duration": e.duration,  
+                    "error": e.error,  
+                }  
+                for e in self.executions  
+            ],  
+        }  
+  
+    def to_dict(self) -> Dict[str, Any]:  
+        """  
+        安全序列化上下文，以便持久化  
+        - 使用 pydantic_encoder 处理 Message / BaseModel 等复杂对象  
+        - history 仅保留字符串或 JSON 友好格式，防止过大或不可序列化  
+        """  
+        def _safe(value: Any) -> Any:  
+            try:  
+                return pydantic_encoder(value)  
+            except Exception:  
+                return str(value)[:200]  
+  
+        history_dump = {  
+            k: _safe(v)  
+            for k, v in self.history.items()  
+            if k == "last_output" or isinstance(k, str)  
+        }  
+  
+        return {  
+            "input": _safe(self.input),  
+            "state": {k: _safe(v) for k, v in self.state.items()},  
+            "history": history_dump,  
+            "metadata": {k: _safe(v) for k, v in self.metadata.items()},  
+        }  
+  
+  
+# ========================= 工作流引擎 =========================  
+class Workflow:  
+    def __init__(  
+        self,  
+        name: str = "Workflow",  
+        event_bus: Optional[EventBus] = None,  
+        storage: Optional[SessionInterface] = None,  
+        max_steps: int = 100,  
+        enable_retry: bool = False,  
+        max_retries: int = 3,  
+    ):  
+        self.name = name  
+        self.event_bus = event_bus or EventBus()  
+        self.storage = storage  
+        self.max_steps = max_steps  
+        self.enable_retry = enable_retry  
+        self.max_retries = max_retries  
+  
+        self.nodes: Dict[str, Callable] = {}  
+        self.edges: Dict[str, List[Tuple[str, Optional[Callable]]]] = {}  
+        self.entry_point: Optional[str] = None  
+  
+        self._validated = False  
+        self._validation_errors: List[str] = []  
+  
+    # ---------- DAG 构建 API ----------  
+    def add_node(self, name: str, func: Callable) -> "Workflow":  
+        if name in self.nodes:  
+            raise ValueError(f"Node '{name}' already exists")  
+        self.nodes[name] = func  
+        self._validated = False  
+        logger.debug("Node added", node=name)  
+        return self  
+  
+    def add_edge(  
+        self,  
+        source: str,  
+        target: str,  
+        condition: Optional[Callable[[WorkflowContext], bool]] = None,  
+    ) -> "Workflow":  
+        if source not in self.nodes:  
+            raise ValueError(f"Source node '{source}' not found")  
+        if target not in self.nodes:  
+            raise ValueError(f"Target node '{target}' not found")  
+  
+        self.edges.setdefault(source, []).append((target, condition))  
+        self._validated = False  
+        logger.debug("Edge added", source=source, target=target)  
+        return self  
+  
+    def set_entry_point(self, name: str) -> "Workflow":  
+        if name not in self.nodes:  
+            raise ValueError(f"Node '{name}' not found")  
+        self.entry_point = name  
+        self._validated = False  
+        return self  
+  
+    # ---------- DAG 验证 ----------  
+    def validate(self) -> bool:  
+        if self._validated:  
+            return len(self._validation_errors) == 0  
+  
+        self._validation_errors.clear()  
+  
+        if not self.entry_point:  
+            self._validation_errors.append("No entry point defined")  
+        elif self.entry_point not in self.nodes:  
+            self._validation_errors.append(f"Entry point '{self.entry_point}' not in nodes")  
+  
+        try:  
+            self._detect_cycles()  
+        except WorkflowCycleError as e:  
+            self._validation_errors.append(str(e))  
+  
+        unreachable = self._find_unreachable_nodes()  
+        if unreachable:  
+            logger.warning("Workflow has unreachable nodes", nodes=list(unreachable))  
+  
+        dead_nodes = self._find_dead_nodes()  
+        if dead_nodes:  
+            logger.warning("Workflow has dead-end nodes", nodes=list(dead_nodes))  
+  
+        self._validated = True  
+        if self._validation_errors:  
+            logger.error("Workflow validation failed", errors=self._validation_errors)  
+            return False  
+  
+        logger.info("Workflow validation passed", name=self.name)  
+        return True  
+  
+    def _detect_cycles(self):  
+        visited: Set[str] = set()  
+        rec_stack: Set[str] = set()  
+  
+        def dfs(node: str, path: List[str]):  
+            visited.add(node)  
+            rec_stack.add(node)  
+            path.append(node)  
+  
+            for neighbor, _ in self.edges.get(node, []):  
+                if neighbor not in visited:  
+                    dfs(neighbor, path)  
+                elif neighbor in rec_stack:  
+                    cycle_start = path.index(neighbor)  
+                    cycle = " → ".join(path[cycle_start:] + [neighbor])  
+                    raise WorkflowCycleError(f"Cycle detected: {cycle}")  
+  
+            rec_stack.remove(node)  
+            path.pop()  
+  
+        for node in self.nodes:  
+            if node not in visited:  
+                dfs(node, [])  
+  
+    def _find_unreachable_nodes(self) -> Set[str]:  
+        if not self.entry_point:  
+            return set(self.nodes.keys())  
+  
+        reachable: Set[str] = set()  
+        queue = [self.entry_point]  
+  
+        while queue:  
+            current = queue.pop(0)  
+            if current in reachable:  
+                continue  
+            reachable.add(current)  
+            for neighbor, _ in self.edges.get(current, []):  
+                if neighbor not in reachable:  
+                    queue.append(neighbor)  
+  
+        return set(self.nodes.keys()) - reachable  
+  
+    def _find_dead_nodes(self) -> Set[str]:  
+        """简单检测：没有出边且不是入口的节点"""  
+        dead = set()  
+        for node in self.nodes:  
+            if not self.edges.get(node) and node != self.entry_point:  
+                dead.add(node)  
+        return dead  
+  
+    def get_validation_errors(self) -> List[str]:  
+        return self._validation_errors.copy()  
+  
+    # ---------- 执行入口 ----------  
+    async def execute(self, input_data: Any, session_id: Optional[str] = None) -> Any:  
+        if not self.validate():  
+            errors = "\n".join(self._validation_errors)  
+            raise WorkflowError(f"Workflow validation failed:\n{errors}")  
+  
+        context = WorkflowContext(input=input_data)  
+        if session_id:  
+            context.metadata["session_id"] = session_id  
+  
+        await self.event_bus.publish(  
+            WorkflowEvent(type="workflow_started", data={"name": self.name, "input": str(input_data)[:100]})  
+        )  
+  
+        try:  
+            result = await self._execute_loop(context, session_id)  
+            await self.event_bus.publish(  
+                WorkflowEvent(  
+                    type="workflow_completed",  
+                    data={"name": self.name, "summary": context.get_execution_summary()},  
+                )  
+            )  
+            return result  
+        except Exception as e:  
+            await self.event_bus.publish(  
+                WorkflowEvent(type="workflow_error", error=str(e), data={"name": self.name})  
+            )  
+            raise  
+  
+    async def _execute_loop(self, context: WorkflowContext, session_id: Optional[str]) -> Any:  
+        current_node = self.entry_point  
+        steps = 0  
+  
+        while current_node and steps < self.max_steps:  
+            steps += 1  
+            node_name = current_node  
+  
+            logger.debug("Executing node", node=node_name, step=steps)  
+            result = await self._execute_node(node_name, context)  
+  
+            normalized = self._normalize_result(result)  
+            context.history[node_name] = normalized  
+            context.history["last_output"] = normalized  
+  
+            if isinstance(result, Next):  
+                current_node = result.node  
+                if result.input is not None:  
+                    normalized_input = self._normalize_result(result.input)  
+                    context.history["last_output"] = normalized_input  
+                    context.state["_next_input"] = normalized_input  
+            else:  
+                current_node = await self._find_next_node(node_name, context)  
+  
+            if self.storage and session_id:  
+                await self._persist_state(session_id, steps, node_name, context)  
+  
+        if steps >= self.max_steps:  
+            raise WorkflowError(  
+                f"Workflow exceeded max steps: {self.max_steps}",  
+                context={"steps": steps, "last_node": current_node},  
+            )  
+  
+        return context.history.get("last_output") 
+    
+    async def _persist_state(  
+        self,  
+        session_id: str,  
+        steps: int,  
+        last_node: Optional[str],  
+        context: WorkflowContext,  
+    ):  
+        """状态持久化统一入口"""  
+        try:  
+            await self.storage.set(  
+                f"workflow:{session_id}",  
+                {  
+                    "step": steps,  
+                    "last_node": last_node,  
+                    "context": context.to_dict(),  
+                },  
+            )  
+        except Exception as e:  
+            logger.warning("Failed to persist workflow state", error=str(e)) 
+  
+    async def _execute_node(self, node_name: str, context: WorkflowContext) -> Any:  
+        execution = NodeExecution(node_name=node_name, status=NodeStatus.RUNNING, start_time=time.time())  
+        await self.event_bus.publish(WorkflowEvent(type="node_started", data={"node": node_name}))  
+  
+        node_callable = self.nodes[node_name]  
+  
+        try:  
+            if self.enable_retry:  
+                result = await self._execute_with_retry(node_callable, context)  
+            else:  
+                result = await self._execute_once(node_callable, context)  
+  
+            execution.status = NodeStatus.SUCCESS  
+            execution.output_data = self._normalize_result(result)  
+            execution.end_time = time.time()  
+  
+            await self.event_bus.publish(  
+                WorkflowEvent(  
+                    type="node_completed",  
+                    data={"node": node_name, "duration": execution.duration, "result": str(result)[:100]},  
+                )  
+            )  
+            return result  
+  
+        except Exception as e:  
+            execution.status = NodeStatus.FAILED  
+            execution.error = str(e)  
+            execution.end_time = time.time()  
+  
+            await self.event_bus.publish(  
+                WorkflowEvent(type="node_error", error=str(e), data={"node": node_name})  
+            )  
+            raise WorkflowError(f"Node '{node_name}' execution failed: {e}", context={"node": node_name}) from e  
+  
+        finally:  
+            context.add_execution(execution)
+    
+    async def _run_agent_node(self, agent: Agent, context: WorkflowContext) -> Any:  
+        """  
+        Agent 节点默认读取 last_output 作为输入；  
+        如果上一节点通过 Next.input 传递了自定义输入，则优先使用  
+        """  
+        user_input = context.state.pop("_next_input", None) or context.history.get("last_output", context.input)  
+  
+        if isinstance(user_input, str):  
+            user_input = Message.user(user_input)  
+        elif isinstance(user_input, dict):  
+            user_input = Message(**user_input)  
+        elif isinstance(user_input, list) and user_input and isinstance(user_input[0], dict):  
+            user_input = [Message(**msg) for msg in user_input]  
+  
+        output = await agent.run(user_input)  
+        return output.model_dump() if hasattr(output, "model_dump") else output  
+  
+    async def _find_next_node(self, current: str, context: WorkflowContext) -> Optional[str]:  
+        edges = self.edges.get(current, [])  
+        for target, condition in edges:  
+            if condition is None:  
+                return target  
+            try:  
+                if inspect.iscoroutinefunction(condition):  
+                    if await condition(context):  
+                        return target  
+                else:  
+                    if condition(context):  
+                        return target  
+            except Exception as e:  
+                logger.error("Condition evaluation failed", source=current, target=target, error=str(e))  
+        return None  
+  
+    # 在 Workflow 类里增加一个通用执行方法  
+    async def _execute_once(self, node_callable: Callable, context: WorkflowContext) -> Any:  
+        if isinstance(node_callable, Agent):  
+            return await self._run_agent_node(node_callable, context)  
+        if callable(node_callable):  
+            return await ensure_awaitable(node_callable, context)  
+        raise WorkflowError(f"Node '{node_callable}' is not callable")  
+    
+    async def _execute_with_retry(self, func: Callable, context: WorkflowContext) -> Any:  
+        last_error = None  
+        for attempt in range(self.max_retries):  
+            try:  
+                return await self._execute_once(func, context)  
+            except Exception as e:  
+                last_error = e  
+                logger.warning(  
+                    "Node execution failed, retrying",  
+                    attempt=attempt + 1,  
+                    max_retries=self.max_retries,  
+                    error=str(e),  
+                )  
+                if attempt < self.max_retries - 1:  
+                    await asyncio.sleep(2 ** attempt)  
+        # 所有重试都失败  
+        raise last_error    
+  
+    def _normalize_result(self, result: Any) -> Any:  
+        """  
+        将节点输出转换为可序列化/可在历史中保存的格式  
+        - BaseModel -> dict  
+        - AgentOutput -> content/dict  
+        - Message -> OpenAI 字典  
+        - 原生类型保持不变  
+        - 其他对象转为字符串（并截断）  
+        """  
+        if isinstance(result, BaseModel):  
+            return result.model_dump()  
+        if hasattr(result, "model_dump"):  
+            data = result.model_dump()  
+            return data.get("content", data)  
+        if isinstance(result, Message):  
+            return result.to_openai_format()  
+        if isinstance(result, (str, int, float, bool, type(None))):  
+            return result  
+        if isinstance(result, (list, dict)):  
+            return result  
+        return str(result)[:500]  
+  
+    async def _persist_state(  
+        self,  
+        session_id: str,  
+        steps: int,  
+        current_node: Optional[str],  
+        context: WorkflowContext,  
+    ):  
+        """状态持久化的统一入口，使用 try/except 避免影响主流程"""  
+        try:  
+            await self.storage.set(  
+                f"workflow:{session_id}",  
+                {  
+                    "step": steps,  
+                    "last_node": current_node,  
+                    "context": context.to_dict(),  
+                },  
+            )  
+        except Exception as e:  
+            logger.warning("Failed to persist workflow state", error=str(e))  
+  
+    # ---------- 可视化/调试 ----------  
+    def to_mermaid(self) -> str:  
+        lines = ["graph TD"]  
+        for node in self.nodes:  
+            label = f"[{node}]" if node == self.entry_point else f"({node})"  
+            lines.append(f"    {node}{label}")  
+        for source, targets in self.edges.items():  
+            for target, condition in targets:  
+                label = f"|condition|" if condition else ""  
+                lines.append(f"    {source} --{label}--> {target}")  
+        return "\n".join(lines)  
+  
+    def print_structure(self):  
+        print(f"\n=== Workflow: {self.name} ===")  
+        print(f"Entry Point: {self.entry_point}")  
+        print(f"\nNodes ({len(self.nodes)}):")  
+        for node in self.nodes:  
+            print(f"  - {node}")  
+  
+        print(f"\nEdges ({sum(len(v) for v in self.edges.values())}):")  
+        for source, targets in self.edges.items():  
+            for target, condition in targets:  
+                cond_str = " [conditional]" if condition else ""  
+                print(f"  - {source} → {target}{cond_str}")  
+        print()  
+```
+
+[6] gecko/config.py
+```python
+# gecko/config.py  
+"""  
+配置系统（改进版）  
+  
+- 增加 configure_settings / reset_settings，便于测试重载  
+- 使用 Lazy 初始化，防止导入 config 时立刻读取 .env  
+- Docstring 更新，避免示例与 Agent API 不匹配  
+"""  
+  
+from __future__ import annotations  
+  
+from typing import Optional  
+  
+from pydantic import Field, field_validator  
+from pydantic_settings import BaseSettings, SettingsConfigDict  
+  
+  
+class GeckoSettings(BaseSettings):  
+    default_model: str = Field(default="gpt-3.5-turbo")  
+    default_api_key: str = Field(default="")  
+    default_base_url: Optional[str] = None  
+    default_temperature: float = Field(default=0.7, ge=0.0, le=2.0)  
+  
+    max_turns: int = Field(default=5, ge=1, le=50)  
+    max_context_tokens: int = Field(default=4000, ge=100)  
+  
+    default_storage_url: str = Field(default="sqlite://./gecko_data.db")  
+    log_level: str = Field(default="INFO")  
+    log_format: str = Field(default="text")  
+  
+    enable_cache: bool = True  
+    tool_execution_timeout: float = Field(default=30.0, ge=1.0)  
+  
+    model_config = SettingsConfigDict(  
+        env_prefix="GECKO_",  
+        env_file=".env",  
+        env_file_encoding="utf-8",  
+        case_sensitive=False,  
+        extra="ignore",  
+    )  
+  
+    @field_validator("log_level")  
+    @classmethod  
+    def validate_log_level(cls, v: str) -> str:  
+        valid = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}  
+        if v.upper() not in valid:  
+            raise ValueError(f"log_level must be one of {valid}")  
+        return v.upper()  
+  
+    @field_validator("log_format")  
+    @classmethod  
+    def validate_log_format(cls, v: str) -> str:  
+        if v not in {"text", "json"}:  
+            raise ValueError("log_format must be 'text' or 'json'")  
+        return v  
+  
+  
+_default_settings: Optional[GeckoSettings] = None  
+  
+  
+def get_settings(force_reload: bool = False) -> GeckoSettings:  
+    global _default_settings  
+    if _default_settings is None or force_reload:  
+        _default_settings = GeckoSettings()  
+    return _default_settings  
+  
+  
+def configure_settings(**overrides) -> GeckoSettings:  
+    """  
+    允许测试/脚本传入覆盖参数，例如：  
+        configure_settings(default_model="gpt-4")  
+    """  
+    global _default_settings  
+    _default_settings = GeckoSettings(**overrides)  
+    return _default_settings  
+  
+  
+def reset_settings():  
+    global _default_settings  
+    _default_settings = None  
+  
+  
+settings = get_settings()  
+```
+
+[7] gecko/core/__init__.py
+```python
+```
+
+[8] gecko/core/agent.py
+```python
+# gecko/core/agent.py  
+from __future__ import annotations  
+  
+from typing import Any, Iterable, List, Optional, Type, Union  
+  
+from pydantic import BaseModel  
+  
+from gecko.core.events import AgentRunEvent, EventBus  
+from gecko.core.message import Message  
+from gecko.core.output import AgentOutput  
+from gecko.core.toolbox import ToolBox  
+from gecko.core.memory import TokenMemory  
+from gecko.core.engine.base import CognitiveEngine  
+from gecko.core.engine.react import ReActEngine  
+from gecko.core.logging import get_logger  
+from gecko.core.exceptions import AgentError  
+  
+logger = get_logger(__name__)  
+  
+  
+class Agent:  
+    """  
+    Agent 对象负责在模型、工具箱、记忆之间协调一次推理任务。  
+    """  
+  
+    def __init__(  
+        self,  
+        model: Any,  
+        toolbox: ToolBox,  
+        memory: TokenMemory,  
+        engine_cls: Type[CognitiveEngine] = ReActEngine,  
+        event_bus: Optional[EventBus] = None,  
+        **engine_kwargs: Any,  
+    ):  
+        self.event_bus = event_bus or EventBus()  
+        self.toolbox = toolbox  
+        self.memory = memory  
+        self.engine = engine_cls(  
+            model=model,  
+            toolbox=toolbox,  
+            memory=memory,  
+            **engine_kwargs  
+        )  
+  
+    async def run(  
+        self,  
+        messages: str | Message | List[Message] | List[dict] | dict,  
+        response_model: Optional[Type[BaseModel]] = None  
+    ) -> AgentOutput | BaseModel:  
+        """  
+        单次推理入口：对多种输入格式统一转换为 Message 列表  
+        """  
+        input_msgs = self._normalize_messages(messages)  
+  
+        await self.event_bus.publish(  
+            AgentRunEvent(type="run_started", data={"input_count": len(input_msgs)})  
+        )  
+  
+        try:  
+            output = await self.engine.step(input_msgs, response_model=response_model)  
+            payload = self._serialize_output(output)  
+  
+            await self.event_bus.publish(  
+                AgentRunEvent(type="run_completed", data={"output": payload})  
+            )  
+            return output  
+  
+        except Exception as e:  
+            logger.exception("Agent run failed")  
+            await self.event_bus.publish(  
+                AgentRunEvent(type="run_error", error=str(e))  
+            )  
+            raise  
+  
+    async def stream(self, messages: str | Message | List[Message] | List[dict] | dict):  
+        """  
+        流式推理：共用同一套输入标准化逻辑  
+        """  
+        input_msgs = self._normalize_messages(messages)  
+  
+        await self.event_bus.publish(AgentRunEvent(type="stream_started"))  
+        try:  
+            async for chunk in self.engine.step_stream(input_msgs):  
+                yield chunk  
+            await self.event_bus.publish(AgentRunEvent(type="stream_completed"))  
+        except Exception as e:  
+            logger.exception("Agent stream failed")  
+            await self.event_bus.publish(AgentRunEvent(type="stream_error", error=str(e)))  
+            raise  
+  
+    # ---------------- 辅助方法 ----------------  
+    def _normalize_messages(  
+        self,  
+        messages: str | Message | List[Message] | List[dict] | dict  
+    ) -> List[Message]:  
+        """  
+        支持以下输入：  
+        1. 字符串 -> 单条 user 消息  
+        2. Message -> [Message]  
+        3. List[Message] -> 原样返回  
+        4. dict -> 若包含 role/content 则构建 Message，否则视为 {"input": "..."}  
+        5. List[dict] -> 每个 dict 转为 Message  
+        """  
+        if isinstance(messages, Message):  
+            return [messages]  
+  
+        if isinstance(messages, str):  
+            return [Message.user(messages)]  
+  
+        if isinstance(messages, dict):  
+            if "role" in messages:  
+                return [Message(**messages)]  
+            text = messages.get("input") or str(messages)  
+            return [Message.user(text)]  
+  
+        if isinstance(messages, list):  
+            if not messages:  
+                raise AgentError("消息列表为空")  
+            if isinstance(messages[0], Message):  
+                return messages  # 已经是标准 Message  
+            normalized = []  
+            for item in messages:  
+                if isinstance(item, Message):  
+                    normalized.append(item)  
+                elif isinstance(item, dict):  
+                    normalized.append(Message(**item))  
+                else:  
+                    raise AgentError(f"无法识别的消息元素类型: {type(item)}")  
+            return normalized  
+  
+        raise AgentError(f"不支持的消息类型: {type(messages)}")  
+  
+    def _serialize_output(self, output: AgentOutput | BaseModel) -> dict:  
+        if hasattr(output, "model_dump"):  
+            return output.model_dump()  
+        return {"content": str(output)}  
+```
+
+[9] gecko/core/builder.py
+```python
+# gecko/core/builder.py  
+from __future__ import annotations  
+  
+from typing import Any, Sequence, Type  
+  
+from gecko.core.agent import Agent  
+from gecko.core.memory import TokenMemory  
+from gecko.core.toolbox import ToolBox  
+from gecko.core.engine.base import CognitiveEngine  
+from gecko.core.engine.react import ReActEngine  
+from gecko.plugins.storage.interfaces import SessionInterface  
+from gecko.plugins.tools.base import BaseTool  
+from gecko.core.exceptions import ConfigurationError  
+  
+  
+class AgentBuilder:  
+    """  
+    Agent 构建器（改进版）  
+    关键改进：  
+    1. system_prompt 等引擎参数统一通过 engine_kwargs 传递，避免与 Agent.__init__ 不匹配  
+    2. 工具列表自动去重并校验是否继承 BaseTool  
+    3. storage 必须实现 SessionInterface，否则在 TokenMemory 中使用会报错  
+    4. 支持自定义 Engine 类 & 额外参数  
+    """  
+  
+    def __init__(self):  
+        self._model: Any | None = None  
+        self._tools: list[BaseTool] = []  
+        self._storage: SessionInterface | None = None  
+        self._session_id: str = "default"  
+        self._max_tokens: int = 4000  
+        self._engine_cls: Type[CognitiveEngine] = ReActEngine  
+        self._engine_kwargs: dict[str, Any] = {}  # 统一放置系统 Prompt、Hook 等  
+        self._toolbox_config: dict[str, Any] = {}  
+  
+    # ---------------- 基础配置 ----------------  
+    def with_model(self, model: Any) -> "AgentBuilder":  
+        # 检查模型是否实现必要方法  
+        missing = [m for m in ("acompletion",) if not hasattr(model, m)]  
+        if missing:  
+            raise ConfigurationError(  
+                f"Model 缺少必要方法: {', '.join(missing)}",  
+                context={"model": repr(model)}  
+            )  
+        self._model = model  
+        return self  
+  
+    def with_tools(self, tools: Sequence[BaseTool]) -> "AgentBuilder":  
+        for tool in tools:  
+            if not isinstance(tool, BaseTool):  
+                raise TypeError(f"Tool 必须继承 BaseTool，收到 {type(tool)}")  
+            self._tools.append(tool)  
+        return self  
+  
+    def with_storage(self, storage: SessionInterface | None) -> "AgentBuilder":  
+        if storage and not isinstance(storage, SessionInterface):  
+            raise TypeError(  
+                "storage 必须实现 SessionInterface，用于 TokenMemory 持久化"  
+            )  
+        self._storage = storage  
+        return self  
+  
+    def with_session_id(self, session_id: str) -> "AgentBuilder":  
+        self._session_id = session_id  
+        return self  
+  
+    def with_max_tokens(self, max_tokens: int) -> "AgentBuilder":  
+        self._max_tokens = max_tokens  
+        return self  
+  
+    def with_engine(  
+        self,  
+        engine_cls: Type[CognitiveEngine],  
+        **engine_kwargs: Any  
+    ) -> "AgentBuilder":  
+        if not issubclass(engine_cls, CognitiveEngine):  
+            raise TypeError("engine_cls 必须继承 CognitiveEngine")  
+        self._engine_cls = engine_cls  
+        self._engine_kwargs.update(engine_kwargs)  
+        return self  
+  
+    def with_system_prompt(self, prompt: str) -> "AgentBuilder":  
+        # 统一放入 engine_kwargs，确保 Engine 可接收  
+        self._engine_kwargs["system_prompt"] = prompt  
+        return self  
+  
+    def with_toolbox_config(self, **config: Any) -> "AgentBuilder":  
+        """  
+        允许调用者自定义 ToolBox 的并发/超时等参数  
+        """  
+        self._toolbox_config.update(config)  
+        return self  
+  
+    # ---------------- 构建流程 ----------------  
+    def build(self) -> Agent:  
+        if not self._model:  
+            raise ConfigurationError("构建 Agent 前必须调用 with_model 指定模型")  
+  
+        toolbox = self._build_toolbox()  
+        memory = self._build_memory()  
+  
+        return Agent(  
+            model=self._model,  
+            toolbox=toolbox,  
+            memory=memory,  
+            engine_cls=self._engine_cls,  
+            event_bus=self._engine_kwargs.pop("event_bus", None),  
+            **self._engine_kwargs  # 其余参数直接传给 Engine  
+        )  
+  
+    def _build_toolbox(self) -> ToolBox:  
+        # 根据工具名称去重，后注册的同名工具会覆盖前者  
+        deduped: dict[str, BaseTool] = {}  
+        for tool in self._tools:  
+            deduped[tool.name] = tool  
+  
+        return ToolBox(  
+            tools=list(deduped.values()),  
+            **self._toolbox_config  
+        )  
+  
+    def _build_memory(self) -> TokenMemory:  
+        return TokenMemory(  
+            session_id=self._session_id,  
+            storage=self._storage,  
+            max_tokens=self._max_tokens  
+        )  
+```
+
+[10] gecko/core/engine/base.py
+```python
+# gecko/core/engine/base.py
+from abc import ABC, abstractmethod
+from typing import List, Optional
+from gecko.core.message import Message
+from gecko.core.output import AgentOutput
+from gecko.core.toolbox import ToolBox
+from gecko.core.memory import TokenMemory
+
+class CognitiveEngine(ABC):
+    """
+    认知引擎基类：定义 Agent 如何'思考'和'执行'
+    """
+    def __init__(self, model, toolbox: ToolBox, memory: TokenMemory):
+        self.model = model
+        self.toolbox = toolbox
+        self.memory = memory
+
+    @abstractmethod
+    async def step(self, input_messages: List[Message]) -> AgentOutput:
+        """
+        执行单次或多轮推理步骤
+        :param input_messages: 当前输入的消息（通常是 User Message）
+        :return: 最终产出的 AgentOutput
+        """
+        pass
+```
+
+[11] gecko/core/engine/react.py
+```python
+# gecko/core/engine/react.py  
+"""  
+ReActEngine（增强版）  
+  
+核心能力：  
+1. 模型能力自适应：检测是否支持 function calling / stream，自动降级或提示  
+2. 工具执行更健壮：校验字段、捕获错误、反馈给 LLM，防止死循环  
+3. 结构化输出解析与带反馈重试  
+4. 流式/非流式路径统一管理上下文  
+5. Hook 机制完善，异常不影响主流程  
+"""  
+  
+from __future__ import annotations  
+  
+import asyncio  
+import json  
+from typing import (  
+    Any,  
+    AsyncIterator,  
+    Callable,  
+    Dict,  
+    List,  
+    Optional,  
+    Tuple,  
+    Type,  
+    TypeVar,  
+)  
+  
+from pydantic import BaseModel  
+  
+from gecko.core.engine.base import CognitiveEngine  
+from gecko.core.exceptions import AgentError, ModelError  
+from gecko.core.logging import get_logger  
+from gecko.core.message import Message  
+from gecko.core.output import AgentOutput  
+from gecko.core.prompt import PromptTemplate  
+from gecko.core.structure import StructureEngine  
+from gecko.core.toolbox import ToolBox  
+from gecko.core.utils import ensure_awaitable  
+from gecko.core.memory import TokenMemory  
+  
+logger = get_logger(__name__)  
+  
+T = TypeVar("T", bound=BaseModel)  
+  
+DEFAULT_REACT_TEMPLATE = """You are a helpful AI assistant.  
+Available Tools:  
+{% for tool in tools %}  
+- {{ tool.function.name }}: {{ tool.function.description }}  
+{% endfor %}  
+  
+Answer the user's request. Use tools if necessary.  
+"""  
+  
+  
+class ExecutionContext:  
+    """  
+    执行上下文：  
+    - messages：当前对话（包含历史和用户输入）  
+    - turn：已经执行的轮数  
+    - metadata：可存储 last_response 等额外信息  
+    """  
+  
+    def __init__(self, messages: List[Message]):  
+        self.messages = messages  
+        self.turn = 0  
+        self.metadata: Dict[str, Any] = {}  
+  
+    def add_message(self, message: Message):  
+        self.messages.append(message)  
+  
+    def get_last_message(self) -> Optional[Message]:  
+        return self.messages[-1] if self.messages else None  
+  
+  
+class ReActEngine(CognitiveEngine):  
+    """  
+    ReAct 引擎（完整实现）  
+    """  
+  
+    def __init__(  
+        self,  
+        model: Any,  
+        toolbox: ToolBox,  
+        memory: TokenMemory,  
+        max_turns: int = 5,  
+        system_prompt: str | PromptTemplate | None = None,  
+        on_turn_start: Optional[Callable[[ExecutionContext], Any]] = None,  
+        on_turn_end: Optional[Callable[[ExecutionContext], Any]] = None,  
+        on_tool_execute: Optional[Callable[[str, Dict[str, Any]], Any]] = None,  
+        supports_functions: Optional[bool] = None,  
+        supports_stream: Optional[bool] = None,  
+    ):  
+        super().__init__(model, toolbox, memory)  
+        self.max_turns = max_turns  
+        self.on_turn_start = on_turn_start  
+        self.on_turn_end = on_turn_end  
+        self.on_tool_execute = on_tool_execute  
+  
+        # 模型能力检测：若未显式声明，则根据方法/属性推断  
+        self.supports_functions = (  
+            supports_functions  
+            if supports_functions is not None  
+            else hasattr(model, "acompletion")  
+        )  
+        self.supports_stream = (  
+            supports_stream  
+            if supports_stream is not None  
+            else hasattr(model, "astream")  
+        )  
+  
+        if system_prompt is None:  
+            self.prompt_template = PromptTemplate(template=DEFAULT_REACT_TEMPLATE)  
+        elif isinstance(system_prompt, str):  
+            self.prompt_template = PromptTemplate(template=system_prompt)  
+        else:  
+            self.prompt_template = system_prompt  
+  
+    # ===================== 对外 API =====================  
+    async def step(  
+        self,  
+        input_messages: List[Message],  
+        response_model: Optional[Type[T]] = None,  
+        strategy: str = "auto",  
+        max_retries: int = 2,  
+    ) -> AgentOutput | T:  
+        """  
+        核心推理入口。  
+        1. 构建上下文（包含历史和 system prompt）  
+        2. 构造模型调用参数（function calling / json mode 等）  
+        3. 运行 ReAct 循环  
+        4. 如需结构化输出，执行解析与带反馈重试  
+        """  
+        logger.info(  
+            "ReAct execution started",  
+            input_count=len(input_messages),  
+            has_structure=response_model is not None,  
+        )  
+  
+        try:  
+            context = await self._build_execution_context(input_messages)  
+            llm_params = self._build_llm_params(response_model, strategy)  
+  
+            final_output = await self._run_reasoning_loop(  
+                context,  
+                llm_params,  
+                response_model,  
+                strategy,  
+            )  
+  
+            if response_model:  
+                structured = await self._extract_and_retry(  
+                    final_output,  
+                    response_model,  
+                    context,  
+                    llm_params,  
+                    max_retries,  
+                )  
+                await self._save_context(context)  
+                return structured  
+  
+            await self._save_context(context)  
+            logger.info("ReAct execution completed")  
+            return final_output  
+  
+        except Exception as e:  
+            logger.exception("ReAct execution failed")  
+            if isinstance(e, AgentError):  
+                raise  
+            raise AgentError(f"ReAct execution failed: {e}") from e  
+  
+    async def step_stream(self, input_messages: List[Message]) -> AsyncIterator[str]:  
+        """  
+        流式执行入口：  
+        1. 先尝试快速判断是否需要工具，若需要则走常规 ReAct  
+        2. 若不需要，直接流式输出最终回复（仅在模型支持 stream 时）  
+        """  
+        if not self.supports_stream:  
+            raise AgentError("当前模型不支持流式输出")  
+  
+        context = await self._build_execution_context(input_messages)  
+        llm_params = self._build_llm_params(None, "auto")  
+  
+        turn = 0  
+        while turn < self.max_turns:  
+            turn += 1  
+  
+            needs_tools, peek_response = await self._check_needs_tools(context, llm_params)  
+            if needs_tools:  
+                await self._execute_one_turn(context, llm_params, None, "auto")  
+                continue  
+  
+            if peek_response:  
+                msg = self._parse_llm_response(peek_response)  
+                context.add_message(msg)  
+                for chunk in msg.content or []:  
+                    yield chunk  
+                break  
+  
+            async for chunk in self._stream_final_response(context, llm_params):  
+                yield chunk  
+            break  
+  
+        await self._save_context(context)  
+  
+    # ===================== 上下文构建 =====================  
+    async def _build_execution_context(self, input_messages: List[Message]) -> ExecutionContext:  
+        history = await self._load_history()  
+  
+        # 若历史中不存在 system prompt，则插入  
+        if not any(m.role == "system" for m in history):  
+            system_msg = self._create_system_message()  
+            history.insert(0, system_msg)  
+  
+        # 用户输入中若包含 system 也应该去重/放到开头  
+        user_system = [m for m in input_messages if m.role == "system"]  
+        normal_inputs = [m for m in input_messages if m.role != "system"]  
+        all_messages = history + user_system + normal_inputs  
+  
+        return ExecutionContext(all_messages)  
+  
+    async def _load_history(self) -> List[Message]:  
+        if not self.memory.storage or not self.memory.session_id:  
+            return []  
+  
+        try:  
+            raw = await self.memory.storage.get(self.memory.session_id)  
+            if not raw:  
+                return []  
+            history_raw = raw.get("messages", [])  
+            return await self.memory.get_history(history_raw)  
+        except Exception as e:  
+            logger.warning("Failed to load history", session_id=self.memory.session_id, error=str(e))  
+            return []  
+  
+    def _create_system_message(self) -> Message:  
+        tools_schema = self.toolbox.to_openai_schema()  
+        content = self.prompt_template.format(tools=tools_schema)  
+        return Message.system(content)  
+  
+    # ===================== LLM 参数构建 =====================  
+    def _build_llm_params(self, response_model: Optional[Type[T]], strategy: str) -> Dict[str, Any]:  
+        params: Dict[str, Any] = {}  
+  
+        tools_schema = self.toolbox.to_openai_schema()  
+        if tools_schema and self.supports_functions:  
+            params["tools"] = tools_schema  
+            params["tool_choice"] = "auto"  
+  
+        if response_model:  
+            if strategy in {"auto", "function_calling"} and self.supports_functions:  
+                self._add_structure_params(params, response_model)  
+            else:  
+                params["response_format"] = {"type": "json_object"}  
+                if not self.supports_functions:  
+                    logger.warning("模型不支持 function calling，已降级为 JSON Mode")  
+  
+        return params  
+  
+    def _add_structure_params(self, params: Dict[str, Any], response_model: Type[T]):  
+        structure_tool = StructureEngine.to_openai_tool(response_model)  
+        params.setdefault("tools", []).append(structure_tool)  
+        params["tool_choice"] = {  
+            "type": "function",  
+            "function": {"name": structure_tool["function"]["name"]},  
+        }  
+  
+    # ===================== 主推理循环 =====================  
+    async def _run_reasoning_loop(  
+        self,  
+        context: ExecutionContext,  
+        llm_params: Dict[str, Any],  
+        response_model: Optional[Type[T]],  
+        strategy: str,  
+    ) -> AgentOutput:  
+        while context.turn < self.max_turns:  
+            context.turn += 1  
+  
+            if self.on_turn_start:  
+                await self._safe_call_hook(self.on_turn_start, context)  
+  
+            should_continue = await self._execute_one_turn(  
+                context,  
+                llm_params,  
+                response_model,  
+                strategy,  
+            )  
+  
+            if self.on_turn_end:  
+                await self._safe_call_hook(self.on_turn_end, context)  
+  
+            if not should_continue:  
+                break  
+  
+        last_msg = context.get_last_message()  
+        if last_msg and last_msg.role == "assistant":  
+            tool_calls = getattr(last_msg, "tool_calls", None) or []  
+            return AgentOutput(  
+                content=last_msg.content or "",  
+                raw=context.metadata.get("last_response"),  
+                tool_calls=tool_calls,  
+            )  
+  
+        logger.warning("Max turns reached", max_turns=self.max_turns)  
+        return AgentOutput(content="Max iterations reached.")  
+  
+    async def _execute_one_turn(  
+        self,  
+        context: ExecutionContext,  
+        llm_params: Dict[str, Any],  
+        response_model: Optional[Type[T]],  
+        strategy: str,  
+    ) -> bool:  
+        response = await self._call_llm(context, llm_params)  
+        assistant_msg = self._parse_llm_response(response)  
+        context.add_message(assistant_msg)  
+        context.metadata["last_response"] = response  
+  
+        # 结构化提取完成则无需继续  
+        if (  
+            response_model  
+            and strategy in {"auto", "function_calling"}  
+            and self._is_structure_extraction(assistant_msg, response_model)  
+        ):  
+            return False  
+  
+        if assistant_msg.tool_calls:  
+            executed = await self._execute_tools(assistant_msg.tool_calls, context, response_model)  
+            return executed  
+  
+        # 无工具调用，则视为最终回复  
+        return False  
+  
+    # ===================== LLM 调用/解析 =====================  
+    async def _call_llm(self, context: ExecutionContext, params: Dict[str, Any]) -> Any:  
+        messages_payload = [m.to_openai_format() for m in context.messages]  
+        logger.debug("Calling LLM", message_count=len(messages_payload))  
+  
+        try:  
+            response = await ensure_awaitable(self.model.acompletion, messages=messages_payload, **params)  
+            return response  
+        except Exception as e:  
+            logger.error("LLM call failed", error=str(e))  
+            raise ModelError(f"LLM API call failed: {e}") from e  
+  
+    def _parse_llm_response(self, response: Any) -> Message:  
+        choice = response.choices[0]  
+        raw_msg = choice.message  
+  
+        if hasattr(raw_msg, "model_dump"):  
+            try:  
+                msg_data = raw_msg.model_dump()  
+            except Exception:  
+                msg_data = {}  
+        else:  
+            msg_data = {}  
+  
+        if not msg_data:  
+            msg_data = {  
+                "content": getattr(raw_msg, "content", ""),  
+                "tool_calls": getattr(raw_msg, "tool_calls", None),  
+            }  
+  
+        if not msg_data.get("role"):  
+            logger.warning("Missing role in LLM response")  
+            msg_data["role"] = "assistant"  
+  
+        return Message(**msg_data)  
+  
+    # ===================== 工具调用 =====================  
+    async def _execute_tools(  
+        self,  
+        tool_calls: List[Dict[str, Any]],  
+        context: ExecutionContext,  
+        response_model: Optional[Type[T]],  
+    ) -> bool:  
+        extraction_name = None  
+        if response_model and self.supports_functions:  
+            extraction_name = StructureEngine.to_openai_tool(response_model)["function"]["name"]  
+  
+        executed_successfully = False  
+  
+        for tool_call in tool_calls:  
+            func_info = tool_call.get("function") or {}  
+            func_name = func_info.get("name")  
+            arguments = func_info.get("arguments")  
+  
+            if not func_name:  
+                logger.error("Tool call missing name", tool_call=tool_call)  
+                continue  
+  
+            if func_name == extraction_name:  
+                # 结构化提取工具由结构化流程处理，此处跳过  
+                continue  
+  
+            if not isinstance(arguments, (str, dict)):  
+                logger.warning("Tool call arguments invalid", tool=func_name)  
+                continue  
+  
+            result = await self._execute_single_tool(func_name, arguments, tool_call.get("id") or "")  
+  
+            tool_msg = Message.tool_result(  
+                tool_call_id=tool_call.get("id") or "",  
+                content=result["content"],  
+                tool_name=func_name,  
+            )  
+            context.add_message(tool_msg)  
+  
+            if result["is_error"]:  
+                # 反馈给 LLM，促使其重新规划  
+                context.add_message(Message.user(f"工具 {func_name} 执行失败：{result['content']}"))  
+            else:  
+                executed_successfully = True  
+  
+        return executed_successfully  
+  
+    async def _execute_single_tool(self, func_name: str, args_payload: str | dict, call_id: str) -> Dict[str, str]:  
+        try:  
+            args = json.loads(args_payload) if isinstance(args_payload, str) else args_payload  
+        except json.JSONDecodeError as e:  
+            logger.error("Tool arguments JSON decode failed", tool=func_name, error=str(e))  
+            return {"content": f"参数解析失败：{e}", "is_error": True}  
+  
+        try:  
+            if self.on_tool_execute:  
+                await self._safe_call_hook(self.on_tool_execute, func_name, args)  
+  
+            result = await self.toolbox.execute(func_name, args)  
+            return {"content": result if isinstance(result, str) else str(result), "is_error": False}  
+        except Exception as e:  
+            logger.exception("Tool execution failed", tool=func_name)  
+            return {"content": f"执行异常：{e}", "is_error": True}  
+  
+    # ===================== 结构化输出 =====================  
+    def _is_structure_extraction(self, message: Message, model_class: Type[T]) -> bool:  
+        if not message.tool_calls or not self.supports_functions:  
+            return False  
+        extraction_name = StructureEngine.to_openai_tool(model_class)["function"]["name"]  
+        return any(tc.get("function", {}).get("name") == extraction_name for tc in message.tool_calls)  
+  
+    async def _extract_and_retry(  
+        self,  
+        base_output: AgentOutput,  
+        model_class: Type[T],  
+        context: ExecutionContext,  
+        llm_params: Dict[str, Any],  
+        max_retries: int,  
+    ) -> T:  
+        for retry in range(max_retries + 1):  
+            try:  
+                tool_calls = self._extract_tool_calls(base_output)  
+                result = await StructureEngine.parse(base_output.content, model_class, tool_calls)  
+                logger.info("Structured output extracted", retries=retry)  
+                return result  
+            except ValueError as e:  
+                if retry >= max_retries:  
+                    logger.error("Structure extraction failed", retries=retry)  
+                    raise AgentError(str(e))  
+                logger.info("Retrying structure extraction", attempt=retry + 1)  
+                base_output = await self._retry_with_feedback(str(e), context, llm_params)  
+  
+        raise AgentError("Structure extraction failed unexpectedly")  
+  
+    def _extract_tool_calls(self, output: AgentOutput) -> Optional[List[Dict[str, Any]]]:  
+        if not output.raw:  
+            return None  
+        try:  
+            return getattr(output.raw.choices[0].message, "tool_calls", None)  
+        except (AttributeError, IndexError):  
+            return None  
+  
+    async def _retry_with_feedback(  
+        self,  
+        error_message: str,  
+        context: ExecutionContext,  
+        llm_params: Dict[str, Any],  
+    ) -> AgentOutput:  
+        feedback = Message.user(f"Parsing error: {error_message}. Please format as valid JSON.")  
+        context.add_message(feedback)  
+  
+        response = await self._call_llm(context, llm_params)  
+        new_msg = self._parse_llm_response(response)  
+        context.add_message(new_msg)  
+  
+        return AgentOutput(  
+            content=new_msg.content or "",  
+            raw=response,  
+            tool_calls=getattr(new_msg, "tool_calls", None),  
+        )  
+  
+    # ===================== 流式/peek =====================  
+    async def _check_needs_tools(  
+        self,  
+        context: ExecutionContext,  
+        llm_params: Dict[str, Any],  
+    ) -> Tuple[bool, Optional[Any]]:  
+        """  
+        通过一次短输出的调用来判断是否需要工具。  
+        返回 (需要工具, peek_response)，若模型已给出最终回复，则可复用 peek_response。  
+        """  
+        peek_params = dict(llm_params)  
+        peek_params["max_tokens"] = min(50, peek_params.get("max_tokens", 50))  
+  
+        try:  
+            response = await self._call_llm(context, peek_params)  
+            msg = self._parse_llm_response(response)  
+  
+            if msg.tool_calls:  
+                # 已经给出工具调用，则把该消息加入上下文  
+                context.add_message(msg)  
+                return True, None  
+  
+            # 无工具调用，直接返回 peek response 供上层复用  
+            return False, response  
+  
+        except Exception as e:  
+            logger.warning("Peek call failed, fallback to normal flow", error=str(e))  
+            return False, None  
+  
+    async def _stream_final_response(  
+        self,  
+        context: ExecutionContext,  
+        llm_params: Dict[str, Any],  
+    ) -> AsyncIterator[str]:  
+        messages_payload = [m.to_openai_format() for m in context.messages]  
+        accumulated: List[str] = []  
+  
+        try:  
+            async for chunk in self.model.astream(messages=messages_payload, **llm_params):  
+                delta = chunk.choices[0].delta  
+                if delta.content:  
+                    accumulated.append(delta.content)  
+                    yield delta.content  
+        except Exception as e:  
+            logger.error("Streaming failed", error=str(e))  
+            raise  
+  
+        full_content = "".join(accumulated)  
+        final_msg = Message.assistant(full_content)  
+        context.add_message(final_msg)  
+        context.metadata["last_response"] = accumulated  
+  
+    # ===================== 记忆保存 =====================  
+    async def _save_context(self, context: ExecutionContext):  
+        if not self.memory.storage or not self.memory.session_id:  
+            return  
+        try:  
+            messages_data = [m.model_dump() for m in context.messages]  
+            await self.memory.storage.set(self.memory.session_id, {"messages": messages_data})  
+            logger.debug("Context saved", message_count=len(messages_data))  
+        except Exception as e:  
+            logger.error("Failed to save context", error=str(e))  
+  
+    # ===================== Hook/工具方法 =====================  
+    async def _safe_call_hook(self, hook: Callable, *args, **kwargs):  
+        try:  
+            if asyncio.iscoroutinefunction(hook):  
+                await hook(*args, **kwargs)  
+            else:  
+                hook(*args, **kwargs)  
+        except Exception as e:  
+            logger.warning("Hook execution failed", hook=getattr(hook, "__name__", str(hook)), error=str(e))  
+```
+
+[12] gecko/core/events.py
+```python
+# gecko/core/events.py  
+"""  
+事件总线（升级版）  
+  
+特性：  
+1. BaseEvent 使用 Pydantic，所有字段默认安全可序列化  
+2. Middleware 可修改事件；返回 None 表示拦截  
+3. 订阅者支持异步/同步函数；错误被捕获并记录  
+4. wait=False 时后台任务异常依然可追踪  
+5. 支持 unsubscribe，便于测试或动态注销  
+"""  
+  
+from __future__ import annotations  
+  
+import asyncio  
+import inspect  
+import time  
+from typing import Any, Awaitable, Callable, Dict, List, Optional  
+  
+from pydantic import BaseModel, Field  
+  
+from gecko.core.logging import get_logger  
+  
+logger = get_logger(__name__)  
+  
+# ===== 事件模型 =====  
+class BaseEvent(BaseModel):  
+    type: str  
+    timestamp: float = Field(default_factory=time.time)  
+    data: Dict[str, Any] = Field(default_factory=dict)  
+    error: Optional[str] = None  
+  
+  
+EventHandler = Callable[[BaseEvent], Awaitable[None]]  
+Middleware = Callable[[BaseEvent], Awaitable[BaseEvent | None]]  
+  
+  
+class EventBus:  
+    def __init__(self):  
+        self._subscribers: Dict[str, List[EventHandler]] = {}  
+        self._middlewares: List[Middleware] = []  
+  
+    # --- 订阅管理 ---  
+    def subscribe(self, event_type: str, handler: EventHandler):  
+        if not callable(handler):  
+            raise TypeError("Event handler 必须是可调用的")  
+        self._subscribers.setdefault(event_type, []).append(handler)  
+        return self  
+  
+    def unsubscribe(self, event_type: str, handler: EventHandler):  
+        handlers = self._subscribers.get(event_type, [])  
+        if handler in handlers:  
+            handlers.remove(handler)  
+        return self  
+  
+    def add_middleware(self, middleware: Middleware):  
+        self._middlewares.append(middleware)  
+        return self  
+  
+    # --- 发布事件 ---  
+    async def publish(self, event: BaseEvent, wait: bool = False):  
+        # 1. 依次执行中间件，可修改事件或拦截  
+        try:  
+            for mw in self._middlewares:  
+                new_event = await mw(event)  
+                if new_event is None:  
+                    logger.debug("Event blocked by middleware", event_type=event.type)  
+                    return  
+                event = new_event  
+        except Exception as e:  
+            logger.error("Middleware error", error=str(e))  
+            return  # 中间件异常直接终止，避免传播不一致事件  
+  
+        # 2. 查找订阅者（支持通配符 "*")  
+        handlers = self._subscribers.get(event.type) or self._subscribers.get("*", [])  
+        if not handlers:  
+            return  
+  
+        tasks = [self._safe_execute(handler, event) for handler in handlers]  
+  
+        if wait:  
+            await asyncio.gather(*tasks, return_exceptions=True)  
+        else:  
+            for coro in tasks:  
+                asyncio.create_task(self._log_task_exception(coro))  
+  
+    async def _safe_execute(self, handler: EventHandler, event: BaseEvent):  
+        try:  
+            if inspect.iscoroutinefunction(handler):  
+                await handler(event)  
+            else:  
+                handler(event)  
+        except Exception as e:  
+            logger.exception("Event handler failed", event_type=event.type, error=str(e))  
+  
+    async def _log_task_exception(self, coro):  
+        try:  
+            await coro  
+        except Exception as e:  
+            logger.exception("Background event handler failed", error=str(e))  
+  
+  
+# ==== 示例：常见事件类型 ====  
+  
+  
+class AgentRunEvent(BaseEvent):  
+    """Agent 运行过程事件"""  
+    pass  
+  
+  
+class WorkflowEvent(BaseEvent):  
+    """Workflow 运行过程事件"""  
+    pass  
+```
+
+[13] gecko/core/exceptions.py
+```python
+# gecko/core/exceptions.py
+"""
+Gecko 异常体系（改进版）
+
+改进：移除装饰器，提倡显式错误处理
+"""
+from __future__ import annotations
+from typing import Optional, Dict, Any
+
+# ========== 异常基类 ==========
+
+class GeckoError(Exception):
+    """
+    Gecko 统一异常基类
+    
+    设计原则：
+    1. 包含结构化上下文
+    2. 便于日志记录
+    3. 支持异常链（from）
+    """
+    def __init__(
+        self,
+        message: str,
+        *args,
+        error_code: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None,
+        **kwargs
+    ):
+        super().__init__(message, *args, **kwargs)
+        self.message = message
+        self.error_code = error_code or self.__class__.__name__
+        self.context = context or {}
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典（便于日志/API 返回）"""
+        return {
+            "error_type": self.__class__.__name__,
+            "error_code": self.error_code,
+            "message": self.message,
+            "context": self.context,
+        }
+    
+    def __str__(self) -> str:
+        if self.context:
+            ctx_str = ", ".join(f"{k}={v}" for k, v in self.context.items())
+            return f"{self.message} [{ctx_str}]"
+        return self.message
+
+# ========== 领域异常 ==========
+
+class AgentError(GeckoError):
+    """Agent 执行异常"""
+    pass
+
+class ModelError(GeckoError):
+    """模型调用异常"""
+    pass
+
+class ToolError(GeckoError):
+    """工具执行异常"""
+    pass
+
+class ToolNotFoundError(ToolError):
+    """工具未找到"""
+    def __init__(self, tool_name: str):
+        super().__init__(
+            f"Tool '{tool_name}' not found in registry",
+            error_code="TOOL_NOT_FOUND",
+            context={"tool_name": tool_name}
+        )
+
+class ToolTimeoutError(ToolError):
+    """工具超时"""
+    def __init__(self, tool_name: str, timeout: float):
+        super().__init__(
+            f"Tool '{tool_name}' timed out after {timeout}s",
+            error_code="TOOL_TIMEOUT",
+            context={"tool_name": tool_name, "timeout": timeout}
+        )
+
+class WorkflowError(GeckoError):
+    """工作流异常"""
+    pass
+
+class WorkflowCycleError(WorkflowError):
+    """工作流循环依赖"""
+    pass
+
+class StorageError(GeckoError):
+    """存储异常"""
+    pass
+
+class ConfigurationError(GeckoError):
+    """配置错误"""
+    pass
+
+class ValidationError(GeckoError):
+    """验证错误"""
+    pass
+```
+
+[14] gecko/core/logging.py
+```python
+# gecko/core/logging.py
+"""
+Gecko 结构化日志系统（改进版）
+
+改进：使用成熟的 structlog 库，代码减少 80%
+"""
+from __future__ import annotations
+import logging
+import sys
+from typing import Any, Optional
+
+try:
+    import structlog
+    STRUCTLOG_AVAILABLE = True
+except ImportError:
+    STRUCTLOG_AVAILABLE = False
+    import warnings
+    warnings.warn(
+        "structlog not installed. Install with: pip install structlog\n"
+        "Falling back to standard logging.",
+        ImportWarning
+    )
+
+from gecko.config import settings
+
+# ========== 日志初始化 ==========
+
+_initialized = False
+
+def setup_logging(
+    level: Optional[str] = None,
+    force: bool = False
+):
+    """
+    初始化日志系统
+    
+    改进：
+    1. 优先使用 structlog（如果可用）
+    2. 降级到标准 logging（如果 structlog 未安装）
+    """
+    global _initialized
+    
+    if _initialized and not force:
+        return
+    
+    level = level or settings.log_level
+    log_level = getattr(logging, level.upper(), logging.INFO)
+    
+    if STRUCTLOG_AVAILABLE:
+        _setup_structlog(log_level)
+    else:
+        _setup_standard_logging(log_level)
+    
+    # 降低第三方库日志级别
+    for lib in ["httpx", "httpcore", "litellm", "openai"]:
+        logging.getLogger(lib).setLevel(logging.WARNING)
+    
+    _initialized = True
+
+def _setup_structlog(level: int):
+    """配置 structlog"""
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.processors.add_log_level,
+            structlog.processors.StackInfoRenderer(),
+            structlog.dev.set_exc_info,
+            structlog.processors.TimeStamper(fmt="iso", utc=True),
+            # 根据配置选择渲染器
+            structlog.processors.JSONRenderer()
+            if settings.log_format == "json"
+            else structlog.dev.ConsoleRenderer(),
+        ],
+        wrapper_class=structlog.make_filtering_bound_logger(level),
+        context_class=dict,
+        logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
+        cache_logger_on_first_use=True,
+    )
+
+def _setup_standard_logging(level: int):
+    """配置标准 logging（降级方案）"""
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        stream=sys.stdout,
+    )
+
+# ========== 获取 Logger ==========
+
+def get_logger(name: str) -> Any:
+    """
+    获取 Logger 实例
+    
+    返回：
+    - structlog.BoundLogger（如果可用）
+    - logging.Logger（降级方案）
+    
+    使用示例:
+        logger = get_logger(__name__)
+        logger.info("event happened", user_id=123, action="login")
+    """
+    if not _initialized:
+        setup_logging()
+    
+    if STRUCTLOG_AVAILABLE:
+        return structlog.get_logger(name)
+    else:
+        return logging.getLogger(name)
+
+# ========== 自动初始化 ==========
+
+setup_logging()
+```
+
+[15] gecko/core/memory.py
+```python
+# gecko/core/memory.py  
+"""  
+Token Memory（优化版）  
+1. 懒加载 tiktoken，减少不必要依赖  
+2. 使用 OrderedDict 实现 LRU 缓存  
+3. 支持多模态消息的 token 估算  
+4. 批量计数时复用同一个 encoder，绕过缓存开销，提升性能  
+"""  
+  
+from __future__ import annotations  
+  
+import hashlib  
+from collections import OrderedDict  
+from typing import Any, Dict, List, Optional  
+  
+from gecko.core.logging import get_logger  
+from gecko.core.message import ContentBlock, Message  
+from gecko.plugins.storage.interfaces import SessionInterface  
+  
+logger = get_logger(__name__)  
+  
+  
+class TokenMemory:  
+    def __init__(  
+        self,  
+        session_id: str,  
+        storage: Optional[SessionInterface] = None,  
+        max_tokens: int = 4000,  
+        model_name: str = "gpt-3.5-turbo",  
+        cache_size: int = 1000,  
+    ):  
+        self.session_id = session_id  
+        self.storage = storage  
+        self.max_tokens = max_tokens  
+        self.model_name = model_name  
+        self.cache_size = cache_size  
+  
+        self._encoding = None  
+        self._token_cache: OrderedDict[str, int] = OrderedDict()  
+        self._cache_hits = 0  
+        self._cache_misses = 0  
+  
+    # ---------- Tokenizer ----------  
+    @property  
+    def tokenizer(self):  
+        if self._encoding is None:  
+            try:  
+                import tiktoken  
+                self._encoding = tiktoken.encoding_for_model(self.model_name)  
+            except Exception:  
+                import tiktoken  
+                logger.warning("Unknown model for tiktoken, fallback to cl100k_base")  
+                self._encoding = tiktoken.get_encoding("cl100k_base")  
+        return self._encoding  
+  
+    # ---------- 单条计数（带缓存） ----------  
+    def count_message_tokens(self, message: Message) -> int:  
+        cache_key = self._make_cache_key(message)  
+        if cache_key in self._token_cache:  
+            self._cache_hits += 1  
+            self._token_cache.move_to_end(cache_key)  
+            return self._token_cache[cache_key]  
+  
+        self._cache_misses += 1  
+        token_count = self._count_tokens_impl(message)  
+        self._cache_token_count(cache_key, token_count)  
+        return token_count  
+  
+    def _make_cache_key(self, message: Message) -> str:  
+        if isinstance(message.content, list):  
+            key = "".join(block.text or "[image]" for block in message.content)  
+        else:  
+            key = str(message.content)  
+  
+        raw = f"{message.role}:{key}"  
+        if message.tool_calls:  
+            import json  
+            raw += json.dumps(message.tool_calls, sort_keys=True)  
+        return hashlib.md5(raw.encode()).hexdigest()  
+  
+    def _cache_token_count(self, key: str, count: int):  
+        self._token_cache[key] = count  
+        self._token_cache.move_to_end(key)  
+        if len(self._token_cache) > self.cache_size:  
+            self._token_cache.popitem(last=False)  
+  
+    # ---------- 批量计数 ----------  
+    def count_messages_batch(self, messages: List[Message]) -> List[int]:  
+        """  
+        批量计算 Token 数：  
+        - 共享同一个 encoder  
+        - 跳过缓存和哈希操作（比逐条更快）  
+        """  
+        encode = self.tokenizer.encode  
+        return [self._count_tokens_impl(msg, encode=encode) for msg in messages]  
+  
+    def _count_tokens_impl(self, message: Message, encode=None) -> int:  
+        encode = encode or self.tokenizer.encode  
+        content_tokens = 0  
+  
+        if isinstance(message.content, str):  
+            content_tokens = len(encode(message.content))  
+        elif isinstance(message.content, list):  
+            buffer = []  
+            for block in message.content:  
+                if block.type == "text" and block.text:  
+                    buffer.append(block.text)  
+                elif block.type == "image_url":  
+                    buffer.append("[image]")  
+            content_tokens = len(encode(" ".join(buffer)))  
+  
+        overhead = 4  
+        if message.tool_calls:  
+            import json  
+            overhead += len(encode(json.dumps(message.tool_calls)))  
+  
+        return content_tokens + overhead  
+  
+    # ---------- 历史加载 ----------  
+    async def get_history(self, raw_messages: List[dict]) -> List[Message]:  
+        messages: List[Message] = []  
+        for entry in raw_messages:  
+            try:  
+                msg = Message(**entry)  
+            except Exception as e:  
+                logger.warning("Invalid history message, skip", error=str(e))  
+                continue  
+  
+            # 限制单条消息长度，防止极端情况  
+            if isinstance(msg.content, str) and len(msg.content) > 2000:  
+                msg.content = msg.content[:2000]  
+            messages.append(msg)  
+  
+        if not messages:  
+            return []  
+  
+        system_msg = None  
+        if messages[0].role == "system":  
+            system_msg = messages.pop(0)  
+  
+        selected: List[Message] = []  
+        current_tokens = self.count_message_tokens(system_msg) if system_msg else 0  
+  
+        for msg in reversed(messages):  
+            token = self.count_message_tokens(msg)  
+            if current_tokens + token > self.max_tokens:  
+                break  
+            selected.insert(0, msg)  
+            current_tokens += token  
+  
+        if system_msg:  
+            selected.insert(0, system_msg)  
+  
+        logger.debug("History loaded", total_messages=len(messages), selected=len(selected))  
+        return selected  
+  
+    # ---------- 缓存管理 ----------  
+    def clear_cache(self):  
+        self._token_cache.clear()  
+        self._cache_hits = 0  
+        self._cache_misses = 0  
+  
+    def get_cache_stats(self) -> Dict[str, Any]:  
+        total = self._cache_hits + self._cache_misses  
+        return {  
+            "cache_size": len(self._token_cache),  
+            "hits": self._cache_hits,  
+            "misses": self._cache_misses,  
+            "hit_rate": self._cache_hits / total if total else 0,  
+        }  
+```
+
+[16] gecko/core/message.py
+```python
+# gecko/core/message.py  
+"""  
+消息模型（增强版）  
+  
+改进：  
+1. MediaResource.from_file 支持文件大小限制与 MIME 自动推断  
+2. Message.tool_result 允许 content 为 dict/list，会在序列化时自动转换  
+3. 增加 from_openai classmethod，便于解析模型返回  
+4. ContentBlock 在初始化阶段校验 image_url 是否存在  
+"""  
+  
+from __future__ import annotations  
+  
+import base64  
+import mimetypes  
+from pathlib import Path  
+from typing import Any, Dict, List, Literal, Optional, Union  
+  
+from pydantic import BaseModel, Field, field_serializer, model_validator  
+  
+Role = Literal["system", "user", "assistant", "tool"]  
+  
+  
+class MediaResource(BaseModel):  
+    url: Optional[str] = None  
+    base64_data: Optional[str] = None  
+    mime_type: Optional[str] = None  
+    detail: Literal["auto", "low", "high"] = "auto"  
+  
+    @model_validator(mode="after")  
+    def validate_source(self):  
+        if not self.url and not self.base64_data:  
+            raise ValueError("必须提供 url 或 base64_data")  
+        return self  
+  
+    @classmethod  
+    def from_file(cls, path: str, mime_type: Optional[str] = None, max_size_mb: int = 5) -> MediaResource:  
+        p = Path(path)  
+        if not p.exists():  
+            raise FileNotFoundError(f"File not found: {path}")  
+        if p.stat().st_size > max_size_mb * 1024 * 1024:  
+            raise ValueError(f"文件过大，超过 {max_size_mb} MB")  
+  
+        with open(p, "rb") as f:  
+            encoded = base64.b64encode(f.read()).decode("utf-8")  
+  
+        mime = mime_type or mimetypes.guess_type(p.name)[0] or "application/octet-stream"  
+        return cls(base64_data=encoded, mime_type=mime)  
+  
+    def to_openai_image_url(self) -> Dict[str, Any]:  
+        url_value = self.url or f"data:{self.mime_type or 'image/jpeg'};base64,{self.base64_data}"  
+        return {"url": url_value, "detail": self.detail}  
+  
+  
+class ContentBlock(BaseModel):  
+    type: Literal["text", "image_url"]  
+    text: Optional[str] = None  
+    image_url: Optional[MediaResource] = None  
+  
+    @model_validator(mode="after")  
+    def ensure_valid(self):  
+        if self.type == "text" and not self.text:  
+            raise ValueError("文本块缺少 text")  
+        if self.type == "image_url" and not self.image_url:  
+            raise ValueError("图片块缺少 image_url")  
+        return self  
+  
+    def to_openai_format(self) -> Dict[str, Any]:  
+        if self.type == "text":  
+            return {"type": "text", "text": self.text}  
+        return {"type": "image_url", "image_url": self.image_url.to_openai_image_url()}  
+  
+  
+class Message(BaseModel):  
+    role: Role  
+    content: Union[str, List[ContentBlock]] = Field(default="")  
+    name: Optional[str] = None  
+    tool_calls: Optional[List[Dict[str, Any]]] = None  
+    tool_call_id: Optional[str] = None  
+  
+    @field_serializer("content")  
+    def serialize_content(self, content: Union[str, List[ContentBlock]], _info):  
+        if isinstance(content, str):  
+            return content  
+        return [block.to_openai_format() for block in content]  
+  
+    @classmethod  
+    def user(cls, text: str = "", images: Optional[List[str]] = None) -> Message:  
+        if not images:  
+            return cls(role="user", content=text)  
+  
+        blocks: List[ContentBlock] = []  
+        if text:  
+            blocks.append(ContentBlock(type="text", text=text))  
+  
+        for img in images:  
+            if img.startswith(("http://", "https://", "data:")):  
+                resource = MediaResource(url=img)  
+            else:  
+                resource = MediaResource.from_file(img)  
+            blocks.append(ContentBlock(type="image_url", image_url=resource))  
+  
+        return cls(role="user", content=blocks)  
+  
+    @classmethod  
+    def assistant(cls, content: str) -> Message:  
+        return cls(role="assistant", content=content)  
+  
+    @classmethod  
+    def system(cls, content: str) -> Message:  
+        return cls(role="system", content=content)  
+  
+    @classmethod  
+    def tool_result(cls, tool_call_id: str, content: Any, tool_name: str) -> Message:  
+        if isinstance(content, (dict, list)):  
+            import json  
+            serialized = json.dumps(content, ensure_ascii=False)  
+        else:  
+            serialized = str(content)  
+        return cls(role="tool", content=serialized, tool_call_id=tool_call_id, name=tool_name)  
+  
+    @classmethod  
+    def from_openai(cls, payload: Dict[str, Any]) -> Message:  
+        return cls(**payload)  
+  
+    def to_openai_format(self) -> Dict[str, Any]:  
+        return self.model_dump(exclude_none=True, mode="json")  
+```
+
+[17] gecko/core/output.py
+```python
+# gecko/core/output.py  
+from __future__ import annotations  
+  
+from typing import Any, Dict, List, Optional  
+  
+from pydantic import BaseModel, Field, field_validator  
+  
+  
+class AgentOutput(BaseModel):  
+    """  
+    Agent 执行结果对象  
+    - content: 最终文本回复  
+    - tool_calls: 工具调用列表，默认为空列表（兼容 LLM 返回 None 的场景）  
+    - usage: 可选的 token 消耗等统计  
+    - raw: 底层模型的原始返回对象  
+    """  
+    content: str = ""  
+    tool_calls: List[Dict[str, Any]] = Field(default_factory=list)  
+    usage: Optional[Dict[str, Any]] = None  
+    raw: Any = None  
+  
+    model_config = {"arbitrary_types_allowed": True}  
+  
+    @field_validator("tool_calls", mode="before")  
+    @classmethod  
+    def ensure_tool_calls(cls, value):  
+        return value or []  
+```
+
+[18] gecko/core/prompt.py
+```python
+# gecko/core/prompt.py  
+"""  
+PromptTemplate（增强版）  
+  
+- 支持 input_variables 校验，缺失变量时抛出明确异常  
+- 在渲染失败时提供模板片段和错误类型，便于定位  
+- 延迟导入 Jinja2 以减轻依赖  
+"""  
+  
+from __future__ import annotations  
+  
+from typing import Any, Dict, List, Optional  
+  
+from pydantic import BaseModel  
+  
+  
+class PromptTemplate(BaseModel):  
+    template: str  
+    input_variables: List[str] = []  
+  
+    def format(self, **kwargs: Any) -> str:  
+        missing = [var for var in self.input_variables if var not in kwargs]  
+        if missing:  
+            raise ValueError(f"缺少模板变量: {', '.join(missing)}")  
+  
+        try:  
+            from jinja2 import Template  
+        except ImportError as e:  
+            raise ImportError("PromptTemplate 依赖 jinja2，请先安装：pip install jinja2") from e  
+  
+        try:  
+            tmpl = Template(self.template)  
+            return tmpl.render(**kwargs)  
+        except Exception as e:  
+            snippet = self.template[:80].replace("\n", "\\n")  
+            raise ValueError(f"Prompt 渲染失败: {e} | 模板片段: {snippet}") from e  
+  
+  
+DEFAULT_REACT_PROMPT = PromptTemplate(  
+    template="""You are a helpful AI assistant.  
+Current time: {{ current_time }}  
+  
+{% if tools %}  
+You have access to the following tools:  
+{% for tool in tools %}  
+- {{ tool.name }}: {{ tool.description }}  
+{% endfor %}  
+{% endif %}  
+  
+Answer the user's question using the tools if necessary.  
+""",  
+    input_variables=["current_time", "tools"],  
+)  
+```
+
+[19] gecko/core/protocols.py
+```python
+# gecko/core/protocols.py  
+"""  
+模型协议定义（扩展版）  
+  
+- 基础模型需实现 acompletion  
+- 如支持流式输出，还应实现 astream  
+"""  
+  
+from __future__ import annotations  
+  
+from typing import Any, AsyncIterator, Dict, List, Protocol, runtime_checkable  
+  
+  
+@runtime_checkable  
+class ModelProtocol(Protocol):  
+    async def acompletion(self, messages: List[Dict[str, Any]], **kwargs) -> Any:  
+        ...  
+  
+    async def astream(self, messages: List[Dict[str, Any]], **kwargs) -> AsyncIterator[Any]:  
+        """  
+        可选：支持流式输出的模型应实现此方法  
+        """  
+        ...  
+```
+
+[20] gecko/core/session.py
+```python
+# gecko/core/session.py
+from typing import Dict, Any
+
+class Session:
+    def __init__(self, session_id: str | None = None, state: Dict[str, Any] | None = None):
+        self.session_id = session_id or "default"
+        self.state = state or {}
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.state.get(key, default)
+
+    def set(self, key: str, value: Any):
+        self.state[key] = value
+```
+
+[21] gecko/core/structure.py
+```python
+# gecko/core/structure.py  
+"""  
+结构化输出引擎（优化版）  
+  
+改进：  
+1. `StructureParseError` 继承自 ValueError，与旧逻辑兼容  
+2. Tool Call 解析失败有 debug 记录，便于排查  
+3. Markdown / 暴力截取策略更健壮  
+4. 失败时返回固定前缀 "No valid JSON found..."，测试与调用方可直接匹配  
+"""  
+  
+from __future__ import annotations  
+  
+import json  
+import re  
+from typing import Any, Dict, List, Optional, Type, TypeVar  
+  
+from pydantic import BaseModel, ValidationError  
+  
+from gecko.core.logging import get_logger  
+  
+logger = get_logger(__name__)  
+  
+T = TypeVar("T", bound=BaseModel)  
+  
+  
+class StructureParseError(ValueError):  
+    """结构化解析失败异常（兼容 ValueError 捕获逻辑）"""  
+    pass  
+  
+  
+class StructureEngine:  
+    """  
+    结构化输出引擎  
+    - 优先从 Tool Call 提取结构化数据  
+    - 否则尝试 JSON / Markdown JSON / 暴力截取  
+    """  
+  
+    @staticmethod  
+    def to_openai_tool(model: Type[BaseModel]) -> Dict[str, Any]:  
+        """将 Pydantic 模型转换为 OpenAI Function Calling 所需的 schema"""  
+        schema = model.model_json_schema()  
+        name = re.sub(r"\W+", "_", schema.get("title", "extract_data")).lower()  
+        return {  
+            "type": "function",  
+            "function": {  
+                "name": name,  
+                "description": schema.get("description", "Extract structured data"),  
+                "parameters": schema,  
+            },  
+        }  
+  
+    @classmethod  
+    async def parse(  
+        cls,  
+        content: str,  
+        model_class: Type[T],  
+        raw_tool_calls: Optional[List[Dict[str, Any]]] = None,  
+    ) -> T:  
+        errors: List[str] = []  
+  
+        # 1. Tool Call 优先  
+        if raw_tool_calls:  
+            for call in raw_tool_calls:  
+                func = call.get("function", {})  
+                try:  
+                    args = func.get("arguments", "")  
+                    data = json.loads(args) if isinstance(args, str) else args  
+                    return model_class(**data)  
+                except (json.JSONDecodeError, ValidationError) as e:  
+                    tool_name = func.get("name", "unknown")  
+                    msg = f"Tool call '{tool_name}' parse failed: {e}"  
+                    errors.append(msg)  
+                    logger.debug(msg)  
+  
+        # 2. 尝试从文本提取 JSON  
+        try:  
+            return cls._extract_json(content, model_class)  
+        except ValueError as e:  
+            errors.append(str(e))  
+            raise StructureParseError("No valid JSON found. Details: " + "; ".join(errors)) from e  
+  
+    @staticmethod  
+    def _extract_json(text: str, model_class: Type[T]) -> T:  
+        text = text.strip()  
+        errors = []  
+  
+        # 策略 A：直接 JSON  
+        try:  
+            return model_class(**json.loads(text))  
+        except Exception as e:  
+            errors.append(f"Raw JSON failed: {e}")  
+  
+        # 策略 B：Markdown 代码块  
+        pattern = r"```(?:json)?\s*([\s\S]*?)```"  
+        for match in re.finditer(pattern, text):  
+            candidate = match.group(1).strip()  
+            try:  
+                return model_class(**json.loads(candidate))  
+            except Exception as e:  
+                errors.append(f"Markdown JSON failed: {e}")  
+  
+        # 策略 C：括号匹配暴力截取  
+        for candidate in StructureEngine._extract_braced_json(text):  
+            try:  
+                return model_class(**json.loads(candidate))  
+            except Exception as e:  
+                errors.append(f"Brute force JSON failed: {e}")  
+                break  
+  
+        raise ValueError("; ".join(errors))  
+  
+    @staticmethod  
+    def _extract_braced_json(text: str) -> List[str]:  
+        """  
+        使用栈找出第一个 { ... }（支持嵌套）  
+        """  
+        stack = []  
+        start = None  
+        candidates = []  
+  
+        for idx, ch in enumerate(text):  
+            if ch == "{":  
+                if not stack:  
+                    start = idx  
+                stack.append(ch)  
+            elif ch == "}" and stack:  
+                stack.pop()  
+                if not stack and start is not None:  
+                    candidates.append(text[start : idx + 1])  
+                    break  
+  
+        return candidates  
+```
+
+[22] gecko/core/toolbox.py
+```python
+# gecko/core/toolbox.py  
+"""  
+ToolBox（优化版）  
+  
+改进点：  
+1. 使用 anyio.Semaphore + create_task_group 控制并发，结果顺序与输入一致  
+2. 使用 anyio.fail_after 实现工具级超时，直接捕获内置 TimeoutError，兼容所有 anyio 版本  
+3. 工具执行日志更详细，统计信息完善  
+4. 工具返回值统一转换为字符串，调用方无需关心类型  
+"""  
+  
+from __future__ import annotations  
+  
+import time  
+from typing import Any, Callable, Dict, List, Optional  
+  
+from anyio import create_task_group, fail_after, Semaphore  
+  
+from gecko.config import settings  
+from gecko.core.exceptions import ToolError, ToolNotFoundError, ToolTimeoutError  
+from gecko.core.logging import get_logger  
+from gecko.plugins.tools.base import BaseTool  
+  
+logger = get_logger(__name__)  
+  
+  
+class ToolBox:  
+    """  
+    Agent 工具箱  
+    负责注册工具、执行单个或多个工具调用，并在内部维护并发/超时/统计逻辑  
+    """  
+  
+    def __init__(  
+        self,  
+        tools: Optional[List[BaseTool]] = None,  
+        max_concurrent: int = 5,  
+        default_timeout: float | None = None,  
+    ):  
+        self._tools: Dict[str, BaseTool] = {}  
+        self.max_concurrent = max_concurrent  
+        self.default_timeout = default_timeout or settings.tool_execution_timeout  
+  
+        # 统计数据  
+        self._execution_count: Dict[str, int] = {}  
+        self._error_count: Dict[str, int] = {}  
+        self._total_time: Dict[str, float] = {}  
+  
+        if tools:  
+            for tool in tools:  
+                self.register(tool)  
+  
+    # ====================== 工具管理 ======================  
+    def register(self, tool: BaseTool, replace: bool = True):  
+        if tool.name in self._tools and not replace:  
+            raise ValueError(f"工具 '{tool.name}' 已注册，如需覆盖请设置 replace=True")  
+        if tool.name in self._tools:  
+            logger.warning("Tool already registered, will be replaced", tool=tool.name)  
+  
+        self._tools[tool.name] = tool  
+        self._execution_count[tool.name] = 0  
+        self._error_count[tool.name] = 0  
+        self._total_time[tool.name] = 0.0  
+        logger.debug("Tool registered", tool=tool.name)  
+  
+    def unregister(self, tool_name: str):  
+        if tool_name in self._tools:  
+            del self._tools[tool_name]  
+            logger.debug("Tool unregistered", tool=tool_name)  
+  
+    def get(self, name: str) -> Optional[BaseTool]:  
+        return self._tools.get(name)  
+  
+    def list_tools(self) -> List[BaseTool]:  
+        return list(self._tools.values())  
+  
+    def has_tool(self, name: str) -> bool:  
+        return name in self._tools  
+  
+    # ====================== OpenAI Schema ======================  
+    def to_openai_schema(self) -> List[Dict[str, Any]]:  
+        """  
+        生成 OpenAI Function Calling 所需的 schema  
+        """  
+        schemas = []  
+        for tool in self._tools.values():  
+            schemas.append({  
+                "type": "function",  
+                "function": {  
+                    "name": tool.name,  
+                    "description": tool.description,  
+                    "parameters": tool.parameters,  
+                }  
+            })  
+        return schemas  
+  
+    # ====================== 单个工具执行 ======================  
+    async def execute(  
+        self,  
+        name: str,  
+        arguments: Dict[str, Any],  
+        timeout: Optional[float] = None  
+    ) -> str:  
+        """  
+        以异步方式执行单个工具，具备超时与异常处理  
+        """  
+        tool = self.get(name)  
+        if not tool:  
+            raise ToolNotFoundError(name)  
+  
+        actual_timeout = timeout or self.default_timeout  
+        start_time = time.time()  
+        logger.debug("Executing tool", tool=name, timeout=actual_timeout)  
+  
+        try:  
+            with fail_after(actual_timeout):  
+                result = await tool.execute(arguments)  
+        except TimeoutError:  
+            self._error_count[name] += 1  
+            logger.error("Tool execution timeout", tool=name, timeout=actual_timeout)  
+            raise ToolTimeoutError(name, actual_timeout)  
+        except Exception as e:  
+            self._error_count[name] += 1  
+            logger.exception("Tool execution failed", tool=name)  
+            raise ToolError(  
+                f"Tool '{name}' execution failed: {e}",  
+                context={"tool": name, "arguments": arguments}  
+            ) from e  
+        else:  
+            duration = time.time() - start_time  
+            self._execution_count[name] += 1  
+            self._total_time[name] += duration  
+            logger.info("Tool executed successfully", tool=name, duration=f"{duration:.3f}s")  
+  
+            return result if isinstance(result, str) else str(result)  
+  
+    # ====================== 并发执行 ======================  
+    async def execute_many(  
+        self,  
+        tool_calls: List[Dict[str, Any]],  
+        timeout: Optional[float] = None  
+    ) -> List[Dict[str, Any]]:  
+        """  
+        并发执行多个工具，并保持结果顺序与输入一致  
+        """  
+        if not tool_calls:  
+            return []  
+  
+        logger.info("Executing tools concurrently", count=len(tool_calls), max_concurrent=self.max_concurrent)  
+  
+        results: List[Dict[str, Any]] = [None] * len(tool_calls)  
+        semaphore = Semaphore(self.max_concurrent)  
+  
+        async def _run_one(idx: int, call: Dict[str, Any]):  
+            tool_name = call.get("name")  
+            arguments = call.get("arguments", {})  
+            call_id = call.get("id", "")  
+  
+            try:  
+                output = await self.execute(tool_name, arguments, timeout)  
+                results[idx] = {  
+                    "id": call_id,  
+                    "name": tool_name,  
+                    "result": output,  
+                    "is_error": False,  
+                }  
+            except Exception as e:  
+                results[idx] = {  
+                    "id": call_id,  
+                    "name": tool_name,  
+                    "result": str(e),  
+                    "is_error": True,  
+                }  
+  
+        async with create_task_group() as tg:  
+            for idx, call in enumerate(tool_calls):  
+                await semaphore.acquire()  
+                tg.start_soon(self._execute_with_sem, semaphore, _run_one, idx, call)  
+  
+        logger.info("All tools executed", total=len(tool_calls))  
+        return results  
+  
+    async def _execute_with_sem(self, sem: Semaphore, fn: Callable, *args):  
+        """  
+        辅助方法：在信号量控制下执行函数，确保并发限制生效  
+        """  
+        try:  
+            await fn(*args)  
+        finally:  
+            sem.release()  
+  
+    # ====================== 统计信息 ======================  
+    def get_stats(self) -> Dict[str, Any]:  
+        stats = {}  
+        for name in self._tools:  
+            exec_count = self._execution_count.get(name, 0)  
+            error_count = self._error_count.get(name, 0)  
+            total_time = self._total_time.get(name, 0.0)  
+  
+            stats[name] = {  
+                "executions": exec_count,  
+                "errors": error_count,  
+                "total_time": total_time,  
+                "avg_time": total_time / exec_count if exec_count else 0.0,  
+                "success_rate": (exec_count - error_count) / exec_count if exec_count else 1.0,  
+            }  
+        return stats  
+  
+    def print_stats(self):  
+        stats = self.get_stats()  
+        print("\n=== ToolBox Statistics ===")  
+        for tool_name, data in stats.items():  
+            print(f"\n{tool_name}:")  
+            print(f"  Executions: {data['executions']}")  
+            print(f"  Errors: {data['errors']}")  
+            print(f"  Success Rate: {data['success_rate']:.1%}")  
+            print(f"  Avg Time: {data['avg_time']:.3f}s")  
+            print(f"  Total Time: {data['total_time']:.3f}s")  
+  
+    def reset_stats(self):  
+        for name in self._tools:  
+            self._execution_count[name] = 0  
+            self._error_count[name] = 0  
+            self._total_time[name] = 0.0  
+```
+
+[23] gecko/core/utils.py
+```python
+# gecko/core/utils.py  
+"""  
+通用工具函数  
+  
+- ensure_awaitable：统一处理同步/异步调用  
+"""  
+  
+from __future__ import annotations  
+  
+import asyncio  
+from typing import Any, Awaitable, Callable, TypeVar  
+  
+T = TypeVar("T")  
+  
+  
+async def ensure_awaitable(func: Callable[..., T | Awaitable[T]], *args, **kwargs) -> T:  
+    if asyncio.iscoroutinefunction(func):  
+        return await func(*args, **kwargs)  
+  
+    result = func(*args, **kwargs)  
+    if asyncio.iscoroutine(result):  
+        return await result  
+    return result  
+```
+
+[24] gecko/plugins/__init__.py
+```python
+```
+
+[25] gecko/plugins/base.py
+```python
+# gecko/plugins/base.py  
+  
+"""  
+占位：未来可在此定义所有插件的抽象基类或通用接口。  
+目前实际内容请参考各子目录（tools/ storage/ knowledge 等）。  
+"""  
+```
+
+[26] gecko/plugins/guardrails/__init__.py
+```python
+```
+
+[27] gecko/plugins/guardrails/pii.py
+```python
+```
+
+[28] gecko/plugins/knowledge/__init__.py
+```python
+# gecko/plugins/knowledge/__init__.py
+from gecko.plugins.knowledge.document import Document
+from gecko.plugins.knowledge.interfaces import EmbedderProtocol
+from gecko.plugins.knowledge.embedders import OpenAIEmbedder, OllamaEmbedder
+from gecko.plugins.knowledge.splitters import RecursiveCharacterTextSplitter
+from gecko.plugins.knowledge.pipeline import IngestionPipeline
+from gecko.plugins.knowledge.tool import RetrievalTool
+
+__all__ = [
+    "Document", 
+    "EmbedderProtocol", 
+    "OpenAIEmbedder", 
+    "OllamaEmbedder",
+    "RecursiveCharacterTextSplitter",
+    "IngestionPipeline",
+    "RetrievalTool"
+]
+```
+
+[29] gecko/plugins/knowledge/base.py
+```python
+```
+
+[30] gecko/plugins/knowledge/default.py
+```python
+```
+
+[31] gecko/plugins/knowledge/document.py
+```python
+# gecko/plugins/knowledge/document.py
+from __future__ import annotations
+from uuid import uuid4
+from typing import Dict, Any, Optional, List
+from pydantic import BaseModel, Field
+
+class Document(BaseModel):
+    """
+    Gecko 标准文档对象
+    在 Pipeline 中流转的核心数据结构
+    """
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    text: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    embedding: Optional[List[float]] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为存储层所需的字典格式"""
+        return {
+            "id": self.id,
+            "text": self.text,
+            "metadata": self.metadata,
+            "embedding": self.embedding
+        }
+```
+
+[32] gecko/plugins/knowledge/embedders.py
+```python
+# gecko/plugins/knowledge/embedders.py
+from __future__ import annotations
+import os
+from typing import List
+import litellm
+from gecko.plugins.knowledge.interfaces import EmbedderProtocol
+
+class OpenAIEmbedder(EmbedderProtocol):
+    """
+    基于 LiteLLM 的通用 Embedder
+    支持 OpenAI, Azure, Ollama 等所有 LiteLLM 支持的 embedding 模型
+    """
+    def __init__(self, model: str = "text-embedding-3-small", dimension: int = 1536, **kwargs):
+        self.model = model
+        self._dimension = dimension
+        self.kwargs = kwargs
+
+    @property
+    def dimension(self) -> int:
+        return self._dimension
+
+    async def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        # 替换换行符以提升某些模型的表现
+        texts = [t.replace("\n", " ") for t in texts]
+        response = await litellm.aembedding(
+            model=self.model,
+            input=texts,
+            **self.kwargs
+        )
+        return [r["embedding"] for r in response.data]
+
+    async def embed_query(self, text: str) -> List[float]:
+        text = text.replace("\n", " ")
+        response = await litellm.aembedding(
+            model=self.model,
+            input=[text],
+            **self.kwargs
+        )
+        return response.data[0]["embedding"]
+
+# 预设 Ollama 配置
+class OllamaEmbedder(OpenAIEmbedder):
+    """
+    Ollama 本地嵌入模型适配器
+    """
+    def __init__(self, model: str = "ollama/nomic-embed-text", base_url: str = "http://localhost:11434", dimension: int = 768):
+        super().__init__(
+            model=model, 
+            dimension=dimension, 
+            api_base=base_url
+        )
+```
+
+[33] gecko/plugins/knowledge/interfaces.py
+```python
+# gecko/plugins/knowledge/interfaces.py
+from __future__ import annotations
+from typing import List, Protocol, runtime_checkable
+
+@runtime_checkable
+class EmbedderProtocol(Protocol):
+    """
+    嵌入模型协议
+    负责将文本转换为向量
+    """
+    @property
+    def dimension(self) -> int:
+        """返回向量维度 (例如 1536)"""
+        ...
+
+    async def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """批量嵌入文档列表"""
+        ...
+
+    async def embed_query(self, text: str) -> List[float]:
+        """嵌入单个查询语句"""
+        ...
+
+@runtime_checkable
+class ReaderProtocol(Protocol):
+    """
+    文件读取协议
+    """
+    def load(self, file_path: str) -> str:
+        """读取文件内容为字符串"""
+        ...
+```
+
+[34] gecko/plugins/knowledge/pipeline.py
+```python
+# gecko/plugins/knowledge/pipeline.py
+from typing import List, Optional
+from gecko.plugins.knowledge.interfaces import EmbedderProtocol
+from gecko.plugins.storage.interfaces import VectorInterface
+from gecko.plugins.knowledge.splitters import RecursiveCharacterTextSplitter
+from gecko.plugins.knowledge.readers import AutoReader
+from gecko.core.utils import ensure_awaitable
+
+class IngestionPipeline:
+    """
+    RAG 数据入库流水线
+    Load -> Split -> Embed -> Store
+    """
+    def __init__(
+        self,
+        vector_store: VectorInterface,
+        embedder: EmbedderProtocol,
+        splitter = None
+    ):
+        self.vector_store = vector_store
+        self.embedder = embedder
+        self.splitter = splitter or RecursiveCharacterTextSplitter()
+
+    async def run(self, file_paths: List[str], batch_size: int = 100):
+        """
+        执行入库流程
+        :param file_paths: 文件路径列表
+        :param batch_size: 向量库写入批次大小
+        """
+        print(f"🚀 开始处理 {len(file_paths)} 个文件...")
+        
+        # 1. Load
+        raw_docs = []
+        for path in file_paths:
+            try:
+                docs = AutoReader.read(path)
+                raw_docs.extend(docs)
+            except Exception as e:
+                print(f"⚠️ 读取失败 {path}: {e}")
+
+        # 2. Split
+        chunks = self.splitter.split_documents(raw_docs)
+        print(f"✂️ 切分为 {len(chunks)} 个片段")
+
+        # 3. Embed & Store (Batch Processing)
+        for i in range(0, len(chunks), batch_size):
+            batch = chunks[i : i + batch_size]
+            texts = [doc.text for doc in batch]
+            
+            # 生成向量
+            embeddings = await ensure_awaitable(self.embedder.embed_documents, texts)
+            
+            # 注入向量到文档对象
+            docs_to_upsert = []
+            for doc, emb in zip(batch, embeddings):
+                doc.embedding = emb
+                docs_to_upsert.append(doc.to_dict())
+            
+            # 写入数据库
+            await self.vector_store.upsert(docs_to_upsert)
+            print(f"💾 已存储批次 {i} - {i+len(batch)}")
+            
+        print("✅ 入库完成")
+```
+
+[35] gecko/plugins/knowledge/readers.py
+```python
+# gecko/plugins/knowledge/readers.py
+import os
+from pathlib import Path
+from typing import List
+from gecko.plugins.knowledge.document import Document
+from gecko.plugins.knowledge.interfaces import ReaderProtocol
+
+class TextReader(ReaderProtocol):
+    """简单文本读取器 (.txt, .md, .py, etc)"""
+    def load(self, file_path: str) -> str:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return f.read()
+
+class PDFReader(ReaderProtocol):
+    """PDF 读取器 (依赖 pypdf)"""
+    def load(self, file_path: str) -> str:
+        try:
+            import pypdf
+        except ImportError:
+            raise ImportError("请安装 pypdf 以支持 PDF 读取: pip install pypdf")
+            
+        text = ""
+        with open(file_path, "rb") as f:
+            reader = pypdf.PdfReader(f)
+            for page in reader.pages:
+                text += page.extract_text() + "\n"
+        return text
+
+class AutoReader:
+    """自动分发读取器"""
+    _READERS = {
+        ".txt": TextReader,
+        ".md": TextReader,
+        ".py": TextReader,
+        ".json": TextReader,
+        ".pdf": PDFReader
+    }
+
+    @classmethod
+    def read(cls, file_path: str) -> List[Document]:
+        path = Path(file_path)
+        ext = path.suffix.lower()
+        
+        reader_cls = cls._READERS.get(ext)
+        if not reader_cls:
+            raise ValueError(f"不支持的文件类型: {ext}")
+        
+        content = reader_cls().load(str(path))
+        return [Document(text=content, metadata={"source": str(path), "filename": path.name})]
+```
+
+[36] gecko/plugins/knowledge/splitters.py
+```python
+# gecko/plugins/knowledge/splitters.py
+from typing import List
+from gecko.plugins.knowledge.document import Document
+
+class RecursiveCharacterTextSplitter:
+    """
+    递归字符切分器 (参考 LangChain 逻辑)
+    尝试按顺序使用分隔符切分文本，直到块大小符合要求。
+    """
+    def __init__(
+        self, 
+        chunk_size: int = 1000, 
+        chunk_overlap: int = 200,
+        separators: List[str] | None = None
+    ):
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.separators = separators or ["\n\n", "\n", " ", ""]
+
+    def split_documents(self, documents: List[Document]) -> List[Document]:
+        """切分文档列表"""
+        final_docs = []
+        for doc in documents:
+            chunks = self.split_text(doc.text)
+            for i, chunk in enumerate(chunks):
+                # 继承元数据，并增加切片信息
+                new_meta = doc.metadata.copy()
+                new_meta.update({"chunk_index": i, "source_id": doc.id})
+                final_docs.append(Document(text=chunk, metadata=new_meta))
+        return final_docs
+
+    def split_text(self, text: str) -> List[str]:
+        """切分单文本核心逻辑"""
+        final_chunks = []
+        if self._length(text) <= self.chunk_size:
+            return [text]
+            
+        # 找到最优分隔符
+        separator = self.separators[-1]
+        for sep in self.separators:
+            if sep == "":
+                separator = ""
+                break
+            if sep in text:
+                separator = sep
+                break
+                
+        # 切分
+        splits = text.split(separator) if separator else list(text)
+        
+        # 合并碎片
+        good_splits = []
+        current_chunk = ""
+        
+        for s in splits:
+            if self._length(current_chunk) + self._length(s) < self.chunk_size:
+                current_chunk += (separator if current_chunk else "") + s
+            else:
+                if current_chunk:
+                    good_splits.append(current_chunk)
+                current_chunk = s
+        
+        if current_chunk:
+            good_splits.append(current_chunk)
+            
+        return good_splits
+
+    def _length(self, text: str) -> int:
+        return len(text)
+```
+
+[37] gecko/plugins/knowledge/tool.py
+```python
+# gecko/plugins/knowledge/tool.py
+from typing import Type
+from pydantic import BaseModel, Field
+from gecko.plugins.tools.base import BaseTool
+from gecko.plugins.storage.interfaces import VectorInterface
+from gecko.plugins.knowledge.interfaces import EmbedderProtocol
+from gecko.core.utils import ensure_awaitable
+
+class RetrievalTool(BaseTool):
+    name: str = "knowledge_search"
+    description: str = "搜索内部知识库以获取相关信息。当问题涉及特定文档、报告或私有数据时使用。"
+    parameters: dict = {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string", 
+                "description": "用于在知识库中检索的查询语句"
+            }
+        },
+        "required": ["query"]
+    }
+
+    def __init__(self, vector_store: VectorInterface, embedder: EmbedderProtocol, top_k: int = 3):
+        super().__init__()
+        # Private attributes are not Pydantic fields
+        object.__setattr__(self, "_vector_store", vector_store)
+        object.__setattr__(self, "_embedder", embedder)
+        object.__setattr__(self, "_top_k", top_k)
+
+    async def execute(self, arguments: dict) -> str:
+        query = arguments.get("query")
+        if not query:
+            return "错误：查询语句为空"
+
+        # 1. Embed Query
+        query_vec = await ensure_awaitable(self._embedder.embed_query, query)
+        
+        # 2. Vector Search
+        results = await self._vector_store.search(query_vec, top_k=self._top_k)
+        
+        if not results:
+            return "未在知识库中找到相关内容。"
+            
+        # 3. Format Results
+        context = "找到以下相关内容：\n\n"
+        for i, res in enumerate(results, 1):
+            source = res['metadata'].get('filename', 'unknown')
+            score = f"{res['score']:.2f}" if 'score' in res else 'N/A'
+            context += f"--- 文档 {i} (来源: {source}, 相关度: {score}) ---\n{res['text']}\n\n"
+            
+        return context
+```
+
+[38] gecko/plugins/models/__init__.py
+```python
+```
+
+[39] gecko/plugins/models/anthropic.py
+```python
+```
+
+[40] gecko/plugins/models/gemini.py
+```python
+```
+
+[41] gecko/plugins/models/groq.py
+```python
+```
+
+[42] gecko/plugins/models/litellm.py
+```python
+# gecko/plugins/models/litellm.py
+from __future__ import annotations
+
+import os
+from typing import Any
+
+import litellm
+from pydantic import BaseModel
+
+
+class LiteLLMModel(BaseModel):
+    """
+    Gecko 官方推荐模型适配器：支持任意 OpenAI-compatible 私有部署
+    用法示例：
+        .with_model(
+            model="kimi-k2-thinking",
+            base_url="http://172.19.37.104:8095/v1",
+            api_key="optional",
+            temperature=0.7
+        )
+    """
+    model: str
+    base_url: str | None = None
+    api_key: str | None = None
+    temperature: float = 0.7
+    max_tokens: int | None = None
+    timeout: float = 300.0
+    # 支持所有 litellm 参数
+    extra_kwargs: dict[str, Any] = {}
+
+    def model_post_init(self, __context) -> None:
+        # 优先使用显式传入的参数
+        if self.base_url:
+            litellm.api_base = self.base_url
+        if self.api_key:
+            os.environ.setdefault("OPENAI_API_KEY", self.api_key)
+
+    async def acompletion(self, messages: list[dict], **kwargs) -> Any:
+        params = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "timeout": self.timeout,
+            "custom_llm_provider": "openai",  # 关键：强制走 OpenAI 协议
+            **self.extra_kwargs,
+            **kwargs,
+        }
+        if self.base_url:
+            params["api_base"] = self.base_url
+        if self.api_key:
+            params["api_key"] = self.api_key
+
+        return await litellm.acompletion(**params)
+```
+
+[43] gecko/plugins/models/openai.py
+```python
+```
+
+[44] gecko/plugins/models/zhipu.py
+```python
+# gecko/plugins/models/zhipu.py
+from __future__ import annotations
+
+import os
+from typing import Any, AsyncIterator # [新增] 导入 AsyncIterator
+
+import litellm
+from pydantic import BaseModel, Field
+
+ZHIPU_BASE_URL = "https://open.bigmodel.cn/api/paas/v4/"
+
+class ZhipuGLM(BaseModel):
+    model: str = "glm-4.5-air"
+    api_key: str = Field(
+        default="3bd5e6fdc377489c80dbb435b84d7560.izN8bDXCVR1FNSYS",
+        description="智谱官方 API Key"
+    )
+    base_url: str = Field(default=ZHIPU_BASE_URL, exclude=True)
+    temperature: float = 0.7
+    max_tokens: int | None = None
+    timeout: float = 300.0
+    extra_kwargs: dict[str, Any] = Field(default_factory=dict)
+
+    def model_post_init(self, __context) -> None:
+        os.environ.setdefault("ZHIPU_API_KEY", self.api_key)
+
+    async def acompletion(self, messages: list[dict], **kwargs) -> Any:
+        # [保持不变]
+        params = {
+            "model": self.model,
+            "messages": messages, # 这里的 messages 已经被 Engine 序列化为标准字典了
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "timeout": self.timeout,
+            "custom_llm_provider": "openai",
+            "api_base": self.base_url,
+            "api_key": self.api_key,
+            **self.extra_kwargs,
+            **kwargs,
+        }
+        return await litellm.acompletion(**params)
+
+    # [新增] 实现流式接口
+    async def astream(self, messages: list[dict], **kwargs) -> AsyncIterator[Any]:
+        params = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "timeout": self.timeout,
+            "custom_llm_provider": "openai",
+            "api_base": self.base_url,
+            "api_key": self.api_key,
+            "stream": True,  # 开启流式
+            **self.extra_kwargs,
+            **kwargs,
+        }
+        
+        # litellm 在 stream=True 时返回 AsyncGenerator
+        response_iterator = await litellm.acompletion(**params)
+        async for chunk in response_iterator:
+            yield chunk
+
+def glm_4_5_air(api_key: str | None = None, **kwargs) -> ZhipuGLM:
+    return ZhipuGLM(api_key=api_key or "3bd5e6fdc377489c80dbb435b84d7560.izN8bDXCVR1FNSYS", **kwargs)
+```
+
+[45] gecko/plugins/registry.py
+```python
+# gecko/plugins/registry.py  
+  
+"""  
+占位：预留统一插件注册机制的位置。  
+  
+TODO:  
+    - 整合 tools/storage 等注册器  
+    - 支持入口点加载第三方插件  
+"""  
+```
+
+[46] gecko/plugins/storage/__init__.py
+```python
+# gecko/plugins/storage/__init__.py
+from gecko.plugins.storage.factory import get_storage_by_url
+from gecko.plugins.storage.interfaces import SessionInterface, VectorInterface
+
+# 显式导入以触发 @register_storage 装饰器
+import gecko.plugins.storage.sqlite
+import gecko.plugins.storage.redis
+try:
+    import gecko.plugins.storage.lancedb
+except ImportError:
+    pass # 允许用户不安装 lancedb
+
+# Postgres 依赖较重，通常作为 extra 安装，这里尝试可选导入
+try:
+    import gecko.plugins.storage.postgres_pgvector
+except ImportError:
+    pass
+
+__all__ = ["get_storage_by_url", "SessionInterface", "VectorInterface"]
+```
+
+[47] gecko/plugins/storage/base.py
+```python
+# gecko/plugins/storage/base.py
+from __future__ import annotations
+from pydantic import BaseModel, Field, AnyUrl
+
+class BaseStorageConfig(BaseModel):
+    """
+    纯配置类：只包含 Pydantic 可验证的字段
+    - 用于所有存储插件的统一配置
+    - 避免运行时对象混入 Pydantic 模型导致冲突
+    """
+    storage_url: AnyUrl = Field(..., description="存储连接 URL，例如 sqlite://./db.db 或 lancedb://./db")
+    collection_name: str = Field(default="gecko_default", description="集合/表名")
+    embedding_dim: int = Field(default=1536, description="向量维度，默认兼容主流 LLM")
+    
+    model_config = {"arbitrary_types_allowed": False, "extra": "forbid"}  # 严格模式，避免任意类型
+```
+
+[48] gecko/plugins/storage/chroma.py
+```python
+# gecko/plugins/storage/chroma.py
+from __future__ import annotations
+import chromadb
+from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+from typing import List, Dict, Any
+from gecko.plugins.storage.registry import register_storage
+from gecko.plugins.storage.interfaces import SessionInterface, VectorInterface
+
+@register_storage("chroma")
+class ChromaStorage(SessionInterface, VectorInterface):
+    """
+    生产级本地存储插件：Chroma
+    - URL 示例：chroma://./chroma_db
+    - 特点：持久化目录、自动嵌入（SentenceTransformer）、支持 Session + Vector
+    - 适用：本地开发到中小型生产（<100万向量）
+    """
+    def __init__(self, storage_url: str, collection_name: str = "gecko_default", **kwargs):
+        db_path = storage_url.removeprefix("chroma://")
+        self.client = chromadb.PersistentClient(path=db_path)
+        self.embedding_fn = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+        
+        self.vector_collection = self.client.get_or_create_collection(
+            name=collection_name,
+            embedding_function=self.embedding_fn
+        )
+        self.session_collection = self.client.get_or_create_collection(name="gecko_sessions")
+
+    # Session 接口
+    async def get(self, session_id: str) -> Dict[str, Any] | None:
+        result = self.session_collection.get(ids=[session_id], include=["metadatas"])
+        return result["metadatas"][0] if result["metadatas"] else None
+
+    async def set(self, session_id: str, state: Dict[str, Any]):
+        self.session_collection.upsert(ids=[session_id], metadatas=[state])
+
+    async def delete(self, session_id: str):
+        self.session_collection.delete(ids=[session_id])
+
+    # Vector 接口
+    async def upsert(self, documents: List[Dict]):
+        self.vector_collection.upsert(
+            ids=[d["id"] for d in documents],
+            documents=[d["text"] for d in documents],
+            metadatas=[d.get("metadata", {}) for d in documents],
+            embeddings=[d.get("embedding") for d in documents]  # 可选外部嵌入
+        )
+
+    async def search(self, query_embedding: List[float], top_k: int = 5):
+        results = self.vector_collection.query(
+            query_embeddings=[query_embedding],
+            n_results=top_k,
+            include=["documents", "metadatas", "distances"]
+        )
+        return [
+            {
+                "text": doc,
+                "metadata": meta,
+                "score": 1 - dist  # 转为相似度
+            }
+            for doc, meta, dist in zip(
+                results["documents"][0],
+                results["metadatas"][0],
+                results["distances"][0]
+            )
+        ]
+```
+
+[49] gecko/plugins/storage/factory.py
+```python
+# gecko/plugins/storage/factory.py
+from __future__ import annotations
+import importlib
+import logging
+from urllib.parse import urlparse
+from gecko.plugins.storage.registry import _STORAGE_FACTORIES
+
+logger = logging.getLogger(__name__)
+
+def get_storage_by_url(storage_url: str, required: str = "any", **overrides) -> Any:
+    """
+    根据 URL 自动初始化对应的存储后端
+    """
+    if "://" in storage_url:
+        scheme = storage_url.split("://")[0]
+    else:
+        raise ValueError(f"无效的存储 URL: {storage_url}")
+
+    # 1. 查找已注册的工厂
+    factory = _STORAGE_FACTORIES.get(scheme)
+
+    # 2. [优化] 如果未找到，尝试动态导入同名模块 (gecko.plugins.storage.{scheme})
+    if not factory:
+        try:
+            module_name = f"gecko.plugins.storage.{scheme}"
+            logger.debug(f"尝试动态加载存储插件: {module_name}")
+            importlib.import_module(module_name)
+            # 重新获取
+            factory = _STORAGE_FACTORIES.get(scheme)
+        except ImportError as e:
+            # 如果是因为缺少依赖包（如 lancedb），抛出更明确的错误
+            if scheme in str(e) and "No module named" not in str(e):
+                raise ImportError(f"加载存储插件 {scheme} 失败，请安装对应依赖: {e}")
+            pass
+        except Exception as e:
+            logger.warning(f"动态加载存储插件 {scheme} 失败: {e}")
+
+    if not factory:
+        # 尝试加载外部插件（entry_points）
+        raise ValueError(f"未找到存储实现: {scheme}。\n"
+                         f"请确保：\n"
+                         f"1. 已安装对应依赖 (如 `rye add lancedb`)\n"
+                         f"2. URL 协议头正确 (如 lancedb://)")
+
+    instance = factory(storage_url, **overrides)
+    
+    # 简单的接口检查
+    if required == "session" and not hasattr(instance, "get"):
+         raise TypeError(f"存储 {scheme} 不支持 Session 接口")
+    if required == "vector" and not hasattr(instance, "search"):
+         raise TypeError(f"存储 {scheme} 不支持 Vector 接口")
+
+    return instance
+```
+
+[50] gecko/plugins/storage/interfaces.py
+```python
+# gecko/plugins/storage/interfaces.py
+from __future__ import annotations
+from abc import ABC, abstractmethod
+from typing import Dict, Any, List, Optional
+
+class SessionInterface(ABC):
+    """
+    Session 存储接口协议
+    负责 Agent 的短期记忆（Conversation History）和状态（State）的持久化
+    """
+    @abstractmethod
+    async def get(self, session_id: str) -> Dict[str, Any] | None:
+        """
+        获取会话状态
+        :param session_id: 会话唯一标识
+        :return: 状态字典，如果不存在返回 None
+        """
+        pass
+
+    @abstractmethod
+    async def set(self, session_id: str, state: Dict[str, Any]) -> None:
+        """
+        设置/更新会话状态
+        :param session_id: 会话唯一标识
+        :param state: 要保存的状态字典（需可 JSON 序列化）
+        """
+        pass
+
+    @abstractmethod
+    async def delete(self, session_id: str) -> None:
+        """
+        删除会话
+        :param session_id: 会话唯一标识
+        """
+        pass
+
+class VectorInterface(ABC):
+    """
+    Vector 存储接口协议 (RAG 用)
+    负责文档的向量存储与检索
+    """
+    @abstractmethod
+    async def upsert(self, documents: List[Dict[str, Any]]) -> None:
+        """
+        插入或更新向量文档
+        :param documents: 文档列表，每项需包含 id, embedding, text, metadata
+        """
+        pass
+
+    @abstractmethod
+    async def search(self, query_embedding: List[float], top_k: int = 5) -> List[Dict]:
+        """
+        向量相似度搜索
+        :param query_embedding: 查询向量
+        :param top_k: 返回结果数量
+        :return: 包含 text, metadata, score 的结果列表
+        """
+        pass
+```
+
+[51] gecko/plugins/storage/lancedb.py
+```python
+# gecko/plugins/storage/lancedb.py
+from __future__ import annotations
+import lancedb
+import pyarrow as pa
+from typing import List, Dict
+from gecko.plugins.storage.registry import register_storage
+from gecko.plugins.storage.interfaces import VectorInterface
+
+@register_storage("lancedb")
+class LanceDBVectorStorage(VectorInterface):
+    """
+    快速开发专用 Vector 存储插件
+    - URL 示例：lancedb://./dev_vector_db
+    - 特点：纯 Python、本地目录存储、毫秒启动、支持 ANN 搜索
+    - 适用：本地 RAG 验证
+    - 注意：首次 upsert 时自动创建表
+    """
+    def __init__(self, storage_url: str, collection_name: str = "gecko_default", embedding_dim: int = 1536, **kwargs):
+        db_path = storage_url.removeprefix("lancedb://")
+        self.db = lancedb.connect(db_path)
+        self.collection_name = collection_name
+        self.embedding_dim = embedding_dim
+        # 检查表是否存在
+        if collection_name in self.db.table_names():
+            self.table = self.db.open_table(collection_name)
+        else:
+            self.table = None
+
+    async def upsert(self, documents: List[Dict]):
+        """插入/更新文档，首次自动创建表"""
+        if not documents:
+            return
+
+        # 构造 pyarrow 表数据
+        data = pa.table({
+            "id": [d["id"] for d in documents],
+            "vector": [d["embedding"] for d in documents],
+            "text": [d["text"] for d in documents],
+            "metadata": [d.get("metadata", {}) for d in documents]
+        })
+
+        if self.table is None:
+            self.table = self.db.create_table(self.collection_name, data=data)
+        else:
+            self.table.add(data)
+
+    async def search(self, query_embedding: List[float], top_k: int = 5):
+        """搜索相似文档"""
+        if self.table is None:
+            return []
+
+        # [修复] 使用 to_list() 替代 to_pylist()
+        results = self.table.search(query_embedding).limit(top_k).to_list()
+        return [
+            {"text": r["text"], "metadata": r["metadata"], "score": 1 - r["_distance"]}
+            for r in results
+        ]
+```
+
+[52] gecko/plugins/storage/milvus.py
+```python
+# gecko/plugins/storage/milvus.py
+from __future__ import annotations
+from pymilvus import connections, Collection, FieldSchema, CollectionSchema, DataType
+from typing import List, Dict
+from gecko.plugins.storage.registry import register_storage
+from gecko.plugins.storage.interfaces import VectorInterface
+
+@register_storage("milvus")
+class MilvusStorage(VectorInterface):
+    """
+    超大规模生产级 Vector 存储：Milvus
+    - URL 示例：milvus://localhost:19530
+    - 特点：支持十亿级向量、分布式
+    """
+    def __init__(self, storage_url: str, collection_name: str = "gecko_default", embedding_dim: int = 1536, **kwargs):
+        uri = storage_url.removeprefix("milvus://")
+        connections.connect(uri=uri)
+        self.collection_name = collection_name
+        
+        if not Collection.has_collection(collection_name):
+            fields = [
+                FieldSchema(name="id", dtype=DataType.VARCHAR, is_primary=True, max_length=500),
+                FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=embedding_dim),
+                FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=65535),
+                FieldSchema(name="metadata", dtype=DataType.JSON)
+            ]
+            schema = CollectionSchema(fields)
+            self.collection = Collection(collection_name, schema)
+            self.collection.create_index("embedding", {"index_type": "IVF_FLAT", "metric_type": "IP", "params": {"nlist": 128}})
+        else:
+            self.collection = Collection(collection_name)
+        self.collection.load()
+
+    async def upsert(self, documents: List[Dict]):
+        self.collection.insert([
+            [d["id"] for d in documents],
+            [d["embedding"] for d in documents],
+            [d["text"] for d in documents],
+            [d.get("metadata", {}) for d in documents]
+        ])
+
+    async def search(self, query_embedding: List[float], top_k: int = 5):
+        params = {"metric_type": "IP", "params": {"nprobe": 16}}
+        results = self.collection.search([query_embedding], "embedding", params, top_k, output_fields=["text", "metadata"])
+        return [
+            {"text": r.entity.get("text"), "metadata": r.entity.get("metadata"), "score": r.distance}
+            for r in results[0]
+        ]
+```
+
+[53] gecko/plugins/storage/postgres_pgvector.py
+```python
+# gecko/plugins/storage/postgres_pgvector.py
+from __future__ import annotations
+import json
+from typing import List, Dict, Any
+
+try:
+    import asyncpg
+except ImportError:
+    raise ImportError("请安装 asyncpg: pip install asyncpg")
+
+from gecko.plugins.storage.registry import register_storage
+from gecko.plugins.storage.interfaces import SessionInterface, VectorInterface
+
+@register_storage("postgres+pgvector")
+class PostgresPgVectorStorage(SessionInterface, VectorInterface):
+    """
+    基于 PostgreSQL 的企业级存储
+    同时支持 Session (JSONB) 和 Vector (pgvector)
+    URL 示例: postgres+pgvector://user:pass@localhost:5432/dbname
+    """
+    def __init__(self, storage_url: str, collection_name: str = "gecko_default", **kwargs):
+        # 移除自定义协议头，还原为标准 postgres URL
+        self.dsn = storage_url.replace("postgres+pgvector://", "postgresql://")
+        self.collection_name = collection_name
+        self._pool = None
+        
+    async def _get_pool(self):
+        if not self._pool:
+            self._pool = await asyncpg.create_pool(self.dsn)
+            await self._init_schema()
+        return self._pool
+
+    async def _init_schema(self):
+        """初始化数据库 Schema"""
+        async with self._pool.acquire() as conn:
+            # 1. 启用 pgvector 扩展
+            await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            
+            # 2. 创建 Session 表
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS gecko_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    state JSONB,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # 3. 创建 Vector 表
+            # 注意：这里假设 embedding 维度为 1536 (OpenAI)，生产环境应动态处理
+            await conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS gecko_vectors (
+                    id TEXT PRIMARY KEY,
+                    collection TEXT,
+                    embedding vector(1536),
+                    text TEXT,
+                    metadata JSONB,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            # 创建向量索引 (IVFFlat)
+            # await conn.execute("CREATE INDEX ON gecko_vectors USING ivfflat (embedding vector_cosine_ops)")
+
+    # --- Session Interface ---
+    
+    async def get(self, session_id: str) -> Dict[str, Any] | None:
+        pool = await self._get_pool()
+        row = await pool.fetchrow(
+            "SELECT state FROM gecko_sessions WHERE session_id = $1", 
+            session_id
+        )
+        return json.loads(row['state']) if row else None
+
+    async def set(self, session_id: str, state: Dict[str, Any]) -> None:
+        pool = await self._get_pool()
+        state_json = json.dumps(state)
+        await pool.execute("""
+            INSERT INTO gecko_sessions (session_id, state) 
+            VALUES ($1, $2)
+            ON CONFLICT (session_id) 
+            DO UPDATE SET state = $2, updated_at = CURRENT_TIMESTAMP
+        """, session_id, state_json)
+
+    async def delete(self, session_id: str) -> None:
+        pool = await self._get_pool()
+        await pool.execute("DELETE FROM gecko_sessions WHERE session_id = $1", session_id)
+
+    # --- Vector Interface ---
+
+    async def upsert(self, documents: List[Dict[str, Any]]) -> None:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                for doc in documents:
+                    await conn.execute("""
+                        INSERT INTO gecko_vectors (id, collection, embedding, text, metadata)
+                        VALUES ($1, $2, $3, $4, $5)
+                        ON CONFLICT (id) DO UPDATE 
+                        SET embedding = $3, text = $4, metadata = $5
+                    """, 
+                    doc["id"], 
+                    self.collection_name, 
+                    doc["embedding"], 
+                    doc["text"], 
+                    json.dumps(doc.get("metadata", {}))
+                    )
+
+    async def search(self, query_embedding: List[float], top_k: int = 5) -> List[Dict]:
+        pool = await self._get_pool()
+        # 使用 <=> 操作符计算余弦距离 (Cosine Distance)
+        # 相似度 = 1 - 距离
+        rows = await pool.fetch("""
+            SELECT text, metadata, 1 - (embedding <=> $1) as score
+            FROM gecko_vectors
+            WHERE collection = $2
+            ORDER BY embedding <=> $1
+            LIMIT $3
+        """, query_embedding, self.collection_name, top_k)
+        
+        return [
+            {
+                "text": r["text"],
+                "metadata": json.loads(r["metadata"]),
+                "score": r["score"]
+            } for r in rows
+        ]
+```
+
+[54] gecko/plugins/storage/qdrant.py
+```python
+# gecko/plugins/storage/qdrant.py
+from __future__ import annotations
+from typing import List, Dict
+try:
+    from qdrant_client import QdrantClient
+    from qdrant_client.http.models import Distance, VectorParams, PointStruct
+except ImportError:
+    raise ImportError("请安装 qdrant-client: pip install qdrant-client")
+
+from gecko.plugins.storage.registry import register_storage
+from gecko.plugins.storage.interfaces import VectorInterface
+
+@register_storage("qdrant")
+class QdrantStorage(VectorInterface):
+    """
+    Qdrant 向量存储实现
+    URL 示例: qdrant://localhost:6333
+    """
+    def __init__(self, storage_url: str, collection_name: str = "gecko_default", embedding_dim: int = 1536, **kwargs):
+        url = storage_url.removeprefix("qdrant://")
+        # 支持内存模式
+        if url == ":memory:":
+            self.client = QdrantClient(":memory:")
+        else:
+            self.client = QdrantClient(url=f"http://{url}")
+            
+        self.collection_name = collection_name
+        
+        # 检查并创建集合
+        if not self.client.collection_exists(collection_name):
+            self.client.create_collection(
+                collection_name=collection_name,
+                vectors_config=VectorParams(size=embedding_dim, distance=Distance.COSINE)
+            )
+
+    async def upsert(self, documents: List[Dict]):
+        if not documents:
+            return
+        points = [
+            PointStruct(
+                id=d["id"],
+                vector=d["embedding"],
+                payload={"text": d["text"], "metadata": d.get("metadata", {})}
+            )
+            for d in documents
+        ]
+        # Qdrant 客户端方法通常是同步的，但在 gecko 协议中我们包装为异步
+        self.client.upsert(collection_name=self.collection_name, points=points)
+
+    async def search(self, query_embedding: List[float], top_k: int = 5):
+        results = self.client.search(
+            collection_name=self.collection_name,
+            query_vector=query_embedding,
+            limit=top_k
+        )
+        return [
+            {
+                "text": r.payload["text"], # type: ignore
+                "metadata": r.payload["metadata"], # type: ignore
+                "score": r.score
+            }
+            for r in results
+        ]
+```
+
+[55] gecko/plugins/storage/redis.py
+```python
+# gecko/plugins/storage/redis.py
+from __future__ import annotations
+import json
+from typing import Dict, Any
+
+try:
+    import redis.asyncio as redis
+except ImportError:
+    raise ImportError("请安装 redis 客户端: pip install redis")
+
+from gecko.plugins.storage.registry import register_storage
+from gecko.plugins.storage.interfaces import SessionInterface
+
+@register_storage("redis")
+class RedisStorage(SessionInterface):
+    """
+    基于 Redis 的高性能 Session 存储
+    URL 示例: redis://localhost:6379/0
+    """
+    def __init__(self, storage_url: str, ttl: int = 3600 * 24 * 7, **kwargs):
+        """
+        :param storage_url: Redis 连接 URL
+        :param ttl: 数据过期时间（秒），默认 7 天
+        """
+        # redis-py 可以直接解析 redis:// URL
+        self.client = redis.from_url(storage_url, decode_responses=True)
+        self.ttl = ttl
+        self.prefix = "gecko:session:"
+
+    async def get(self, session_id: str) -> Dict[str, Any] | None:
+        key = f"{self.prefix}{session_id}"
+        data = await self.client.get(key)
+        if data:
+            return json.loads(data)
+        return None
+
+    async def set(self, session_id: str, state: Dict[str, Any]) -> None:
+        key = f"{self.prefix}{session_id}"
+        json_str = json.dumps(state, ensure_ascii=False)
+        # 设置值并重置过期时间
+        await self.client.set(key, json_str, ex=self.ttl)
+
+    async def delete(self, session_id: str) -> None:
+        key = f"{self.prefix}{session_id}"
+        await self.client.delete(key)
+        
+    async def close(self):
+        await self.client.aclose()
+```
+
+[56] gecko/plugins/storage/registry.py
+```python
+# gecko/plugins/storage/registry.py
+from __future__ import annotations
+from typing import Dict, Callable, Type, Any
+
+# 存储后端工厂注册表
+_STORAGE_FACTORIES: Dict[str, Callable] = {}
+
+def register_storage(scheme: str):
+    """
+    装饰器：注册存储后端实现
+    :param scheme: URL 协议前缀，如 'sqlite', 'redis', 'postgres'
+    """
+    def decorator(cls):
+        if scheme in _STORAGE_FACTORIES:
+            raise ValueError(f"存储方案 '{scheme}' 已注册")
+        
+        # 包装为工厂函数
+        def factory(storage_url: str, **overrides):
+            return cls(storage_url=storage_url, **overrides)
+            
+        _STORAGE_FACTORIES[scheme] = factory
+        return cls
+    return decorator
+
+def get_storage_factory(scheme: str) -> Callable | None:
+    """获取指定协议的工厂函数"""
+    return _STORAGE_FACTORIES.get(scheme)
+```
+
+[57] gecko/plugins/storage/sqlite.py
+```python
+# gecko/plugins/storage/sqlite.py (改进版)
+from __future__ import annotations
+import json
+from pathlib import Path
+from typing import Dict, Any, Optional
+
+from sqlmodel import SQLModel, Field, create_engine, select, Session as SQLSession
+
+from gecko.plugins.storage.registry import register_storage
+from gecko.plugins.storage.interfaces import SessionInterface
+from gecko.plugins.storage.utils import parse_storage_url, validate_storage_url  # ✅ 使用统一解析
+from gecko.core.logging import get_logger
+
+logger = get_logger(__name__)
+
+class SessionModel(SQLModel, table=True):
+    """会话数据模型"""
+    __tablename__ = "gecko_sessions"
+    session_id: str = Field(primary_key=True)
+    state_json: str = Field(default="{}")
+
+@register_storage("sqlite")
+class SQLiteSessionStorage(SessionInterface):
+    """
+    SQLite 会话存储（改进版）
+    
+    改进：
+    1. 使用统一 URL 解析
+    2. 支持 URL 参数
+    3. 更好的错误处理
+    """
+    
+    def __init__(self, storage_url: str, **kwargs):
+        # ✅ 使用统一解析
+        validate_storage_url(storage_url, required_scheme="sqlite")
+        scheme, db_path, params = parse_storage_url(storage_url)
+        
+        # 处理 :memory:
+        if db_path == ":memory:":
+            self.db_path = ":memory:"
+        else:
+            self.db_path = db_path
+            # 创建父目录
+            if db_path != ":memory:":
+                path_obj = Path(db_path)
+                if not path_obj.parent.exists():
+                    path_obj.parent.mkdir(parents=True, exist_ok=True)
+                    logger.info("Created database directory", path=str(path_obj.parent))
+        
+        # 应用 URL 参数
+        timeout = params.get("timeout", "30")
+        
+        # 创建引擎
+        connect_args = {"timeout": int(timeout)}
+        self.engine = create_engine(
+            f"sqlite:///{self.db_path}",
+            echo=False,
+            connect_args=connect_args
+        )
+        
+        # 建表
+        SQLModel.metadata.create_all(self.engine)
+        logger.info("SQLite storage initialized", db_path=self.db_path)
+
+    async def get(self, session_id: str) -> Dict[str, Any] | None:
+        """获取会话状态"""
+        try:
+            with SQLSession(self.engine) as session:
+                statement = select(SessionModel).where(
+                    SessionModel.session_id == session_id
+                )
+                result = session.exec(statement).first()
+                
+                if result:
+                    return json.loads(result.state_json)
+                return None
+        except Exception as e:
+            logger.error("Failed to get session", session_id=session_id, error=str(e))
+            raise
+
+    async def set(self, session_id: str, state: Dict[str, Any]) -> None:
+        """设置会话状态"""
+        try:
+            with SQLSession(self.engine) as session:
+                statement = select(SessionModel).where(
+                    SessionModel.session_id == session_id
+                )
+                existing = session.exec(statement).first()
+                
+                json_str = json.dumps(state, ensure_ascii=False)
+                
+                if existing:
+                    existing.state_json = json_str
+                    session.add(existing)
+                else:
+                    new_session = SessionModel(
+                        session_id=session_id,
+                        state_json=json_str
+                    )
+                    session.add(new_session)
+                
+                session.commit()
+        except Exception as e:
+            logger.error("Failed to set session", session_id=session_id, error=str(e))
+            raise
+
+    async def delete(self, session_id: str) -> None:
+        """删除会话"""
+        try:
+            with SQLSession(self.engine) as session:
+                statement = select(SessionModel).where(
+                    SessionModel.session_id == session_id
+                )
+                result = session.exec(statement).first()
+                
+                if result:
+                    session.delete(result)
+                    session.commit()
+        except Exception as e:
+            logger.error("Failed to delete session", session_id=session_id, error=str(e))
+            raise
+```
+
+[58] gecko/plugins/storage/utils.py
+```python
+# gecko/plugins/storage/utils.py
+"""
+Storage 插件工具函数
+
+提供：
+1. 统一的 URL 解析
+2. 连接参数验证
+3. URL 构建工具
+"""
+from __future__ import annotations
+from urllib.parse import urlparse, parse_qs, urlencode
+from typing import Tuple, Dict, Any
+from gecko.core.exceptions import StorageError
+
+def parse_storage_url(url: str) -> Tuple[str, str, Dict[str, str]]:
+    """
+    解析存储 URL
+    
+    格式：scheme://path?param1=value1&param2=value2
+    
+    返回：(scheme, path, params)
+    
+    示例:
+        parse_storage_url("sqlite://./data.db?timeout=30")
+        => ("sqlite", "./data.db", {"timeout": "30"})
+        
+        parse_storage_url("redis://localhost:6379/0?password=secret")
+        => ("redis", "localhost:6379/0", {"password": "secret"})
+    """
+    if "://" not in url:
+        raise StorageError(
+            f"Invalid storage URL: '{url}'. Must include scheme (e.g., sqlite://)",
+            context={"url": url}
+        )
+    
+    parsed = urlparse(url)
+    
+    # 1. 提取 scheme
+    scheme = parsed.scheme
+    if not scheme:
+        raise StorageError(
+            f"Missing scheme in URL: '{url}'",
+            context={"url": url}
+        )
+    
+    # 2. 提取 path
+    # 对于 sqlite://./data.db，path 是 './data.db'
+    # 对于 redis://localhost:6379，netloc 是 'localhost:6379'
+    if parsed.path and parsed.path != "/":
+        # 有路径，使用路径
+        path = parsed.path
+        if path.startswith("/"):
+            path = path[1:]  # 移除开头的 /
+        
+        # 如果有 netloc，拼接
+        if parsed.netloc:
+            path = f"{parsed.netloc}/{path}"
+    else:
+        # 无路径或路径为 /，使用 netloc
+        path = parsed.netloc or ""
+    
+    # 3. 解析查询参数
+    params: Dict[str, str] = {}
+    if parsed.query:
+        query_dict = parse_qs(parsed.query)
+        # 只取第一个值（简化处理）
+        params = {k: v[0] for k, v in query_dict.items()}
+    
+    return scheme, path, params
+
+def build_storage_url(
+    scheme: str,
+    path: str,
+    **params
+) -> str:
+    """
+    构建存储 URL
+    
+    示例:
+        build_storage_url("sqlite", "./data.db", timeout=30)
+        => "sqlite://./data.db?timeout=30"
+    """
+    url = f"{scheme}://{path}"
+    
+    if params:
+        query = urlencode(params)
+        url += f"?{query}"
+    
+    return url
+
+def validate_storage_url(url: str, required_scheme: str | None = None):
+    """
+    验证存储 URL
+    
+    参数:
+        url: URL 字符串
+        required_scheme: 要求的 scheme（如 'sqlite'）
+    
+    抛出:
+        StorageError: 如果验证失败
+    """
+    try:
+        scheme, path, params = parse_storage_url(url)
+    except Exception as e:
+        raise StorageError(
+            f"Invalid storage URL: {e}",
+            context={"url": url}
+        ) from e
+    
+    # 检查 scheme
+    if required_scheme and scheme != required_scheme:
+        raise StorageError(
+            f"Invalid scheme '{scheme}', expected '{required_scheme}'",
+            context={"url": url, "expected": required_scheme, "actual": scheme}
+        )
+    
+    # 检查 path
+    if not path and scheme not in ["memory"]:  # :memory: 可以没有 path
+        raise StorageError(
+            f"Missing path in URL: '{url}'",
+            context={"url": url}
+        )
+
+# ========== 常用 URL 工厂 ==========
+
+def make_sqlite_url(
+    db_path: str = "./gecko_data.db",
+    timeout: int | None = None
+) -> str:
+    """创建 SQLite URL"""
+    params = {}
+    if timeout:
+        params["timeout"] = str(timeout)
+    
+    return build_storage_url("sqlite", db_path, **params)
+
+def make_redis_url(
+    host: str = "localhost",
+    port: int = 6379,
+    db: int = 0,
+    password: str | None = None
+) -> str:
+    """创建 Redis URL"""
+    path = f"{host}:{port}/{db}"
+    params = {}
+    if password:
+        params["password"] = password
+    
+    return build_storage_url("redis", path, **params)
+
+def make_postgres_url(
+    user: str,
+    password: str,
+    host: str = "localhost",
+    port: int = 5432,
+    database: str = "gecko"
+) -> str:
+    """创建 PostgreSQL URL"""
+    path = f"{user}:{password}@{host}:{port}/{database}"
+    return build_storage_url("postgres+pgvector", path)
+```
+
+[59] gecko/plugins/tools/__init__.py
+```python
+```
+
+[60] gecko/plugins/tools/base.py
+```python
+from __future__ import annotations  
+  
+from typing import Any, Dict, Optional, Type  
+  
+from pydantic import BaseModel, Field, ValidationError  
+  
+from gecko.core.utils import ensure_awaitable  
+  
+  
+class ToolResult(BaseModel):  
+    content: str  
+    is_error: bool = False  
+    metadata: Dict[str, Any] = Field(default_factory=dict)  
+  
+  
+class ToolArgsModel(BaseModel):  
+    """可选：工具参数模型。"""  
+    pass  
+  
+  
+class BaseTool(BaseModel):  
+    name: str = Field(..., description="工具唯一名称")  
+    description: str = Field(..., description="工具功能描述")  
+    parameters: Dict[str, Any] = Field(  
+        default_factory=lambda: {"type": "object", "properties": {}, "required": []},  
+        description="OpenAI 风格的参数 schema",  
+    )  
+    args_model: Optional[Type[ToolArgsModel]] = None  # 子类如需校验参数，可设置该字段  
+  
+    async def execute(self, arguments: Dict[str, Any]) -> ToolResult:  
+        """  
+        通用执行入口：  
+        1. 如声明 args_model，则先用 Pydantic 校验  
+        2. 调用 _execute_impl（可同步/异步）  
+        3. 返回 ToolResult  
+        """  
+        payload = arguments  
+        if self.args_model:  
+            try:  
+                payload = self.args_model(**arguments)  
+            except ValidationError as e:  
+                return ToolResult(content=str(e), is_error=True)  
+  
+        result = await ensure_awaitable(self._execute_impl, payload)  
+        if isinstance(result, ToolResult):  
+            return result  
+        return ToolResult(content=str(result))  
+  
+    def _execute_impl(self, arguments: Any) -> ToolResult:  
+        """子类需要实现具体逻辑，参数为校验后的对象或原始 dict"""  
+        raise NotImplementedError("子类必须实现 _execute_impl")  
+```
+
+[61] gecko/plugins/tools/calculator.py
+```python
+from __future__ import annotations  
+  
+from typing import Any, Dict, Type  
+  
+from pydantic import BaseModel, Field  
+  
+from gecko.plugins.tools.base import BaseTool, ToolResult  
+from gecko.plugins.tools.registry import tool  
+  
+  
+class CalculatorArgs(BaseModel):  
+    expression: str = Field(..., description="数学表达式，例如：(1 + 2) * 3")  
+  
+  
+@tool  
+class CalculatorTool(BaseTool):  
+    name: str = "calculator"  
+    description: str = "执行安全的数学计算，支持加减乘除等"  
+    parameters: Dict[str, Any] = CalculatorArgs.model_json_schema()  
+    args_model: Type[CalculatorArgs] = CalculatorArgs  
+  
+    def _execute_impl(self, args: CalculatorArgs) -> ToolResult:  
+        expr = args.expression.strip()  
+        allowed = set("0123456789.+-*/() ")  
+        if not all(c in allowed for c in expr):  
+            return ToolResult(content="错误：表达式包含非法字符", is_error=True)  
+  
+        try:  
+            result = eval(expr, {"__builtins__": {}})  
+            return ToolResult(content=f"计算结果：{result}")  
+        except Exception as e:  
+            return ToolResult(content=f"计算错误：{e}", is_error=True)  
+```
+
+[62] gecko/plugins/tools/duckduckgo.py
+```python
+from __future__ import annotations  
+  
+from typing import Any, Dict, Type  
+  
+from duckduckgo_search import DDGS  
+from pydantic import BaseModel, Field  
+  
+from gecko.plugins.tools.base import BaseTool, ToolResult  
+from gecko.plugins.tools.registry import tool  
+  
+  
+class DuckDuckGoArgs(BaseModel):  
+    query: str = Field(..., description="搜索关键词")  
+  
+  
+@tool  
+class DuckDuckGoSearch(BaseTool):  
+    name: str = "duckduckgo_search"  
+    description: str = "使用 DuckDuckGo 搜索互联网，返回前 5 条结果（无需 API Key）"  
+    parameters: Dict[str, Any] = DuckDuckGoArgs.model_json_schema()  
+    args_model: Type[DuckDuckGoArgs] = DuckDuckGoArgs  
+  
+    async def _execute_impl(self, args: DuckDuckGoArgs) -> ToolResult:  
+        query = args.query.strip()  
+        if not query:  
+            return ToolResult(content="错误：搜索关键词为空", is_error=True)  
+  
+        try:  
+            with DDGS() as ddgs:  
+                results = list(ddgs.text(query, max_results=5))  
+        except Exception as e:  
+            return ToolResult(content=f"搜索失败：{e}", is_error=True)  
+  
+        if not results:  
+            return ToolResult(content="未找到相关结果")  
+  
+        lines = [f"{i+1}. {r['title']}\n   {r['href']}" for i, r in enumerate(results)]  
+        return ToolResult(content="搜索结果：\n" + "\n".join(lines))  
+```
+
+[63] gecko/plugins/tools/executor.py
+```python
+from __future__ import annotations  
+  
+from typing import Any, Dict, List, Optional  
+  
+import anyio  
+  
+from gecko.plugins.tools.base import ToolResult  
+from gecko.plugins.tools.registry import ToolRegistry  
+  
+  
+class ToolExecutor:  
+    @staticmethod  
+    async def concurrent_execute(  
+        tool_calls: List[Dict[str, Any]],  
+        *,  
+        raise_on_error: bool = False,  
+        max_concurrent: int = 5,  
+    ) -> List[ToolResult]:  
+        results: List[Optional[ToolResult]] = [None] * len(tool_calls)  
+  
+        async def _run_one(idx: int, call: Dict[str, Any]):  
+            tool_name = call.get("name")  
+            arguments = call.get("arguments", {})  
+            tool = ToolRegistry.get(tool_name)  
+            if not tool:  
+                res = ToolResult(content=f"工具 {tool_name} 未找到", is_error=True)  
+            else:  
+                try:  
+                    res = await tool.execute(arguments)  
+                except Exception as e:  
+                    res = ToolResult(content=f"执行失败: {e}", is_error=True)  
+            results[idx] = res  
+            if raise_on_error and res.is_error:  
+                raise RuntimeError(res.content)  
+  
+        async with anyio.create_task_group() as tg:  
+            sem = anyio.Semaphore(max_concurrent)  
+            for idx, call in enumerate(tool_calls):  
+                await sem.acquire()  
+                tg.start_soon(ToolExecutor._run_with_sem, sem, _run_one, idx, call)  
+  
+        return [r for r in results if r]  
+  
+    @staticmethod  
+    async def _run_with_sem(sem: anyio.Semaphore, fn, *args):  
+        try:  
+            await fn(*args)  
+        finally:  
+            sem.release()  
+```
+
+[64] gecko/plugins/tools/registry.py
+```python
+from __future__ import annotations  
+  
+from typing import Dict, List, Optional, Type  
+  
+from gecko.plugins.tools.base import BaseTool  
+  
+  
+class ToolRegistry:  
+    _tools: Dict[str, BaseTool | Type[BaseTool]] = {}  
+  
+    @classmethod  
+    def register(cls, tool: BaseTool | Type[BaseTool], *, replace: bool = True):  
+        instance = tool if isinstance(tool, BaseTool) else tool()  
+        if instance.name in cls._tools and not replace:  
+            raise ValueError(f"工具 '{instance.name}' 已注册")  
+        cls._tools[instance.name] = tool  # 保留原对象（类或实例）  
+  
+    @classmethod  
+    def get(cls, name: str) -> Optional[BaseTool]:  
+        tool = cls._tools.get(name)  
+        if tool is None:  
+            return None  
+        if isinstance(tool, type):  
+            tool = tool()  
+            cls._tools[name] = tool  
+        return tool  
+  
+    @classmethod  
+    def list_all(cls) -> List[str]:  
+        return list(cls._tools.keys())  
+  
+  
+def tool(cls: Type[BaseTool]):  
+    ToolRegistry.register(cls, replace=True)  
+    return cls  
+```
+
+[65] gecko/utils/cleanup.py
+```python
+# gecko/utils/cleanup.py
+import atexit
+import asyncio
+
+def register_litellm_cleanup():
+    """在进程退出时优雅关闭 LiteLLM 异步客户端，避免 RuntimeWarning"""
+    def _cleanup():
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # 如果循环还在运行，调度清理任务
+                loop.create_task(_close_clients())
+            else:
+                # 循环已关闭，直接新开一个临时循环执行清理
+                asyncio.run(_close_clients())
+        except Exception:
+            pass  # 防止清理本身抛错
+
+    async def _close_clients():
+        try:
+            import litellm
+            # LiteLLM 官方提供的异步关闭方法（v1.40+ 支持）
+            if hasattr(litellm, "async_http_handler"):
+                if litellm.async_http_handler:
+                    await litellm.async_http_handler.client.close()
+            # 兼容旧版本
+            if hasattr(litellm, "http_client"):
+                if litellm.http_client:
+                    await litellm.http_client.close()
+        except Exception:
+            pass
+
+    atexit.register(_cleanup)
+
+# 自动注册（模块导入即生效）
+register_litellm_cleanup()
+```
+
