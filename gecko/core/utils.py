@@ -22,6 +22,7 @@ import asyncio
 import functools
 import hashlib
 import inspect
+import json
 import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional, TypeVar, Union
 
@@ -115,17 +116,28 @@ def run_sync(coro: Awaitable[T]) -> T:
         ```
     """
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # 如果事件循环正在运行，创建新的事件循环
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # 没有运行中的 loop，直接 run
+        return asyncio.run(coro)
+    
+    if loop.is_running():
+        # ⚠️ 检测到嵌套循环
+        logger.debug(
+            "Running async code in sync context with nested loop. "
+            "Trying to use nest_asyncio."
+        )
+        try:
             import nest_asyncio
             nest_asyncio.apply()
             return loop.run_until_complete(coro)
-        else:
-            return loop.run_until_complete(coro)
-    except RuntimeError:
-        # 没有事件循环，创建新的
-        return asyncio.run(coro)
+        except ImportError:
+            raise RuntimeError(
+                "Detected nested event loop. "
+                "Please install 'nest_asyncio' to allow nested usage: pip install nest_asyncio"
+            )
+    else:
+        return loop.run_until_complete(coro)
 
 
 # ===== 重试机制 =====
@@ -176,6 +188,8 @@ async def retry_async(
     last_exception = None
     current_delay = delay
     
+    func_name = getattr(func, "__name__", str(func))
+    
     for attempt in range(1, max_attempts + 1):
         try:
             return await func(*args, **kwargs)
@@ -185,7 +199,7 @@ async def retry_async(
             if attempt >= max_attempts:
                 logger.error(
                     "All retry attempts failed",
-                    func=getattr(func, "__name__", str(func)),
+                    func=func_name,
                     attempts=max_attempts,
                     error=str(e)
                 )
@@ -193,7 +207,7 @@ async def retry_async(
             
             logger.warning(
                 "Function failed, retrying",
-                func=getattr(func, "__name__", str(func)),
+                func=func_name,
                 attempt=attempt,
                 max_attempts=max_attempts,
                 delay=current_delay,
@@ -202,9 +216,13 @@ async def retry_async(
             
             if on_retry:
                 try:
-                    on_retry(attempt, e)
-                except Exception as callback_error:
-                    logger.warning("Retry callback failed", error=str(callback_error))
+                    # 新增：检测回调是否为异步函数
+                    if inspect.iscoroutinefunction(on_retry):
+                        await on_retry(attempt, e)
+                    else:
+                        on_retry(attempt, e)
+                except Exception as cb_err:
+                    logger.warning("Retry callback failed", error=str(cb_err))
             
             await asyncio.sleep(current_delay)
             current_delay *= backoff
@@ -526,6 +544,14 @@ class Timer:
         
         return False
 
+def safe_json_loads(text: str, default: Any = None) -> Any:
+    """
+    安全地解析 JSON
+    """
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return default
 
 def timing(func: Callable) -> Callable:
     """
@@ -719,4 +745,5 @@ __all__ = [
     "chunk_list",
     "flatten_list",
     "deduplicate",
+    "safe_json_loads",
 ]

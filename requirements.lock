@@ -165,6 +165,8 @@ mypy==1.18.2
     # via gecko-ai
 mypy-extensions==1.1.0
     # via mypy
+nest-asyncio==1.6.0
+    # via gecko-ai
 networkx==3.5
     # via gecko-ai
 numpy==2.3.5
