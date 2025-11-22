@@ -10,7 +10,7 @@ async def main():
     output = await agent.run([
         Message(role="user", content="用中文介绍一下 Gecko 框架的插件化设计优势")
     ])
-    print(output.content)
+    print(output)
 
 if __name__ == "__main__":
     asyncio.run(main())

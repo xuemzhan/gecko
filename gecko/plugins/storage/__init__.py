@@ -1,19 +1,18 @@
 # gecko/plugins/storage/__init__.py
-from gecko.plugins.storage.factory import get_storage_by_url
+"""
+Gecko Storage 插件系统
+
+提供统一的接口用于访问 Session (KV) 和 Vector (RAG) 存储。
+"""
+from gecko.plugins.storage.abc import AbstractStorage
+from gecko.plugins.storage.factory import create_storage
 from gecko.plugins.storage.interfaces import SessionInterface, VectorInterface
+from gecko.plugins.storage.registry import register_storage
 
-# 显式导入以触发 @register_storage 装饰器
-import gecko.plugins.storage.sqlite
-import gecko.plugins.storage.redis
-try:
-    import gecko.plugins.storage.lancedb
-except ImportError:
-    pass # 允许用户不安装 lancedb
-
-# Postgres 依赖较重，通常作为 extra 安装，这里尝试可选导入
-try:
-    import gecko.plugins.storage.postgres_pgvector
-except ImportError:
-    pass
-
-__all__ = ["get_storage_by_url", "SessionInterface", "VectorInterface"]
+__all__ = [
+    "AbstractStorage",
+    "create_storage",
+    "SessionInterface",
+    "VectorInterface",
+    "register_storage",
+]
