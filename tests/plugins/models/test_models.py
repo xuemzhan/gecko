@@ -60,7 +60,7 @@ async def test_litellm_driver_completion():
         assert isinstance(resp, CompletionResponse)
         assert resp.choices[0].message["content"] == "Cleaned Content"
         assert resp.model == "gpt-mock"
-        assert resp.usage.total_tokens == 15
+        assert resp.usage.total_tokens == 15 # type: ignore
 
 @pytest.mark.asyncio
 async def test_litellm_driver_error():
@@ -82,7 +82,7 @@ should_run = pytest.mark.skipif(not ZHIPU_KEY, reason="No ZHIPU_API_KEY")
 @pytest.mark.asyncio
 async def test_zhipu_live_completion():
     """[Integration] Zhipu 真实调用"""
-    model = ZhipuChat(api_key=ZHIPU_KEY, model="glm-4-flash")
+    model = ZhipuChat(api_key=ZHIPU_KEY, model="glm-4-flash") # type: ignore
     messages = [{"role": "user", "content": "1+1=?"}]
     
     resp = await model.acompletion(messages)
@@ -95,7 +95,7 @@ async def test_zhipu_live_completion():
 @pytest.mark.asyncio
 async def test_zhipu_live_stream():
     """[Integration] Zhipu 流式调用"""
-    model = ZhipuChat(api_key=ZHIPU_KEY, model="glm-4-flash")
+    model = ZhipuChat(api_key=ZHIPU_KEY, model="glm-4-flash") # type: ignore
     messages = [{"role": "user", "content": "Hello"}]
     
     text = ""

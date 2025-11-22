@@ -1,158 +1,126 @@
-# Gecko Plugins Models
+# Gecko Models Plugin
 
-`gecko.plugins.models` 是 Gecko 框架的统一模型接入层。它基于 [LiteLLM](https://github.com/BerriAI/litellm) 构建，为上层 Agent 和 RAG 模块提供了一致、健壮且类型安全的模型调用接口。
+`gecko.plugins.models` 是 Gecko 框架的核心模型接入层。它采用 **驱动器模式 (Driver Pattern)** 和 **注册表模式 (Registry Pattern)** 设计，为上层应用提供了一个统一、健壮且高度可扩展的模型调用接口。
 
 ## 🌟 核心特性
 
-*   **全能接入**：统一支持 OpenAI、Anthropic、Gemini 等主流 SaaS 模型，以及 DeepSeek、智谱 GLM 等国产大模型。
-*   **云端 & 本地双轨**：无缝切换云端 API 和本地离线模型（Ollama, vLLM, SGLang），仅需修改配置。
-*   **职责分离**：严格区分 **Chat Model**（对话/多模态）与 **Embedder**（向量化），避免接口混用。
-*   **协议驱动**：完全遵循 Gecko Core 的 `StreamableModelProtocol` 和 `EmbedderProtocol`，支持流式输出和 Function Calling。
-*   **多模态支持**：通过能力标识（Capability Flags）支持视觉（Vision）等多模态输入。
+*   **驱动器架构 (Driver Architecture)**：核心层与具体实现解耦。默认内置 `LiteLLMDriver` 以支持 100+ 种模型，同时支持扩展原生 SDK 驱动（如 `NativeOpenAIDriver`, `NativeGeminiDriver`）。
+*   **全能接入**：无缝支持 OpenAI, Anthropic, Zhipu (智谱AI) 等 SaaS 服务，以及 Ollama, vLLM 等本地离线模型。
+*   **健壮性设计**：内置 **防腐层 (Anti-Corruption Layer)**，通过 `LiteLLMAdapter` 自动清洗上游响应，彻底解决 Pydantic 版本冲突和序列化警告问题。
+*   **协议驱动**：严格遵循 Gecko Core 的 `StreamableModelProtocol` 和 `EmbedderProtocol`。
+*   **多模态与流式**：原生支持视觉输入 (Vision) 和 Token 级流式输出 (Streaming)。
 
 ## 📂 目录结构
 
 ```text
 gecko/plugins/models/
-├── __init__.py          # 导出常用类
-├── config.py            # 统一配置对象 (ModelConfig)
-├── base.py              # 抽象基类定义 (BaseChatModel, BaseEmbedder)
-├── chat.py              # Chat 模型通用实现 (LiteLLMChatModel)
-├── embedding.py         # Embedding 模型通用实现 (LiteLLMEmbedder)
-└── presets/             # 厂商预设配置
-    ├── openai.py
-    ├── zhipu.py
+├── __init__.py                  # 模块入口 (导出常用类)
+├── config.py                    # 统一配置对象 (ModelConfig)
+├── base.py                      # 抽象基类 (BaseChatModel, BaseEmbedder)
+├── factory.py                   # 工厂方法 (create_model)
+├── registry.py                  # 驱动注册表 (@register_driver)
+├── adapter.py                   # 响应清洗适配器 (ACL)
+├── embedding.py                 # Embedding 模型通用实现
+├── drivers/                     # 驱动器实现目录
+│   ├── __init__.py
+│   └── litellm_driver.py        # [默认] LiteLLM 通用驱动
+└── presets/                     # 厂商预设配置 (简化初始化)
+    ├── __init__.py
     ├── ollama.py
-    └── ...
+    ├── openai.py
+    └── zhipu.py
 ```
 
 ## 🚀 快速开始
 
-### 1. 使用 Chat 模型 (对话/推理)
+### 1. 使用厂商预设 (推荐)
 
-#### 方式 A：使用厂商预设 (推荐)
+预设类 (Presets) 封装了复杂的配置细节，是使用特定厂商模型的最佳方式。
 
-Gecko 预置了主流厂商的配置类，简化初始化流程。
+#### 智谱 AI (ZhipuGLM)
 
 ```python
-from gecko.plugins.models.presets.openai import OpenAIChat
+import os
 from gecko.plugins.models.presets.zhipu import ZhipuChat
+from gecko.core.message import Message
 
-# 1. OpenAI
-model_openai = OpenAIChat(
-    api_key="sk-...", 
-    model="gpt-4o"
+# 初始化 (使用 OpenAI 兼容协议连接)
+model = ZhipuChat(
+    api_key=os.getenv("ZHIPU_API_KEY"), 
+    model="glm-4-flash"
 )
 
-# 2. 智谱 AI (GLM-4)
-model_zhipu = ZhipuChat(
-    api_key="...", 
-    model="glm-4-plus"
-)
-
-# 调用 (支持异步)
-response = await model_zhipu.acompletion([{"role": "user", "content": "你好"}])
-print(response.choices[0].message.content)
+# 调用
+msg = Message.user("你好，请介绍一下 Gecko 框架")
+response = await model.acompletion([msg.to_openai_format()])
+print(response.choices[0].message["content"])
 ```
 
-#### 方式 B：连接本地模型 (Ollama / vLLM)
+#### 本地模型 (Ollama)
 
-支持完全离线的本地推理，适合隐私敏感或无网环境。
+适合离线环境或隐私敏感场景。
 
 ```python
 from gecko.plugins.models.presets.ollama import OllamaChat
 
-# 连接本地 Ollama 服务
+# 连接本地 Ollama (默认端口 11434)
 local_model = OllamaChat(
-    model="llama3",                 # 对应 `ollama run llama3`
+    model="llama3",  
     base_url="http://localhost:11434",
-    timeout=120.0                   # 本地推理可能较慢，建议增加超时
+    timeout=120.0  # 本地推理建议增加超时
 )
 
-# 集成到 Agent
-agent = Agent(model=local_model, ...)
+response = await local_model.acompletion([...])
 ```
 
-#### 方式 C：通用配置 (自定义厂商)
+### 2. 使用通用配置 (Factory 模式)
 
-对于未预设的厂商（如 DeepSeek、Moonshot），可使用通用适配器。
+对于未提供预设的厂商（如 DeepSeek、Moonshot），或者需要动态加载配置的场景，使用 `ModelConfig` 和 `create_model`。
 
 ```python
 from gecko.plugins.models.config import ModelConfig
-from gecko.plugins.models.chat import LiteLLMChatModel
+from gecko.plugins.models.factory import create_model
 
-# 连接 DeepSeek (通过 OpenAI 兼容接口)
+# 配置 DeepSeek (通过 LiteLLM 驱动)
 config = ModelConfig(
     model_name="deepseek-chat",
+    driver_type="litellm",  # 指定驱动
     api_key="sk-...",
     base_url="https://api.deepseek.com",
     max_retries=3
 )
 
-model = LiteLLMChatModel(config)
+model = create_model(config)
 ```
 
-### 2. 使用 Embedding 模型 (RAG)
-
-Embedding 模型用于将文本转换为向量，是 RAG 系统的核心组件。
+### 3. 使用 Embedding 模型 (RAG)
 
 ```python
 from gecko.plugins.models.presets.openai import OpenAIEmbedder
-from gecko.plugins.models.presets.ollama import OllamaEmbedder
 
-# 1. OpenAI Embedding
-embedder_cloud = OpenAIEmbedder(
+embedder = OpenAIEmbedder(
     api_key="sk-...",
     model="text-embedding-3-small",
     dimension=1536
 )
 
-# 2. 本地 Embedding (Ollama)
-embedder_local = OllamaEmbedder(
-    model="nomic-embed-text",
-    base_url="http://localhost:11434",
-    dimension=768  # 需手动指定维度以便向量库初始化
-)
-
-# 使用
-vectors = await embedder_local.embed_documents(["Gecko 是一个 AI 框架"])
+vectors = await embedder.embed_documents(["Gecko 是一个 AI 智能体框架"])
 ```
 
 ## ⚙️ 配置详解 (ModelConfig)
 
-`ModelConfig` 是所有模型初始化的核心配置对象，支持以下参数：
-
-| 参数 | 类型 | 描述 | 默认值 |
+| 参数 | 类型 | 说明 | 默认值 |
 | :--- | :--- | :--- | :--- |
-| `model_name` | str | 模型名称 (如 `gpt-4o`, `ollama/llama3`) | 必填 |
-| `api_key` | str | API 密钥 | None |
-| `base_url` | str | API 基础地址 (SaaS 可空，本地必填) | None |
-| `timeout` | float | 请求超时时间 (秒) | 60.0 |
-| `max_retries` | int | 失败重试次数 | 2 |
-| `supports_vision` | bool | 是否支持视觉输入 | False |
-| `supports_function_calling` | bool | 是否支持工具调用 | True |
-| `extra_kwargs` | dict | 透传给 LiteLLM 的额外参数 | {} |
+| `model_name` | str | 模型名称 (如 `gpt-4o`, `ollama/qwen2`) | **必填** |
+| `driver_type` | str | 驱动类型 (`litellm`, `openai_native` 等) | `"litellm"` |
+| `api_key` | str | API 密钥 | `None` |
+| `base_url` | str | API 基础地址 (SaaS 可空，本地必填) | `None` |
+| `timeout` | float | 请求超时时间 (秒) | `60.0` |
+| `max_retries` | int | 失败重试次数 | `2` |
+| `supports_vision` | bool | 启用视觉支持 | `False` |
+| `extra_kwargs` | dict | 透传给驱动底层的额外参数 | `{}` |
 
-## 🔌 高级用法
-
-### 多模态支持 (Vision)
-
-Gecko 的 `Message` 对象支持多模态内容。要启用此功能，请确保模型配置了 `supports_vision=True`。
-
-```python
-from gecko.core.message import Message
-
-# 初始化支持视觉的模型
-model = OpenAIChat(model="gpt-4o", api_key="...")
-
-# 发送图片
-msg = Message.user(
-    text="这张图片里有什么？",
-    images=["https://example.com/image.jpg"]
-)
-
-response = await model.acompletion([msg.to_openai_format()])
-```
+## 🔌 高级特性
 
 ### 流式输出 (Streaming)
 
@@ -164,22 +132,60 @@ async for chunk in model.astream(messages):
         print(chunk.content, end="", flush=True)
 ```
 
-## 🛠️ 扩展指南
+### 多模态 (Vision)
 
-如果您需要支持新的模型厂商，只需继承 `LiteLLMChatModel` 或 `LiteLLMEmbedder` 并预设配置即可：
+支持发送图片 URL 或 Base64 数据。需确保 `supports_vision=True`。
 
 ```python
-# 示例：添加 Moonshot (Kimi) 支持
-from gecko.plugins.models.chat import LiteLLMChatModel
-from gecko.plugins.models.config import ModelConfig
+vision_model = ZhipuChat(api_key="...", model="glm-4v-flash")
 
-class MoonshotChat(LiteLLMChatModel):
-    def __init__(self, api_key: str, model: str = "moonshot-v1-8k", **kwargs):
-        config = ModelConfig(
-            model_name=model,
-            api_key=api_key,
-            base_url="https://api.moonshot.cn/v1",
-            **kwargs
-        )
-        super().__init__(config)
+msg = Message.user(
+    text="这张图里有什么？",
+    images=["https://example.com/photo.jpg"]
+)
+
+await vision_model.acompletion([msg.to_openai_format()])
 ```
+
+## 🛠️ 架构扩展指南
+
+Gecko 的模型层设计支持无限扩展。如果您需要接入特殊的 SDK（例如 Google 原生 SDK 以支持 Video 输入），可以编写自定义驱动。
+
+### 如何增加新的驱动？
+
+1.  **创建驱动文件**：在 `gecko/plugins/models/drivers/` 下创建 `my_custom_driver.py`。
+2.  **继承基类**：继承 `BaseChatModel`。
+3.  **注册驱动**：使用 `@register_driver("my_driver_name")` 装饰器。
+
+```python
+# gecko/plugins/models/drivers/my_custom_driver.py
+from gecko.plugins.models.base import BaseChatModel
+from gecko.plugins.models.registry import register_driver
+
+@register_driver("my_native_sdk")
+class MyNativeDriver(BaseChatModel):
+    async def acompletion(self, messages, **kwargs):
+        # 调用原生 SDK 逻辑
+        native_response = await my_sdk.chat(...)
+        # 转换为 Gecko 标准 CompletionResponse
+        return CompletionResponse(...)
+
+    async def astream(self, messages, **kwargs):
+        # 实现流式逻辑
+        ...
+```
+
+4.  **使用新驱动**：
+
+```python
+config = ModelConfig(
+    model_name="my-model",
+    driver_type="my_native_sdk",  # 指定新驱动
+    ...
+)
+model = create_model(config)
+```
+
+---
+
+**Gecko Team**
