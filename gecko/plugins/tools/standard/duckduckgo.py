@@ -1,21 +1,12 @@
 # gecko/plugins/tools/standard/duckduckgo.py
-"""
-DuckDuckGo 搜索工具 (标准版)
-
-基于 duckduckgo-search 库实现。
-重构改进：
-1. 继承新的 BaseTool，使用 Pydantic V2 定义参数。
-2. 使用 run_sync 将同步的网络 I/O 卸载到线程池，防止阻塞 Event Loop。
-3. 增强错误处理和结果格式化。
-"""
 from __future__ import annotations
 
 from typing import Any, Dict, List, Type
 
+from anyio.to_thread import run_sync
 from pydantic import BaseModel, Field
 
 from gecko.core.logging import get_logger
-from gecko.core.utils import run_sync
 from gecko.plugins.tools.base import BaseTool, ToolResult
 from gecko.plugins.tools.registry import register_tool
 
@@ -23,18 +14,8 @@ logger = get_logger(__name__)
 
 
 class DuckDuckGoArgs(BaseModel):
-    query: str = Field(
-        ..., 
-        description="搜索关键词",
-        min_length=1,
-        max_length=200
-    )
-    max_results: int = Field(
-        default=5, 
-        description="返回的最大结果数量 (1-10)", 
-        ge=1, 
-        le=10
-    )
+    query: str = Field(..., description="搜索关键词", min_length=1, max_length=200)
+    max_results: int = Field(default=5, description="返回的最大结果数量 (1-10)", ge=1, le=10)
 
 
 @register_tool("duckduckgo_search")
@@ -48,10 +29,6 @@ class DuckDuckGoSearchTool(BaseTool):
     args_schema: Type[BaseModel] = DuckDuckGoArgs
 
     async def _run(self, args: DuckDuckGoArgs) -> ToolResult: # type: ignore
-        """
-        执行搜索
-        注意：DDGS 库主要是同步 IO，必须通过 run_sync 卸载到线程池
-        """
         # 检查依赖
         try:
             from duckduckgo_search import DDGS
@@ -72,33 +49,32 @@ class DuckDuckGoSearchTool(BaseTool):
             try:
                 # 使用上下文管理器确保 session 关闭
                 with DDGS() as ddgs:
-                    # text() 方法是生成器，需要转 list
-                    # backend="api" 通常更稳定
+                    # [修改] 移除已废弃的 backend 参数
                     raw_results = ddgs.text(
                         keywords=query,
-                        max_results=args.max_results,
-                        backend="api" 
+                        max_results=args.max_results
                     )
-                    # 立即消费生成器以捕获可能的网络异常
-                    results = list(raw_results)
+                    # [修改] 增加空值检查，ddgs.text 可能返回 None
+                    if raw_results:
+                        results = list(raw_results)
             except Exception as e:
-                logger.error("DuckDuckGo search failed", error=str(e))
-                raise e
+                # 记录错误但不抛出，返回空列表让上层处理
+                logger.warning(f"DuckDuckGo search request failed: {e}")
+                return []
             return results
 
         try:
             # 异步非阻塞执行
-            # 这里的 run_sync 引用自 gecko.core.utils，底层使用 to_thread
-            raw_data = await run_sync(_search_sync()) # type: ignore
+            raw_data = await run_sync(_search_sync)
 
             if not raw_data:
-                return ToolResult(content=f"未找到关于 '{query}' 的相关结果。")
+                return ToolResult(content=f"未找到关于 '{query}' 的相关结果，或搜索服务暂时不可用。")
 
             return self._format_results(raw_data)
 
         except Exception as e:
             return ToolResult(
-                content=f"搜索请求失败: {str(e)}",
+                content=f"搜索工具执行异常: {str(e)}",
                 is_error=True
             )
 

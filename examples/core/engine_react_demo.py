@@ -1,3 +1,4 @@
+# examples/core/engine_react_demo.py
 import asyncio
 import os
 from typing import Any, Dict
@@ -11,10 +12,11 @@ from gecko.core.memory import TokenMemory
 from gecko.core.toolbox import ToolBox
 from gecko.core.engine.react import ReActEngine
 from gecko.plugins.tools.base import BaseTool
-from gecko.plugins.models.zhipu import ZhipuGLM, glm_4_5_air
+# [修改] 导入新的模型类
+from gecko.plugins.models import ZhipuChat
 
 # ==========================================
-# 1. 定义简单的工具
+# 1. 定义简单的工具 (保持不变)
 # ==========================================
 
 class CalculatorTool(BaseTool):
@@ -30,9 +32,17 @@ class CalculatorTool(BaseTool):
         },
         "required": ["expression"]
     }
+    # 为了兼容新版 BaseTool，这里虽然没有用 args_schema，但手动实现了 parameters 属性
+    # 如果使用新版 BaseTool，建议定义 Pydantic Model。
+    # 这里为了最小化改动，我们通过覆盖 _run 并忽略类型检查来适配 Demo
+    
+    # 定义一个临时的 args schema 以满足 BaseTool 初始化检查
+    class Args(BaseModel):
+        expression: str
+    args_schema: type[BaseModel] = Args
 
-    async def execute(self, arguments: Dict[str, Any]) -> str:
-        expression = arguments.get("expression")
+    async def _run(self, args: Args) -> str:
+        expression = args.expression
         try:
             # 注意：eval 在生产环境中是不安全的，仅用于演示
             return str(eval(expression))
@@ -42,24 +52,17 @@ class CalculatorTool(BaseTool):
 class WeatherTool(BaseTool):
     name: str = "get_current_weather"
     description: str = "Get the current weather in a given location"
-    parameters: Dict[str, Any] = {
-        "type": "object",
-        "properties": {
-            "location": {
-                "type": "string",
-                "description": "The city and state, e.g. San Francisco, CA"
-            },
-            "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
-        },
-        "required": ["location"]
-    }
+    
+    class Args(BaseModel):
+        location: str
+        unit: str = "celsius"
+    args_schema: type[BaseModel] = Args
 
-    async def execute(self, arguments: Dict[str, Any]) -> str:
-        location = arguments.get("location")
-        return f"The weather in {location} is sunny and 25°C."
+    async def _run(self, args: Args) -> str:
+        return f"The weather in {args.location} is sunny and 25°C."
 
 # ==========================================
-# 2. 定义结构化输出模型
+# 2. 定义结构化输出模型 (保持不变)
 # ==========================================
 
 class AnalysisReport(BaseModel):
@@ -73,10 +76,13 @@ class AnalysisReport(BaseModel):
 # ==========================================
 
 async def main():
-    # 1. 初始化模型 (使用提供的 ZhipuGLM 实现)
-    # 请确保 ZHIPU_API_KEY 环境变量已设置，或者在构造函数中传入
-    api_key = os.getenv("ZHIPU_API_KEY", "3bd5e6fdc377489c80dbb435b84d7560.izN8bDXCVR1FNSYS")
-    llm = ZhipuGLM(api_key=api_key, model="glm-4-flash") # 使用 flash 模型速度更快
+    # 1. 初始化模型 [修改]
+    api_key = os.getenv("ZHIPU_API_KEY")
+    if not api_key:
+        print("Please set ZHIPU_API_KEY environment variable.")
+        return
+
+    llm = ZhipuChat(api_key=api_key, model="glm-4-flash")
 
     # 2. 初始化工具箱
     toolbox = ToolBox(tools=[CalculatorTool(), WeatherTool()])
@@ -93,7 +99,7 @@ async def main():
         max_turns=5 # 限制最大思考轮数
     )
 
-    print("\n🚀 ReAct Agent Demo (Powered by ZhipuGLM)\n")
+    print("\n🚀 ReAct Agent Demo (Powered by ZhipuChat)\n")
 
     # --- 场景 1: 需要使用工具的复杂查询 ---
     query1 = "What is 123 * 45? Also, what's the weather in Beijing?"
@@ -104,7 +110,7 @@ async def main():
     response1 = await agent.run(query1)
     print(f"💡 Final Answer: {response1.content}\n")
     
-    # 查看统计 (ReActEngine 会记录工具调用)
+    # 查看统计
     if agent.engine.stats:
         print(f"📊 Stats: Steps={agent.engine.stats.total_steps}, ToolCalls={agent.engine.stats.tool_calls}")
 
@@ -130,6 +136,4 @@ async def main():
     print("\n")
 
 if __name__ == "__main__":
-    # 确保安装了 litellm
-    # pip install litellm
     asyncio.run(main())

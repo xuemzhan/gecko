@@ -7,6 +7,7 @@ Gecko 结构化日志系统（改进版）
 from __future__ import annotations
 import logging
 import sys
+import warnings
 from typing import Any, Optional
 
 try:
@@ -43,6 +44,11 @@ def setup_logging(
     if _initialized and not force:
         return
     
+     # [新增] 屏蔽 LiteLLM/Pydantic 的序列化警告
+    warnings.filterwarnings("ignore", message=".*Pydantic serializer warnings.*", category=UserWarning)
+    # [新增] 屏蔽 DuckDuckGo 的废弃警告
+    warnings.filterwarnings("ignore", message=".*backend='api' is deprecated.*", category=UserWarning)
+    
     level = level or settings.log_level
     log_level = getattr(logging, level.upper(), logging.INFO)
     
@@ -59,21 +65,21 @@ def setup_logging(
 
 def _setup_structlog(level: int):
     """配置 structlog"""
-    structlog.configure(
+    structlog.configure( # type: ignore
         processors=[
-            structlog.contextvars.merge_contextvars, 
-            structlog.processors.add_log_level,
-            structlog.processors.StackInfoRenderer(),
-            structlog.dev.set_exc_info,
-            structlog.processors.TimeStamper(fmt="iso", utc=True),
+            structlog.contextvars.merge_contextvars, # type: ignore
+            structlog.processors.add_log_level, # type: ignore
+            structlog.processors.StackInfoRenderer(), # type: ignore
+            structlog.dev.set_exc_info, # type: ignore
+            structlog.processors.TimeStamper(fmt="iso", utc=True), # type: ignore
             # 根据配置选择渲染器
-            structlog.processors.JSONRenderer()
-            if settings.log_format == "json"
-            else structlog.dev.ConsoleRenderer(),
+            structlog.processors.JSONRenderer() # type: ignore
+            if settings.log_format == "json" # type: ignore
+            else structlog.dev.ConsoleRenderer(), # type: ignore
         ],
-        wrapper_class=structlog.make_filtering_bound_logger(level),
+        wrapper_class=structlog.make_filtering_bound_logger(level), # type: ignore
         context_class=dict,
-        logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
+        logger_factory=structlog.PrintLoggerFactory(file=sys.stdout), # type: ignore
         cache_logger_on_first_use=True,
     )
 
@@ -104,7 +110,7 @@ def get_logger(name: str) -> Any:
         setup_logging()
     
     if STRUCTLOG_AVAILABLE:
-        return structlog.get_logger(name)
+        return structlog.get_logger(name) # type: ignore
     else:
         return logging.getLogger(name)
 

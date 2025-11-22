@@ -11,6 +11,8 @@ from gecko.core.memory import TokenMemory
 from gecko.core.protocols import ModelProtocol
 from gecko.core.toolbox import ToolBox
 
+from gecko.plugins.tools.registry import ToolRegistry
+
 def pytest_configure(config):
     """
     Pytest 配置钩子
@@ -26,6 +28,19 @@ def pytest_configure(config):
     
     # 2. 屏蔽 LiteLLM 的一些 verbose 输出
     os.environ["LITELLM_LOG"] = "ERROR"
+
+@pytest.fixture(autouse=True)
+def clean_tool_registry():
+    """
+    [新增] 自动清理工具注册表
+    确保每个测试用例都在一个干净的注册表状态下运行，
+    避免 Test A 注册的工具影响 Test B。
+    """
+    # 备份当前状态
+    original_registry = ToolRegistry._registry.copy()
+    yield
+    # 还原状态
+    ToolRegistry._registry = original_registry
 
 @pytest.fixture(autouse=True)
 def env_setup():

@@ -1,8 +1,8 @@
 # examples/tools/tools_demo.py
 """
-Gecko Tool Demo (修复版)
+Gecko Tool Demo (适配新版 Models 架构)
 
-展示如何结合 ZhipuGLM 模型与 ToolBox 构建具备工具调用能力的 Agent。
+展示如何结合 ZhipuChat 模型与 ToolBox 构建具备工具调用能力的 Agent。
 """
 import asyncio
 import os
@@ -11,16 +11,17 @@ from typing import Type
 
 from pydantic import BaseModel, Field
 
-# 确保当前目录在 sys.path 中，以便能导入 gecko 包 (如果在开发模式下)
+# 确保当前目录在 sys.path 中
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../"))
 
 from gecko.core.builder import AgentBuilder
 from gecko.core.logging import setup_logging
 
-# 导入插件系统
-from gecko.plugins.models.zhipu import ZhipuGLM
+# [修改 1] 从统一的 models 插件入口导入 ZhipuChat
+from gecko.plugins.models import ZhipuChat
 from gecko.plugins.tools.base import BaseTool, ToolResult
-from gecko.plugins.tools.registry import register_tool
+# [修改] 导入 load_tool 用于实例化工具
+from gecko.plugins.tools.registry import register_tool, load_tool
 
 # 导入标准工具库以触发自动注册
 import gecko.plugins.tools.standard
@@ -29,7 +30,7 @@ setup_logging(level="INFO")
 
 
 # ==========================================
-# 自定义工具定义
+# 自定义工具定义 (保持不变)
 # ==========================================
 
 class WeatherArgs(BaseModel):
@@ -41,7 +42,7 @@ class WeatherTool(BaseTool):
     description: str = "查询特定城市的当前天气状况。"
     args_schema: Type[BaseModel] = WeatherArgs
 
-    async def _run(self, args: WeatherArgs) -> ToolResult:
+    async def _run(self, args: WeatherArgs) -> ToolResult: # type: ignore
         print(f"\n[Mock API] Querying weather for {args.city}...")
         mock_data = {
             "Beijing": "Sunny, 25°C, Wind: NW 3km/h",
@@ -62,37 +63,39 @@ async def main():
     # 1. 获取 API Key
     api_key = os.environ.get("ZHIPU_API_KEY")
     
-    # [Fix] 构造参数字典，避免显式传递 None 覆盖默认值
-    llm_kwargs = {
-        "model": "glm-4-air",
-        "temperature": 0.1,
-    }
-    
-    if api_key:
-        print(f"✅ 检测到环境变量 API Key: {api_key[:6]}******")
-        llm_kwargs["api_key"] = api_key
-    else:
-        print("⚠️ 未检测到 ZHIPU_API_KEY，将尝试使用模型内置的默认 Key (仅供测试)...")
-        # 不在 llm_kwargs 中设置 'api_key'，让 ZhipuGLM 使用 default 值
+    if not api_key:
+        print("❌ 未检测到 ZHIPU_API_KEY 环境变量")
+        print("请运行: export ZHIPU_API_KEY='your_key_here'")
+        # 为了演示继续运行，这里可以抛出异常或者硬编码测试Key(不推荐)
+        return
 
-    # 2. 初始化模型
+    print(f"✅ 检测到 API Key: {api_key[:6]}******")
+
+    # 2. 初始化模型 [修改 2]
+    # 使用新的 ZhipuChat 类，显式传入 api_key 和 model
     try:
-        llm = ZhipuGLM(**llm_kwargs)
+        llm = ZhipuChat(
+            api_key=api_key,
+            model="glm-4-air",
+            temperature=0.1
+        )
     except Exception as e:
         print(f"❌ 模型初始化失败: {e}")
-        print("请运行: export ZHIPU_API_KEY='your_key_here'")
         return
 
     # 3. 构建 Agent
     try:
+        # [修改] 显式加载工具实例，满足 AgentBuilder 的严格类型检查
+        tools_list = [
+            load_tool("calculator"),        # 从注册表加载标准工具
+            load_tool("duckduckgo_search"), # 从注册表加载标准工具
+            load_tool("weather_query")      # 加载刚刚注册的自定义工具
+        ]
+
         agent = (
             AgentBuilder()
             .with_model(llm)
-            .with_tools([
-                "calculator",        # 标准库：安全计算器
-                "duckduckgo_search", # 标准库：联网搜索
-                "weather_query"      # 自定义：天气查询
-            ])
+            .with_tools(tools_list)  # 现在传入的是 BaseTool 实例列表
             .with_max_tokens(4000)
             .build()
         )
@@ -111,18 +114,17 @@ async def main():
     print(f"\nUser: {query_math}")
     try:
         response = await agent.run(query_math)
-        print(f"Agent: {response.content}")
+        print(f"Agent: {response.content}") # type: ignore
     except Exception as e:
         print(f"Execution failed: {e}")
 
-    # 场景 B: 联网搜索
-    # 只有在安装了 duckduckgo-search 且网络通畅时才执行
+    # 场景 B: 联网搜索 (可选)
     try:
         import duckduckgo_search
         query_search = "2024年巴黎奥运会金牌榜第一名是哪个国家？"
         print(f"\nUser: {query_search}")
         response = await agent.run(query_search)
-        print(f"Agent: {response.content}")
+        print(f"Agent: {response.content}") # type: ignore
     except ImportError:
         print("\n⚠️ 跳过搜索测试：未安装 duckduckgo-search")
     except Exception as e:

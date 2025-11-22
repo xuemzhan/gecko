@@ -88,7 +88,15 @@ class CalculatorTool(BaseTool):
                 if op_type in operators:
                     left = _eval(node.left)
                     right = _eval(node.right)
+
+                    # [新增] 安全防御：限制幂运算的指数大小
+                    if op_type == ast.Pow:
+                        # 检查指数是否为数字且过大 (例如限制为 1000)
+                        if isinstance(right, (int, float)) and right > 1000:
+                            raise ValueError(f"指数过大: {right} (最大允许 1000)")
+
                     return operators[op_type](left, right)
+            
                 raise ValueError(f"不支持的操作符: {op_type}")
 
             # 3. 一元运算 (-a)

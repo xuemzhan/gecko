@@ -6,6 +6,9 @@ from gecko.plugins.tools.registry import ToolRegistry, register_tool
 from gecko.plugins.tools.standard.calculator import CalculatorTool
 from gecko.core.toolbox import ToolBox
 
+from unittest.mock import MagicMock, patch
+from gecko.plugins.tools.standard.duckduckgo import DuckDuckGoSearchTool
+
 # 1. 定义测试用的工具
 class EchoArgs(BaseModel):
     msg: str
@@ -95,3 +98,125 @@ async def test_toolbox_integration():
     # 执行
     res = await toolbox.execute("echo_test", {"msg": "Integration Works"})
     assert res == "ECHO: Integration Works"
+
+# [新增] DuckDuckGo 工具测试套件
+class TestDuckDuckGoTool:
+    
+    @pytest.mark.asyncio
+    async def test_ddg_tool_success(self):
+        """测试 DDG 搜索成功场景 (Mock 网络请求)"""
+        # Mock duckduckgo_search 库
+        with patch("gecko.plugins.tools.standard.duckduckgo.DDGS") as mock_ddgs_cls:
+            mock_instance = mock_ddgs_cls.return_value
+            # 模拟上下文管理器
+            mock_instance.__enter__.return_value = mock_instance
+            
+            # 模拟 text() 方法返回生成器/列表
+            mock_instance.text.return_value = [
+                {"title": "Gecko Framework", "href": "https://gecko.ai", "body": "AI Agent Framework"}
+            ]
+            
+            tool = DuckDuckGoSearchTool() # type: ignore
+            result = await tool.execute({"query": "gecko ai"})
+            
+            assert not result.is_error
+            assert "Gecko Framework" in result.content
+            assert "https://gecko.ai" in result.content
+            assert result.metadata["count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_ddg_tool_missing_dependency(self):
+        """测试依赖缺失时的降级处理"""
+        tool = DuckDuckGoSearchTool() # type: ignore
+        
+        # 模拟 sys.modules 中找不到 duckduckgo_search
+        # 这会触发 tool._run 中的 ImportError
+        with patch.dict("sys.modules", {"duckduckgo_search": None}):
+            result = await tool.execute({"query": "test"})
+            
+            assert result.is_error
+            assert "未安装 duckduckgo_search" in result.content
+
+    @pytest.mark.asyncio
+    async def test_ddg_tool_search_error(self):
+        """测试搜索过程抛出异常"""
+        with patch("gecko.plugins.tools.standard.duckduckgo.DDGS") as mock_ddgs_cls:
+            mock_instance = mock_ddgs_cls.return_value
+            mock_instance.__enter__.return_value = mock_instance
+            
+            # 模拟网络错误
+            mock_instance.text.side_effect = Exception("Network Timeout")
+            
+            tool = DuckDuckGoSearchTool() # type: ignore
+            result = await tool.execute({"query": "fail"})
+            
+            assert result.is_error
+            assert "搜索请求失败" in result.content
+            assert "Network Timeout" in result.content
+
+# [修改] DuckDuckGo 工具测试套件
+class TestDuckDuckGoTool:
+    
+    @pytest.mark.asyncio
+    async def test_ddg_tool_success(self):
+        """测试 DDG 搜索成功场景 (Mock 网络请求)"""
+        # 1. 构造 Mock 的 duckduckgo_search 模块和 DDGS 类
+        mock_ddgs_module = MagicMock()
+        mock_ddgs_cls = MagicMock()
+        mock_ddgs_module.DDGS = mock_ddgs_cls
+        
+        # 2. 模拟 DDGS 实例行为
+        mock_instance = mock_ddgs_cls.return_value
+        # 模拟上下文管理器 (with DDGS() as ddgs:)
+        mock_instance.__enter__.return_value = mock_instance
+        
+        # 模拟 text() 方法返回数据
+        mock_instance.text.return_value = [
+            {"title": "Gecko Framework", "href": "https://gecko.ai", "body": "AI Agent Framework"}
+        ]
+        
+        # 3. 使用 patch.dict 注入 sys.modules
+        # 这使得工具内部的 `from duckduckgo_search import DDGS` 能成功导入我们的 Mock
+        with patch.dict("sys.modules", {"duckduckgo_search": mock_ddgs_module}):
+            tool = DuckDuckGoSearchTool()
+            result = await tool.execute({"query": "gecko ai"})
+            
+            assert not result.is_error
+            assert "Gecko Framework" in result.content
+            assert "https://gecko.ai" in result.content
+            assert result.metadata["count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_ddg_tool_missing_dependency(self):
+        """测试依赖缺失时的降级处理"""
+        tool = DuckDuckGoSearchTool()
+        
+        # 模拟 sys.modules 中找不到 duckduckgo_search (设置为 None 即为 ImportError)
+        with patch.dict("sys.modules", {"duckduckgo_search": None}):
+            result = await tool.execute({"query": "test"})
+            
+            assert result.is_error
+            assert "未安装 duckduckgo_search" in result.content
+
+    @pytest.mark.asyncio
+    async def test_ddg_tool_search_error(self):
+        """测试搜索过程抛出异常"""
+        # 1. 构造 Mock
+        mock_ddgs_module = MagicMock()
+        mock_ddgs_cls = MagicMock()
+        mock_ddgs_module.DDGS = mock_ddgs_cls
+        
+        mock_instance = mock_ddgs_cls.return_value
+        mock_instance.__enter__.return_value = mock_instance
+        
+        # 2. 模拟网络错误
+        mock_instance.text.side_effect = Exception("Network Timeout")
+        
+        # 3. 注入 Mock
+        with patch.dict("sys.modules", {"duckduckgo_search": mock_ddgs_module}):
+            tool = DuckDuckGoSearchTool()
+            result = await tool.execute({"query": "fail"})
+            
+            assert result.is_error
+            assert "搜索请求失败" in result.content
+            assert "Network Timeout" in result.content
