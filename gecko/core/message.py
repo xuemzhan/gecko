@@ -290,7 +290,7 @@ class ContentBlock(BaseModel):
         elif self.type == "image_url":
             return {
                 "type": "image_url",
-                "image_url": self.image_url.to_openai_image_url()
+                "image_url": self.image_url.to_openai_image_url() # type: ignore
             }
         else:
             raise ValueError(f"未知的内容类型: {self.type}")
