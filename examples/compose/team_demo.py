@@ -1,11 +1,11 @@
 # examples/team_demo.py
 """
-Team 多智能体协作示例
+Team 多智能体协作示例 (Updated for V0.2)
 
 展示 Gecko Team 引擎的并行处理能力：
 1. 专家评审团模式 (Panel of Experts)
 2. 并发控制 (Rate Limiting)
-3. 容错机制 (Partial Failure Handling)
+3. 容错机制 (Partial Failure) -> [Updated] 使用 MemberResult 处理结果
 4. 结果聚合 (Aggregation)
 
 运行前提：
@@ -17,11 +17,13 @@ import asyncio
 import os
 from typing import List
 
-from gecko.compose.team import Team
+# [Updated] 引入 MemberResult 用于类型安全的处理
+from gecko.compose.team import Team, MemberResult
 from gecko.core.agent import Agent
 from gecko.core.builder import AgentBuilder
 from gecko.core.logging import get_logger
-from gecko.plugins.models.zhipu import glm_4_5_air
+# [Updated] 使用新的模型类
+from gecko.plugins.models.presets.zhipu import ZhipuChat
 
 logger = get_logger(__name__)
 
@@ -32,7 +34,8 @@ def create_expert(role: str, prompt: str, api_key: str) -> Agent:
     """
     创建一个特定角色的专家 Agent
     """
-    model = glm_4_5_air(api_key=api_key, temperature=0.8)
+    # [Updated] 使用 ZhipuChat 类实例化
+    model = ZhipuChat(api_key=api_key, model="glm-4-air", temperature=0.8)
     
     return (
         AgentBuilder()
@@ -43,17 +46,22 @@ def create_expert(role: str, prompt: str, api_key: str) -> Agent:
     )
 
 
-async def aggregate_results(results: List[str]) -> str:
+async def aggregate_results(results: List[MemberResult]) -> str:
     """
     聚合函数：将团队的意见汇总
+    [Updated] 适配 MemberResult 结构，显式检查成功状态
     """
     summary = []
-    for i, res in enumerate(results, 1):
-        # 处理可能的错误信息（Team 的容错机制）
-        if str(res).startswith("Error:"):
-            summary.append(f"专家 {i}: [缺席] ({res})")
+    # Team.run 现在返回 List[MemberResult]
+    for res in results:
+        i = res.member_index + 1
+        
+        if res.is_success:
+            # 成功：直接获取 result (Team 默认会提取 content)
+            summary.append(f"专家 {i}: {res.result}")
         else:
-            summary.append(f"专家 {i}: {res}")
+            # 失败：从 error 字段获取信息
+            summary.append(f"专家 {i}: [缺席] (Error: {res.error})")
             
     return "\n".join(summary)
 
@@ -89,7 +97,7 @@ async def main():
     )
 
     # 2. 创建 Team 引擎
-    # 设置 max_concurrent=2，演示流量整形（虽然有3个专家，但同一时间只并发请求2个）
+    # 设置 max_concurrent=2，演示流量整形
     team = Team(
         members=[optimist, pessimist, realist],
         name="AI_Review_Board",
@@ -100,12 +108,12 @@ async def main():
     print(f"\n🎙️ 议题: {topic}\n")
 
     # 3. 并行执行
-    # Team.run 会自动处理并发、等待所有结果、并捕获单个 Agent 的异常
-    raw_results = await team.run(topic)
+    # [Updated] Team.run 返回 List[MemberResult]
+    member_results = await team.run(topic)
 
     # 4. 结果展示
     print("-" * 20 + " 评审结果 " + "-" * 20)
-    final_report = await aggregate_results(raw_results)
+    final_report = await aggregate_results(member_results)
     print(final_report)
     print("-" * 50)
 

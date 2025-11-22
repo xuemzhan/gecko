@@ -16,6 +16,10 @@ Workflow 引擎
 - [Fix] 将 WorkflowContext 升级为 BaseModel，彻底解决持久化数据截断问题
 - [Fix] 增加分支歧义检测，确保逻辑确定性
 - [Fix] 优化 Agent 间的数据流转 (Data Handover)，避免 Prompt 污染
+
+优化日志：
+- [Feat] 支持 allow_cycles 配置，允许定义有环图
+- [Feat] 支持处理 Next.update_state
 """
 from __future__ import annotations
 
@@ -24,7 +28,7 @@ import inspect
 import time
 import uuid
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union, Set
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar, Union, Set
 
 from pydantic import BaseModel, Field, PrivateAttr
 
@@ -37,6 +41,8 @@ from gecko.core.utils import ensure_awaitable
 from gecko.plugins.storage.interfaces import SessionInterface
 
 logger = get_logger(__name__)
+
+T = TypeVar("T")
 
 
 # ========================= 事件定义 =========================
@@ -111,6 +117,30 @@ class WorkflowContext(BaseModel):
     def get_last_output(self) -> Any:
         """获取上一个节点的输出（如果无历史则返回初始输入）"""
         return self.history.get("last_output", self.input)
+    
+    def get_last_output_as(self, type_: Type[T]) -> T:
+        """
+        类型安全地获取上一步输出
+        尝试将输出转换为指定类型，或进行断言。
+        """
+        val = self.get_last_output()
+        
+        # 1. 如果已经是该类型，直接返回
+        if isinstance(val, type_):
+            return val
+            
+        # 2. 尝试 Pydantic 转换 (如果是 dict -> Model)
+        if isinstance(val, dict) and hasattr(type_, "model_validate"):
+            try:
+                return type_.model_validate(val) # type: ignore
+            except Exception:
+                pass
+                
+        # 3. 简单的类型转换 (如 int, str)
+        try:
+            return type_(val) # type: ignore
+        except Exception as e:
+            raise TypeError(f"Cannot convert last output {type(val)} to {type_}") from e
 
     def get_summary(self) -> Dict[str, Any]:
         """获取执行摘要"""
@@ -140,6 +170,7 @@ class Workflow:
         max_steps: int = 100,
         enable_retry: bool = False,
         max_retries: int = 3,
+        allow_cycles: bool = False, # [New] 允许循环
     ):
         self.name = name
         self.event_bus = event_bus or EventBus()
@@ -147,6 +178,7 @@ class Workflow:
         self.max_steps = max_steps
         self.enable_retry = enable_retry
         self.max_retries = max_retries
+        self.allow_cycles = allow_cycles 
 
         # 内部存储
         self._nodes: Dict[str, Callable] = {}
@@ -231,10 +263,12 @@ class Workflow:
                 )
 
         # 3. 检查死循环 (静态检测)
-        try:
-            self._detect_cycles()
-        except WorkflowCycleError as e:
-            self._validation_errors.append(str(e))
+        # [Updated] 仅在不允许循环时检测环
+        if not self.allow_cycles:
+            try:
+                self._detect_cycles()
+            except WorkflowCycleError as e:
+                self._validation_errors.append(str(e))
 
         # 4. 连通性警告
         self._check_connectivity()
@@ -359,6 +393,10 @@ class Workflow:
                     normalized_input = self._normalize_result(result.input)
                     context.history["last_output"] = normalized_input
                     context.state["_next_input"] = normalized_input
+
+                # [New] 处理状态更新
+                if result.update_state:
+                    context.state.update(result.update_state)
             else:
                 # 普通 DAG 流转
                 normalized = self._normalize_result(result)
@@ -439,7 +477,7 @@ class Workflow:
         修复：智能处理参数绑定，支持同时需要 Input 和 Context 的场景
         """
         # 1. 智能体对象 (Agent or Team)
-        if hasattr(node_callable, "run") and callable(node_callable.run):
+        if hasattr(node_callable, "run") and callable(node_callable.run): # type: ignore
             return await self._run_intelligent_object(node_callable, context)
         
         # 2. 普通可调用对象
@@ -486,21 +524,25 @@ class Workflow:
         执行 Agent/Team 对象
         
         优化: 智能处理数据流转 (Data Handover)
+        优化: [Refactored Phase 1] 移除数据流转的魔法清洗逻辑
         """
         # 1. 获取输入 (优先使用 Next 传递的，否则用上一步输出)
         raw_input = context.state.pop("_next_input", None) or context.get_last_output()
         
         # 2. 数据清洗 (Data Handover Fix)
+        ## 以前这里会尝试从 dict 中提取 content。
+        ## 现在我们假设 Agent.run 能够处理 raw_input (因为 Agent.run 支持 dict 输入)
+        ## 或者上一个节点的输出就是 Agent 期望的格式。
         # 如果上一个节点返回的是 AgentOutput (dict)，且当前 Agent 需要文本输入，
         # 我们尝试提取 content，避免将整个 JSON 结构扔给 LLM。
-        agent_input = raw_input
-        if isinstance(raw_input, dict):
-            # 如果有 content 且没有 role (说明不是 Message 对象，而是 Output 字典)
-            if "content" in raw_input and "role" not in raw_input:
-                agent_input = raw_input["content"]
+        # agent_input = raw_input
+        # if isinstance(raw_input, dict):
+        #     # 如果有 content 且没有 role (说明不是 Message 对象，而是 Output 字典)
+        #     if "content" in raw_input and "role" not in raw_input:
+        #         agent_input = raw_input["content"]
         
         # 3. 执行
-        output = await obj.run(agent_input)
+        output = await obj.run(raw_input)
         
         # 4. 结果处理
         if hasattr(output, "model_dump"):
@@ -522,7 +564,7 @@ class Workflow:
                 )
                 if attempt < self.max_retries - 1:
                     await asyncio.sleep(2 ** attempt)
-        raise last_error
+        raise last_error # type: ignore
 
     # ========================= 辅助方法 =========================
 
@@ -591,7 +633,7 @@ class Workflow:
             # mode='json' 会将 UUID, Enum 等转换为字符串
             context_data = context.model_dump(mode="json")
             
-            await self.storage.set(
+            await self.storage.set( # type: ignore
                 f"workflow:{session_id}",
                 {
                     "step": steps,

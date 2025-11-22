@@ -14,7 +14,7 @@ Workflow 节点定义与辅助工具
 from __future__ import annotations
 
 import functools
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, Optional
 
 from pydantic import BaseModel, Field
 
@@ -34,9 +34,13 @@ class Next(BaseModel):
         ```
     """
     node: str = Field(..., description="下一个节点的名称")
-    input: Optional[Any] = Field(
-        default=None, 
-        description="传递给下一个节点的输入数据。如果为 None，则保持上下文中的 last_output 不变。"
+    input: Optional[Any] = Field(default=None, 
+        iption="传递给下一个节点的输入数据。如果为 None，则保持上下文中的 last_output 不变。"
+    ) # type: ignore
+    # [New] 允许在跳转时更新 Context.state # type: ignore
+    update_state: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="需要合并到 WorkflowContext.state 的字典"
     )
 
 

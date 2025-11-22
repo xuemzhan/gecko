@@ -127,3 +127,12 @@ async def test_step_exception_propagation():
     
     with pytest.raises(ValueError, match="Boom"):
         await failing_func()
+
+def test_next_with_state_update():
+    """[New] 测试 Next 携带状态更新"""
+    n = Next(
+        node="B", 
+        input="data", 
+        update_state={"counter": 1, "flag": True}
+    )
+    assert n.update_state == {"counter": 1, "flag": True}

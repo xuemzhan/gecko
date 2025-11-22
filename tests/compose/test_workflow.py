@@ -153,43 +153,6 @@ async def test_node_binding_error(simple_workflow):
     with pytest.raises(WorkflowError, match="Node 'Bad' failed"):
         await simple_workflow.execute("init")
 
-@pytest.mark.asyncio
-async def test_agent_node_execution(simple_workflow):
-    """测试 Agent 对象（具备 run 方法）的执行与数据流转"""
-    
-    class MockAgent:
-        async def run(self, message):
-            # 模拟 Agent 接收输入
-            return {"content": f"Agent processed: {message}", "role": "assistant"}
-
-    agent = MockAgent()
-    simple_workflow.add_node("Agent", agent)
-    simple_workflow.set_entry_point("Agent")
-    
-    res = await simple_workflow.execute("hello")
-    assert res["content"] == "Agent processed: hello"
-
-@pytest.mark.asyncio
-async def test_data_handover_extraction(simple_workflow):
-    """测试数据交接：从上一个节点的字典输出中提取 content 给下一个 Agent"""
-    
-    # 节点1返回字典
-    def node1():
-        return {"content": "pure text", "metadata": 123}
-    
-    # 节点2是 Agent，应该只收到 "pure text"
-    class MockAgent:
-        async def run(self, text):
-            assert text == "pure text" # 关键断言
-            return "done"
-            
-    simple_workflow.add_node("N1", node1)
-    simple_workflow.add_node("Agent", MockAgent())
-    simple_workflow.add_edge("N1", "Agent")
-    simple_workflow.set_entry_point("N1")
-    
-    await simple_workflow.execute("init")
-
 # ========================= 3. 控制流逻辑测试 =========================
 
 @pytest.mark.asyncio
@@ -440,3 +403,82 @@ async def test_not_callable_node(simple_workflow):
     
     with pytest.raises(WorkflowError, match="is not callable"):
         await simple_workflow.execute(None)
+
+# tests/compose/test_workflow.py (Partial Update)
+# 仅展示修改和新增的部分，其他基础 DAG 测试保持不变
+
+@pytest.mark.asyncio
+async def test_agent_node_execution(simple_workflow):
+    """测试 Agent 对象执行"""
+    class MockAgent:
+        async def run(self, message):
+            return {"content": f"Agent processed: {message}", "role": "assistant"}
+
+    agent = MockAgent()
+    simple_workflow.add_node("Agent", agent)
+    simple_workflow.set_entry_point("Agent")
+    
+    res = await simple_workflow.execute("hello")
+    assert res["content"] == "Agent processed: hello"
+
+@pytest.mark.asyncio
+async def test_no_magic_extraction(simple_workflow):
+    """
+    [New] 测试不再进行魔法提取
+    验证节点返回的字典被完整传递给下一个节点（即使是 Agent）
+    """
+    # 节点1返回复杂结构
+    def node1():
+        return {"content": "text", "meta": "data"}
+    
+    # 节点2是 Agent，验证它收到了完整的字典
+    class MockAgent:
+        async def run(self, input_data):
+            # Agent 应该收到完整的字典，而不是被拆包后的 "text"
+            assert isinstance(input_data, dict)
+            assert input_data["meta"] == "data"
+            return "done"
+            
+    simple_workflow.add_node("N1", node1)
+    simple_workflow.add_node("Agent", MockAgent())
+    simple_workflow.add_edge("N1", "Agent")
+    simple_workflow.set_entry_point("N1")
+    
+    await simple_workflow.execute("init")
+
+@pytest.mark.asyncio
+async def test_context_type_safety(simple_workflow):
+    """[New] 测试 WorkflowContext 的类型安全获取方法"""
+    # 这里的导入确保使用最新的类定义
+    from gecko.compose.workflow import WorkflowContext
+    from pydantic import BaseModel
+    
+    ctx = WorkflowContext(input="init")
+    
+    # 1. 基础类型转换
+    ctx.history["last_output"] = "123"
+    assert ctx.get_last_output_as(int) == 123
+    assert ctx.get_last_output_as(str) == "123"
+    
+    # 2. Pydantic 转换
+    class MyModel(BaseModel):
+        val: int
+        
+    ctx.history["last_output"] = {"val": 99}
+    model = ctx.get_last_output_as(MyModel)
+    assert isinstance(model, MyModel)
+    assert model.val == 99
+    
+    # 3. 转换失败
+    ctx.history["last_output"] = "not an int"
+    with pytest.raises(TypeError):
+        ctx.get_last_output_as(int)
+
+def test_next_with_state_update():
+    """[New] 测试 Next 携带状态更新"""
+    n = Next(
+        node="B", 
+        input="data", 
+        update_state={"counter": 1, "flag": True}
+    )
+    assert n.update_state == {"counter": 1, "flag": True}
