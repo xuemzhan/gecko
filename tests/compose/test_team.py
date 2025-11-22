@@ -14,7 +14,7 @@ from gecko.core.output import AgentOutput
 # ========================= Mock 对象 =========================
 
 class MockContext:
-    def __init__(self, input_data: Any, history: dict = None, state: dict = None):
+    def __init__(self, input_data: Any, history: dict = None, state: dict = None): # type: ignore
         self.input = input_data
         self.history = history or {}
         self.state = state or {}
@@ -52,7 +52,7 @@ async def test_mixed_members_execution():
     def sync_task(x):
         return f"sync_{x}"
     
-    team = Team(members=[agent, func_task, sync_task])
+    team = Team(members=[agent, func_task, sync_task]) # type: ignore
     results = await team.run("input")
     
     # 验证结果对象
@@ -70,7 +70,7 @@ async def test_invalid_member_type():
     
     assert len(results) == 1
     assert results[0].is_success is False
-    assert "not executable" in results[0].error
+    assert "not executable" in results[0].error # type: ignore
 
 @pytest.mark.asyncio
 async def test_partial_failure():
@@ -92,7 +92,7 @@ async def test_partial_failure():
         
         assert results[1].is_success is False
         assert results[1].result is None
-        assert "Boom!" in results[1].error
+        assert "Boom!" in results[1].error # type: ignore
         
         mock_logger.error.assert_called()
 

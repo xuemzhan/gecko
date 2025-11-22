@@ -7,6 +7,7 @@ Workflow 模块单元测试
 - [Fix] test_node_binding_error: 适配最新的参数注入逻辑，断言运行时的 TypeError 而非签名检查错误
 - [Fix] 保持其他测试用例的稳定性
 """
+import time
 import pytest
 import asyncio
 from unittest.mock import MagicMock, AsyncMock, patch, ANY
@@ -16,6 +17,7 @@ from gecko.compose.workflow import Workflow, WorkflowContext, NodeStatus, Workfl
 from gecko.compose.nodes import Next
 from gecko.core.message import Message
 from gecko.plugins.storage.interfaces import SessionInterface
+from gecko.compose.workflow import CheckpointStrategy
 
 # ========================= Fixtures =========================
 
@@ -272,7 +274,8 @@ async def test_max_steps_exceeded(simple_workflow):
     simple_workflow.set_entry_point("A")
     
     # 预期运行：A(1) -> B(2) -> A(3 > max 2) -> Error
-    with pytest.raises(WorkflowError, match="Workflow exceeded max steps"):
+    # [Fix] 更新匹配字符串: "Workflow exceeded" -> "Exceeded"
+    with pytest.raises(WorkflowError, match="Exceeded max steps"):
         await simple_workflow.execute(None)
 
 @pytest.mark.asyncio
@@ -323,11 +326,12 @@ async def test_persistence(simple_workflow, mock_storage):
     assert key == "workflow:sess_123"
     assert data["step"] == 1
     
-    # 只有 A 一个节点，执行完后 find_next_node 返回 None
-    # 因此持久化时的 last_node 状态为 None（表示指针已移出）
-    assert data["last_node"] is None 
+    # [Fix] 只有 A 一个节点，执行完后：
+    # 旧逻辑: last_node 是下一个节点 (None)
+    # 新逻辑: last_node 是刚刚完成的节点 ("A")，这样 Resume 时才知道 A 已完成
+    assert data["last_node"] == "A"
     
-    # 但历史记录里必须有 A
+    # 历史记录检查保持不变
     assert data["context"]["input"] == "input"
     assert data["context"]["history"]["A"] == "output_a"
 
@@ -482,3 +486,71 @@ def test_next_with_state_update():
         update_state={"counter": 1, "flag": True}
     )
     assert n.update_state == {"counter": 1, "flag": True}
+
+@pytest.mark.asyncio
+async def test_checkpoint_strategy(simple_workflow, mock_storage):
+    """[New] 测试持久化策略"""
+    simple_workflow.storage = mock_storage
+    simple_workflow.checkpoint_strategy = CheckpointStrategy.FINAL
+    
+    simple_workflow.add_node("A", lambda: "a")
+    simple_workflow.add_node("B", lambda: "b")
+    simple_workflow.add_edge("A", "B")
+    simple_workflow.set_entry_point("A")
+    
+    await simple_workflow.execute("init", session_id="sess_strat")
+    
+    # 策略是 FINAL，只有在结束时强制保存一次
+    # 中间步骤 A->B 时 _persist_state 会被调用但应该 early return
+    # 只有最后 execute 结束前会 force=True 调用一次
+    # 实际上，_execute_loop 内部循环了 2 次 (A, B)，如果策略是 ALWAYS，会保存 2 次
+    # 如果是 FINAL，_execute_loop 内不保存，最后保存 1 次
+    
+    assert mock_storage.set.call_count == 1
+    
+    # 验证最后保存的状态
+    key, data = mock_storage.set.call_args[0]
+    assert data["last_node"] is None # 执行完了，没有 next
+    assert data["context"]["history"]["B"] == "b"
+
+@pytest.mark.asyncio
+async def test_resume_functionality(simple_workflow, mock_storage):
+    """[New] 测试断点恢复"""
+    simple_workflow.storage = mock_storage
+    simple_workflow.checkpoint_strategy = CheckpointStrategy.ALWAYS
+    
+    # 定义节点
+    # 使用 Mock 记录执行次数
+    node_a_mock = MagicMock(return_value="res_a")
+    node_b_mock = MagicMock(return_value="res_b")
+    
+    simple_workflow.add_node("A", lambda: node_a_mock())
+    simple_workflow.add_node("B", lambda: node_b_mock())
+    simple_workflow.add_edge("A", "B")
+    simple_workflow.set_entry_point("A")
+    
+    # 1. 模拟已执行完 A 并保存的状态
+    mock_context_data = {
+        "input": "start",
+        "history": {"last_output": "res_a", "A": "res_a"},
+        "executions": [{"node_name": "A", "status": "success"}]
+    }
+    
+    mock_storage.get.return_value = {
+        "step": 1,
+        "last_node": "A", # A 已完成
+        "context": mock_context_data,
+        "updated_at": time.time()
+    }
+    
+    # 2. 调用 resume
+    result = await simple_workflow.resume("sess_resume")
+    
+    # 3. 验证
+    # A 不应该再被执行
+    node_a_mock.assert_not_called()
+    
+    # B 应该被执行
+    node_b_mock.assert_called_once()
+    
+    assert result == "res_b"
