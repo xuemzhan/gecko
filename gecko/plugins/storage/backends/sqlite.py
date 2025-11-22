@@ -6,6 +6,12 @@ SQLite 存储后端 (高并发优化版)
 1. Mixin 组合：继承 ThreadOffloadMixin 防止阻塞 Loop，继承 AtomicWriteMixin 防止写冲突。
 2. WAL 模式：开启 Write-Ahead Logging，大幅提升读写并发性能。
 3. 线程安全：配置 check_same_thread=False 以支持在线程池中使用连接。
+4. 进程安全：启用 FileLock 防止多进程环境下的 Database is locked 错误。
+
+更新日志：
+- [Arch] 初始化时配置 FileLock。
+- [Robustness] 所有操作统一抛出 StorageError。
+- [Perf] 保持 WAL 模式优化。
 """
 from __future__ import annotations
 
@@ -16,6 +22,7 @@ from typing import Any, Dict, Optional
 from sqlalchemy import text
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 
+from gecko.core.exceptions import StorageError
 from gecko.core.logging import get_logger
 from gecko.plugins.storage.abc import AbstractStorage
 from gecko.plugins.storage.interfaces import SessionInterface
@@ -48,114 +55,129 @@ class SQLiteStorage(
         
         scheme, path, params = parse_storage_url(url)
         
-        # 处理文件路径
         self.db_path = path
         self.is_memory = path == ":memory:"
         
-        if not self.is_memory:
-            # 确保父目录存在
-            db_file = Path(path)
-            if not db_file.parent.exists():
-                db_file.parent.mkdir(parents=True, exist_ok=True)
-        
-        # 构造 SQLAlchemy URL
-        # 注意：sqlite://<path> (3 slashes for relative, 4 for absolute)
-        # 这里简化处理，假设 utils 解析出的 path 已经是文件系统路径
-        if self.is_memory:
-            sqlalchemy_url = "sqlite:///:memory:"
-        else:
-            sqlalchemy_url = f"sqlite:///{self.db_path}"
+        try:
+            if not self.is_memory:
+                # 确保父目录存在
+                db_file = Path(path)
+                if not db_file.parent.exists():
+                    db_file.parent.mkdir(parents=True, exist_ok=True)
+                
+                # [架构优化] 配置跨进程文件锁
+                self.setup_multiprocess_lock(self.db_path)
+            
+            if self.is_memory:
+                sqlalchemy_url = "sqlite:///:memory:"
+            else:
+                sqlalchemy_url = f"sqlite:///{self.db_path}"
 
-        # 创建引擎
-        # check_same_thread=False: 允许在不同线程使用连接（必须，因为用了 ThreadOffload）
-        # timeout=30: 增加 SQLite 忙等待时间
-        self.engine = create_engine(
-            sqlalchemy_url,
-            connect_args={"check_same_thread": False, "timeout": 30},
-            # echo=True # 调试时开启
-        )
+            self.engine = create_engine(
+                sqlalchemy_url,
+                connect_args={"check_same_thread": False, "timeout": 30},
+            )
+        except Exception as e:
+            raise StorageError(f"Failed to configure SQLite: {e}") from e
 
     async def initialize(self) -> None:
-        """异步初始化：建表 + 开启 WAL"""
         if self.is_initialized:
             return
 
-        # 1. 建表 (在线程中执行)
-        await self._run_sync(SQLModel.metadata.create_all, self.engine)
-        
-        # 2. 开启 WAL 模式 (提升并发)
-        # 内存数据库不需要 WAL
-        if not self.is_memory:
-            def _enable_wal():
-                with self.engine.connect() as conn:
-                    conn.execute(text("PRAGMA journal_mode=WAL;"))
-                    conn.execute(text("PRAGMA synchronous=NORMAL;"))
+        try:
+            await self._run_sync(SQLModel.metadata.create_all, self.engine)
             
-            await self._run_sync(_enable_wal)
-            logger.debug("SQLite WAL mode enabled", path=self.db_path)
-            
-        self._is_initialized = True
-        logger.info("SQLite storage initialized", url=self.url)
+            if not self.is_memory:
+                def _enable_wal():
+                    with self.engine.connect() as conn:
+                        conn.execute(text("PRAGMA journal_mode=WAL;"))
+                        conn.execute(text("PRAGMA synchronous=NORMAL;"))
+                
+                await self._run_sync(_enable_wal)
+                logger.debug("SQLite WAL mode enabled", path=self.db_path)
+                
+            self._is_initialized = True
+            logger.info("SQLite storage initialized", url=self.url)
+        except Exception as e:
+            raise StorageError(f"Failed to initialize SQLite: {e}") from e
 
     async def shutdown(self) -> None:
-        """释放资源"""
-        self.engine.dispose()
-        self._is_initialized = False
+        try:
+            self.engine.dispose()
+        except Exception as e:
+            logger.warning(f"Error during SQLite shutdown: {e}")
+        finally:
+            self._is_initialized = False
 
     async def get(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """获取 Session"""
         def _sync_get():
-            with Session(self.engine) as session:
-                statement = select(SessionModel).where(
-                    SessionModel.session_id == session_id
-                )
-                result = session.exec(statement).first()
-                return result.state_json if result else None
+            try:
+                with Session(self.engine) as session:
+                    statement = select(SessionModel).where(
+                        SessionModel.session_id == session_id
+                    )
+                    result = session.exec(statement).first()
+                    return result.state_json if result else None
+            except Exception as e:
+                raise e
 
-        # 卸载到线程池读取
-        json_str = await self._run_sync(_sync_get)
-        return self._deserialize(json_str)
+        try:
+            json_str = await self._run_sync(_sync_get)
+            return self._deserialize(json_str)
+        except Exception as e:
+            raise StorageError(f"SQLite get failed: {e}") from e
 
     async def set(self, session_id: str, state: Dict[str, Any]) -> None:
-        """保存 Session"""
         json_str = self._serialize(state)
 
         def _sync_set():
-            with Session(self.engine) as session:
-                # 查询是否存在
-                statement = select(SessionModel).where(
-                    SessionModel.session_id == session_id
-                )
-                existing = session.exec(statement).first()
-                
-                if existing:
-                    existing.state_json = json_str
-                    session.add(existing)
-                else:
-                    new_rec = SessionModel(
-                        session_id=session_id, 
-                        state_json=json_str
-                    )
-                    session.add(new_rec)
-                
-                session.commit()
+            # [修复] 在 Worker 线程内部获取文件锁
+            with self.file_lock_guard():
+                try:
+                    with Session(self.engine) as session:
+                        statement = select(SessionModel).where(
+                            SessionModel.session_id == session_id
+                        )
+                        existing = session.exec(statement).first()
+                        
+                        if existing:
+                            existing.state_json = json_str
+                            session.add(existing)
+                        else:
+                            new_rec = SessionModel(
+                                session_id=session_id, 
+                                state_json=json_str
+                            )
+                            session.add(new_rec)
+                        session.commit()
+                except Exception as e:
+                    raise e
 
-        # 写锁 + 线程卸载
-        async with self.write_guard():
-            await self._run_sync(_sync_set)
+        try:
+            # 获取协程锁 -> 切换线程 -> 获取文件锁 -> 操作 -> 释放
+            async with self.write_guard():
+                await self._run_sync(_sync_set)
+        except Exception as e:
+            raise StorageError(f"SQLite set failed: {e}") from e
 
     async def delete(self, session_id: str) -> None:
-        """删除 Session"""
         def _sync_delete():
-            with Session(self.engine) as session:
-                statement = select(SessionModel).where(
-                    SessionModel.session_id == session_id
-                )
-                result = session.exec(statement).first()
-                if result:
-                    session.delete(result)
-                    session.commit()
+            # [修复] 在 Worker 线程内部获取文件锁
+            with self.file_lock_guard():
+                try:
+                    with Session(self.engine) as session:
+                        statement = select(SessionModel).where(
+                            SessionModel.session_id == session_id
+                        )
+                        result = session.exec(statement).first()
+                        if result:
+                            session.delete(result)
+                            session.commit()
+                except Exception as e:
+                    raise e
         
-        # 写锁 + 线程卸载
-        async with self.write_guard():
-            await self._run_sync(_sync_delete)
+        try:
+            async with self.write_guard():
+                await self._run_sync(_sync_delete)
+        except Exception as e:
+            raise StorageError(f"SQLite delete failed: {e}") from e

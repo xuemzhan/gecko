@@ -1,168 +1,138 @@
-# examples/custom_storage_demo.py
+# examples/storage/custom_storage_demo.py
 import asyncio
-import os
 import json
-import tempfile
-import shutil
-from typing import Dict, Any
-from gecko.plugins.storage.abc import AbstractStorage
-from gecko.plugins.storage.mixins import ThreadOffloadMixin, AtomicWriteMixin, JSONSerializerMixin
-from gecko.plugins.storage.interfaces import SessionInterface
+import os
+from typing import Any, Dict, Optional
 
-class JsonFileStorage(
-    AbstractStorage, 
-    SessionInterface, 
-    ThreadOffloadMixin, 
-    AtomicWriteMixin, 
+# 导入 Gecko 的基类和 Mixin
+from gecko.plugins.storage.abc import AbstractStorage
+from gecko.plugins.storage.interfaces import SessionInterface
+from gecko.plugins.storage.mixins import (
+    ThreadOffloadMixin,
+    AtomicWriteMixin,
     JSONSerializerMixin
+)
+from gecko.plugins.storage.registry import register_storage
+
+# ================= 自定义实现 =================
+
+@register_storage("myjson")
+class SimpleJsonStorage(
+    AbstractStorage,
+    SessionInterface,
+    ThreadOffloadMixin,  # 1. 自动将 IO 放入线程池
+    AtomicWriteMixin,    # 2. 自动提供 FileLock 和 AsyncLock
+    JSONSerializerMixin  # 3. 提供 _serialize/_deserialize
 ):
     """
-    演示：一个简单的基于 JSON 文件的存储实现
-    
-    特性：
-    1. 线程安全（ThreadOffload）
-    2. 进程内写锁（AtomicWrite）
-    3. 自动序列化
-    4. [修复] 原子文件写入，防止并发读写时的竞态崩溃
+    一个极其简单但健壮的 JSON 文件存储
+    URL: myjson://./data.json
     """
     
     def __init__(self, url: str, **kwargs):
         super().__init__(url, **kwargs)
-        # 解析 path: json://./data.json -> ./data.json
-        self.file_path = url.replace("json://", "")
-    
+        # 解析路径: myjson://./data.json -> ./data.json
+        self.file_path = url.replace("myjson://", "")
+        
+        # [关键] 配置 FileLock，这样即使多个进程同时操作这个文件也不会坏
+        self.setup_multiprocess_lock(self.file_path)
+
     async def initialize(self) -> None:
-        print(f"[Init] Checking file: {self.file_path}")
-        # 在线程中检查文件
-        await self._run_sync(self._ensure_file)
+        """初始化：确保文件存在"""
+        if not os.path.exists(self.file_path):
+            # 使用 run_sync 在线程中执行文件写入
+            await self._run_sync(self._write_file, {})
+        self._is_initialized = True
+        print(f"[Init] Storage ready at {self.file_path}")
 
     async def shutdown(self) -> None:
-        print("[Shutdown] Storage closed")
+        self._is_initialized = False
 
-    def _ensure_file(self):
-        """同步文件检查逻辑"""
-        if not os.path.exists(self.file_path):
-            self._write_json_atomically({})
+    # --- 核心逻辑 (全部是同步写法，由 Mixin 处理异步) ---
 
-    def _write_json_atomically(self, data: Dict[str, Any]):
-        """
-        [核心修复] 原子写入文件
-        
-        步骤：
-        1. 写入临时文件
-        2. 原子重命名覆盖原文件
-        
-        这防止了 reader 在 writer 截断文件但未完成写入时读取到空文件。
-        """
-        dir_name = os.path.dirname(self.file_path) or "."
-        # 在同一目录下创建临时文件，确保原子重命名可行（跨分区无法原子重命名）
-        with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8", suffix=".tmp") as tmp_f:
-            json.dump(data, tmp_f, ensure_ascii=False, indent=2)
-            tmp_name = tmp_f.name
-        
-        # 原子替换
+    def _read_file(self) -> Dict[str, Any]:
         try:
-            shutil.move(tmp_name, self.file_path)
-        except Exception:
-            # 清理残余
-            if os.path.exists(tmp_name):
-                os.remove(tmp_name)
-            raise
+            with open(self.file_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
 
-    async def get(self, session_id: str) -> Dict[str, Any] | None:
-        def _read():
-            try:
-                with open(self.file_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    return data.get(session_id)
-            except (FileNotFoundError, json.JSONDecodeError):
-                return None
-        
-        # 卸载到线程池读取
-        return await self._run_sync(_read)
+    def _write_file(self, data: Dict[str, Any]):
+        with open(self.file_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    # --- 接口实现 ---
+
+    async def get(self, session_id: str) -> Optional[Dict[str, Any]]:
+        # 读操作：只需要卸载到线程池，不需要加写锁
+        data = await self._run_sync(self._read_file)
+        return data.get(session_id)
 
     async def set(self, session_id: str, state: Dict[str, Any]) -> None:
-        def _write():
-            # 1. 读取最新数据 (在写锁保护下，确保读-改-写的一致性)
-            try:
-                with open(self.file_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-            except (FileNotFoundError, json.JSONDecodeError):
-                data = {}
-            
-            # 2. 更新内存
+        # 写操作逻辑
+        def _do_update():
+            data = self._read_file()
             data[session_id] = state
-            
-            # 3. 原子写入磁盘
-            self._write_json_atomically(data)
+            self._write_file(data)
+            return len(data)
 
-        # 加锁 + 线程卸载
+        # [关键] 使用 write_guard 保护临界区 (包含 FileLock)
         async with self.write_guard():
-            await self._run_sync(_write)
+            count = await self._run_sync(_do_update)
+            print(f"   [Write] Saved session {session_id}. Total sessions: {count}")
 
     async def delete(self, session_id: str) -> None:
-        def _delete():
-            try:
-                with open(self.file_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-            except (FileNotFoundError, json.JSONDecodeError):
-                return
-
+        def _do_delete():
+            data = self._read_file()
             if session_id in data:
                 del data[session_id]
-                self._write_json_atomically(data)
-        
+                self._write_file(data)
+
         async with self.write_guard():
-            await self._run_sync(_delete)
+            await self._run_sync(_do_delete)
+
+# ================= 测试流程 =================
 
 async def main():
-    file_path = "demo_sessions.json"
-    # 清理旧文件防止干扰
-    if os.path.exists(file_path):
-        os.remove(file_path)
-
-    storage = JsonFileStorage(f"json://{file_path}")
+    db_file = "demo_custom.json"
+    url = f"myjson://{db_file}"
     
-    try:
-        # 1. 初始化
-        await storage.initialize()
-        
-        # 2. 写入数据
-        print("Writing session...")
-        await storage.set("user_1", {"name": "Alice", "history": ["Hi"]})
-        
-        # 3. 读取数据
-        data = await storage.get("user_1")
-        print(f"Read session: {data}")
-        
-        # 4. 并发写入测试
-        print("Testing concurrent writes...")
-        async def update_age(age):
-            # 模拟业务逻辑：读 -> 改 -> 写
-            # 注意：这里的业务逻辑本身在极端并发下存在"更新丢失"风险，
-            # 但我们要测试的是 storage 层不会崩溃。
-            s = await storage.get("user_1") or {}
-            s["age"] = age
-            await storage.set("user_1", s)
-            print(f"Updated age to {age}")
+    # 清理环境
+    if os.path.exists(db_file): os.remove(db_file)
+    if os.path.exists(db_file + ".lock"): os.remove(db_file + ".lock")
 
-        # 并发执行 5 次，增加压力
-        await asyncio.gather(
-            update_age(20),
-            update_age(25),
-            update_age(30),
-            update_age(35),
-            update_age(40)
-        )
+    print(f"🚀 Testing Custom Storage: {url}")
+    
+    # 1. 实例化 (无需工厂，直接用类演示，或通过 create_storage 也可以)
+    storage = SimpleJsonStorage(url)
+    await storage.initialize()
+
+    try:
+        # 2. 并发写入测试
+        print("\n⚡ Starting Concurrent Write Test...")
         
-        final_data = await storage.get("user_1")
-        print(f"Final data: {final_data}")
+        async def worker(idx):
+            # 模拟并发 Agent 写入
+            await storage.set(f"user_{idx}", {"score": idx * 10}) # type: ignore
         
+        # 启动 10 个并发任务
+        # 如果没有 AtomicWriteMixin，这里大概率会报 JSONDecodeError 或内容损坏
+        await asyncio.gather(*[worker(i) for i in range(10)])
+        
+        # 3. 验证结果
+        print("\n🔍 Verifying Data...")
+        all_data = await storage._run_sync(storage._read_file) # type: ignore
+        print(f"   Total Records: {len(all_data)}")
+        
+        assert len(all_data) == 10
+        assert all_data["user_9"]["score"] == 90
+        print("✅ Data integrity check passed!")
+
     finally:
         await storage.shutdown()
-        # 清理文件
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        # 清理
+        if os.path.exists(db_file): os.remove(db_file)
+        if os.path.exists(db_file + ".lock"): os.remove(db_file + ".lock")
 
 if __name__ == "__main__":
     asyncio.run(main())

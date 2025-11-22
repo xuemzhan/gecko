@@ -1,75 +1,79 @@
-# examples/sqlite_storage_demo.py
+# examples/storage/sqlite_storage_demo.py
 import asyncio
 import os
+import random
 import time
-from gecko.plugins.storage.backends.sqlite import SQLiteStorage
+from gecko.plugins.storage.factory import create_storage
+from gecko.core.exceptions import StorageError
+
+DB_PATH = "./demo_sqlite.db"
+DB_URL = f"sqlite:///{DB_PATH}"
 
 async def main():
-    db_path = "./demo_sqlite.db"
-    url = f"sqlite:///{db_path}"
+    # 清理旧数据
+    if os.path.exists(DB_PATH):
+        os.remove(DB_PATH)
+    if os.path.exists(DB_PATH + ".lock"):
+        os.remove(DB_PATH + ".lock")
+
+    print(f"🚀 Initializing SQLite Storage at {DB_URL}")
     
-    print(f"🚀 Initializing SQLite Storage at {url}")
-    
-    # 1. 创建实例
-    storage = SQLiteStorage(url)
+    # 1. 创建实例 (会自动启用 WAL 和 FileLock)
+    storage = await create_storage(DB_URL)
     
     try:
-        # 2. 初始化 (建表, WAL)
-        await storage.initialize()
-        
-        # 3. 写入测试
-        print("\n💾 Saving session data...")
-        session_id = "user_session_123"
-        data = {
-            "name": "Gecko Agent",
-            "role": "Assistant",
-            "history": [
-                {"role": "user", "content": "Hello"},
-                {"role": "assistant", "content": "Hi there!"}
-            ],
-            "metadata": {"timestamp": time.time()}
-        }
-        await storage.set(session_id, data)
-        print("✅ Saved.")
-        
-        # 4. 读取测试
-        print("\n📖 Reading session data...")
-        loaded_data = await storage.get(session_id)
-        print(f"✅ Loaded: {loaded_data['name']} (History: {len(loaded_data['history'])} msgs)")
-        
-        # 5. 更新测试
-        print("\n🔄 Updating session data...")
-        loaded_data["metadata"]["updated"] = True
-        await storage.set(session_id, loaded_data)
-        
-        # 6. 并发测试 (验证是否阻塞)
-        print("\n⚡ Testing concurrency (Non-blocking check)...")
-        start_time = time.time()
-        
-        async def background_writer(idx):
-            # 模拟写入
-            await storage.set(f"bg_sess_{idx}", {"idx": idx})
-            return idx
+        # 2. 基础操作
+        session_id = "user_123"
+        await storage.set(session_id, {"name": "Alice", "balance": 100}) # type: ignore
+        print("✅ Basic CRUD operational.")
 
-        # 同时发起 10 个写操作
-        tasks = [background_writer(i) for i in range(10)]
-        # 同时做一个 Sleep 模拟 Event Loop 其他任务
-        tasks.append(asyncio.sleep(0.1))
+        # 3. [新特性] 并发压力测试 (验证锁机制)
+        # 模拟多个协程同时读取并更新同一个 Key
+        # 如果没有锁，可能会遇到 "database is locked" 或者更新丢失
+        print("\n⚡ Starting Concurrency Stress Test (10 concurrent updates)...")
         
-        await asyncio.gather(*tasks)
+        concurrency_level = 10
+        target_session = "counter_session"
+        await storage.set(target_session, {"count": 0}) # type: ignore
+        
+        async def worker(idx):
+            # 模拟随机延迟
+            await asyncio.sleep(random.uniform(0.001, 0.01))
+            
+            # 读-改-写 (注意：应用层的原子性仍需分布式锁，但这里测试的是 DB 层不崩)
+            # 我们使用 AtomicWriteMixin 的 write_guard 也可以在应用层加锁，
+            # 但 storage.set 内部已经加了锁，保证单次 set 是安全的。
+            # 为了测试 storage 的健壮性，我们只单纯疯狂写入。
+            try:
+                # 获取当前值（为了模拟负载）
+                await storage.get(target_session) # type: ignore
+                # 写入新值
+                await storage.set(f"worker_{idx}", {"data": "x" * 100}) # type: ignore
+                return True
+            except StorageError as e:
+                print(f"❌ Worker {idx} failed: {e}")
+                return False
+
+        start_time = time.time()
+        results = await asyncio.gather(*[worker(i) for i in range(concurrency_level)])
         duration = time.time() - start_time
-        print(f"✅ Concurrency test passed in {duration:.3f}s")
         
+        success_count = sum(results)
+        print(f"✅ Finished in {duration:.3f}s. Success: {success_count}/{concurrency_level}")
+        
+        if success_count == concurrency_level:
+            print("🎉 Concurrency test PASSED (No locking errors)")
+        else:
+            print("⚠️ Some writes failed (Check logs)")
+
     finally:
-        # 7. 关闭
         await storage.shutdown()
         # 清理
-        if os.path.exists(db_path):
-            os.remove(db_path)
-            # WAL 模式会产生 .wal 和 .shm 文件
-            if os.path.exists(db_path + "-wal"): os.remove(db_path + "-wal")
-            if os.path.exists(db_path + "-shm"): os.remove(db_path + "-shm")
-        print("\n👋 Cleanup done.")
+        if os.path.exists(DB_PATH): os.remove(DB_PATH)
+        if os.path.exists(DB_PATH + ".lock"): os.remove(DB_PATH + ".lock")
+        # WAL 文件
+        if os.path.exists(DB_PATH + "-wal"): os.remove(DB_PATH + "-wal")
+        if os.path.exists(DB_PATH + "-shm"): os.remove(DB_PATH + "-shm")
 
 if __name__ == "__main__":
     asyncio.run(main())

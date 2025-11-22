@@ -3,6 +3,9 @@
 业务接口定义
 
 定义 Session（会话存储）和 Vector（向量存储）的标准行为。
+
+更新日志：
+- [Feat] VectorInterface.search 增加 filters 参数，支持元数据过滤。
 """
 from __future__ import annotations
 
@@ -72,13 +75,19 @@ class VectorInterface(Protocol):
         ...
 
     @abstractmethod
-    async def search(self, query_embedding: List[float], top_k: int = 5) -> List[Dict[str, Any]]:
+    async def search(
+        self, 
+        query_embedding: List[float], 
+        top_k: int = 5,
+        filters: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
         """
         向量相似度搜索
         
         参数:
             query_embedding: 查询向量
             top_k: 返回结果数量
+            filters: 元数据过滤条件 (Key-Value 精确匹配)
             
         返回:
             包含 text, metadata, score 的结果列表

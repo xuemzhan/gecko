@@ -1,0 +1,175 @@
+gecko/
+├── examples/
+│   ├── core/
+│   │   ├── engine_base_demo.py
+│   │   ├── engine_react_demo.py
+│   │   ├── events_demo.py
+│   │   ├── memory_demo.py
+│   │   ├── message_demo.py
+│   │   ├── output_demo.py
+│   │   ├── prompt_demo.py
+│   │   ├── protocol_demo.py
+│   │   ├── session_demo.py
+│   │   ├── structure_demo.py
+│   │   ├── toolbox_demo.py
+│   │   └── utils_demo.py
+│   ├── models/
+│   │   └── models_demo.py
+│   ├── storage/
+│   │   ├── custom_storage_demo.py
+│   │   ├── redis_storage_demo.py
+│   │   ├── sqlite_storage_demo.py
+│   │   └── vector_storage_demo.py
+│   ├── tools/
+│   │   └── tools_demo.py
+│   ├── fast_dev_demo.py
+│   ├── full_tool_test.py
+│   ├── mock_test.py
+│   ├── multi_tool.py
+│   ├── rag_agent.py
+│   ├── team_demo.py
+│   ├── team_of_agents.py
+│   ├── workflow_dag.py
+│   ├── workflow_demo.py
+│   └── zhipu_agent.py
+├── gecko/
+│   ├── compose/
+│   │   ├── __init__.py
+│   │   ├── nodes.py
+│   │   ├── team.py
+│   │   └── workflow.py
+│   ├── core/
+│   │   ├── engine/
+│   │   │   ├── base.py
+│   │   │   └── react.py
+│   │   ├── __init__.py
+│   │   ├── agent.py
+│   │   ├── builder.py
+│   │   ├── events.py
+│   │   ├── exceptions.py
+│   │   ├── logging.py
+│   │   ├── memory.py
+│   │   ├── message.py
+│   │   ├── output.py
+│   │   ├── prompt.py
+│   │   ├── protocols.py
+│   │   ├── session.py
+│   │   ├── structure.py
+│   │   ├── toolbox.py
+│   │   └── utils.py
+│   ├── plugins/
+│   │   ├── guardrails/
+│   │   │   ├── __init__.py
+│   │   │   └── pii.py
+│   │   ├── knowledge/
+│   │   │   ├── __init__.py
+│   │   │   ├── base.py
+│   │   │   ├── default.py
+│   │   │   ├── document.py
+│   │   │   ├── embedders.py
+│   │   │   ├── interfaces.py
+│   │   │   ├── pipeline.py
+│   │   │   ├── readers.py
+│   │   │   ├── splitters.py
+│   │   │   └── tool.py
+│   │   ├── models/
+│   │   │   ├── drivers/
+│   │   │   │   └── litellm_driver.py
+│   │   │   ├── presets/
+│   │   │   │   ├── ollama.py
+│   │   │   │   ├── openai.py
+│   │   │   │   ├── zhipu.py
+│   │   │   │   └── zhipu.py.bak
+│   │   │   ├── __init__.py
+│   │   │   ├── adapter.py
+│   │   │   ├── base.py
+│   │   │   ├── chat.py
+│   │   │   ├── config.py
+│   │   │   ├── embedding.py
+│   │   │   ├── factory.py
+│   │   │   ├── README.md
+│   │   │   └── registry.py
+│   │   ├── storage/
+│   │   │   ├── backends/
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── chroma.py
+│   │   │   │   ├── lancedb.py
+│   │   │   │   ├── redis.py
+│   │   │   │   └── sqlite.py
+│   │   │   ├── __init__.py
+│   │   │   ├── abc.py
+│   │   │   ├── factory.py
+│   │   │   ├── interfaces.py
+│   │   │   ├── mixins.py
+│   │   │   ├── registry.py
+│   │   │   └── utils.py
+│   │   ├── tools/
+│   │   │   ├── standard/
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── calculator.py
+│   │   │   │   └── duckduckgo.py
+│   │   │   ├── __init__.py
+│   │   │   ├── base.py
+│   │   │   └── registry.py
+│   │   ├── __init__.py
+│   │   ├── base.py
+│   │   └── registry.py
+│   ├── utils/
+│   │   └── cleanup.py
+│   ├── __init__.py
+│   └── config.py
+├── gecko-compat/
+│   └── __init__.py
+├── scripts/
+│   ├── create_project.sh
+│   ├── publish.py
+│   ├── run_tests.sh
+│   ├── scan_folder.py
+│   ├── scan_pyfiles.py
+│   └── verify_phase1.py
+├── tests/
+│   ├── compose/
+│   │   ├── test_nodes.py
+│   │   ├── test_team.py
+│   │   └── test_workflow.py
+│   ├── core/
+│   │   ├── test_agent.py
+│   │   ├── test_engine_base.py
+│   │   ├── test_events.py
+│   │   ├── test_memory.py
+│   │   ├── test_message.py
+│   │   ├── test_output.py
+│   │   ├── test_prompt.py
+│   │   ├── test_protocols.py
+│   │   ├── test_react.py
+│   │   ├── test_session.py
+│   │   ├── test_storage.py
+│   │   ├── test_structure.py
+│   │   ├── test_toolbox.py
+│   │   └── test_utils.py
+│   ├── performance/
+│   │   ├── test_performance.py
+│   │   └── test_phase2_benchmarks.py
+│   ├── plugins/
+│   │   ├── mod/
+│   │   ├── models/
+│   │   │   └── test_models.py
+│   │   ├── storage/
+│   │   │   ├── test_redis_and_factory.py
+│   │   │   ├── test_sqlite.py
+│   │   │   ├── test_storage_core.py
+│   │   │   └── test_vector_backends.py
+│   │   └── tools/
+│   │       └── test_tools.py
+│   ├── utils/
+│   │   └── test_cleanup.py
+│   ├── __init__.py
+│   ├── conftest.py
+│   └── test_config.py
+├── CHANGELOG.md
+├── LICENSE
+├── pyproject.toml
+├── README.md
+├── requirements-dev.lock
+├── requirements.lock
+└── requirements.txt

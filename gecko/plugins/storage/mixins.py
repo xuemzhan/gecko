@@ -3,13 +3,16 @@
 存储功能混入类 (Mixins)
 
 包含解决异步阻塞、并发冲突和数据序列化的通用逻辑。
-这是本次重构的核心，用于修复 Event Loop 阻塞问题。
+
+更新日志：
+- [Arch] 引入 FileLock 实现跨进程文件锁，解决多进程环境下 SQLite/文件存储的并发安全问题。
+- [Fix] 分离 asyncio.Lock (write_guard) 和 FileLock (file_lock_guard) 以避免死锁。
 """
 from __future__ import annotations
 
 import asyncio
 import json
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from functools import partial
 from typing import Any, Callable, TypeVar, Optional
 
@@ -18,6 +21,13 @@ from anyio import to_thread
 from gecko.core.logging import get_logger
 
 logger = get_logger(__name__)
+
+# 尝试导入 filelock，用于跨进程文件锁
+try:
+    from filelock import FileLock
+    FILELOCK_AVAILABLE = True
+except ImportError:
+    FILELOCK_AVAILABLE = False
 
 T = TypeVar("T")
 
@@ -51,35 +61,71 @@ class ThreadOffloadMixin:
 
 class AtomicWriteMixin:
     """
-    [核心] 原子写混入类
+    [核心] 原子写混入类 (增强版)
     
-    提供应用层的异步写锁，防止文件型数据库（如 SQLite, LanceDB）
-    在并发写入时发生 'database is locked' 错误。
+    提供双层锁机制：
+    1. asyncio.Lock: 保证单进程内协程的互斥 (write_guard)。
+    2. FileLock: 保证跨进程（如 Gunicorn Worker）对同一文件的互斥访问 (file_lock_guard)。
     
-    修复：使用 Lazy Loading 替代 __init__，防止多重继承时初始化链断裂。
+    使用方法：
+        1. 在子类 __init__ 中调用 self.setup_multiprocess_lock(path) 启用文件锁。
+        2. 在 async 方法中由于 await _run_sync 调用前使用 async with self.write_guard()。
+        3. 在 _run_sync 调用的同步函数内部使用 with self.file_lock_guard()。
     """
     
     _write_lock: Optional[asyncio.Lock] = None
+    _file_lock: Any = None
 
     @property
     def write_lock(self) -> asyncio.Lock:
-        """懒加载获取锁"""
-        # 注意：这里需要处理 _write_lock 可能不存在的情况（虽然类属性已定义）
+        """懒加载获取协程锁"""
         if getattr(self, "_write_lock", None) is None:
             self._write_lock = asyncio.Lock()
         return self._write_lock # type: ignore
 
+    def setup_multiprocess_lock(self, lock_path: str) -> None:
+        """
+        配置跨进程文件锁
+        
+        参数:
+            lock_path: 锁文件路径（通常是数据库文件路径）
+        """
+        if not FILELOCK_AVAILABLE:
+            logger.warning(
+                "filelock module not installed. Cross-process safety is NOT guaranteed. "
+                "Install with: pip install filelock"
+            )
+            return
+
+        try:
+            # 创建 .lock 文件
+            self._file_lock = FileLock(f"{lock_path}.lock") # type: ignore
+            logger.debug("FileLock initialized", path=f"{lock_path}.lock")
+        except Exception as e:
+            logger.error("Failed to initialize FileLock", error=str(e))
+
     @asynccontextmanager
     async def write_guard(self):
         """
-        写操作保护上下文
+        写操作保护上下文 (Async)
         
-        示例:
-            async with self.write_guard():
-                await self._run_sync(sync_write_func)
+        只负责进程内协程互斥。
         """
-        # 使用 property 获取锁
         async with self.write_lock:
+            yield
+
+    @contextmanager
+    def file_lock_guard(self):
+        """
+        跨进程文件锁 (Sync)
+        
+        必须在 Worker 线程（_run_sync 调用的函数）内部使用。
+        确保 acquire/release 在同一个线程中执行，避免 Reentrancy 问题。
+        """
+        if self._file_lock:
+            with self._file_lock:
+                yield
+        else:
             yield
 
 

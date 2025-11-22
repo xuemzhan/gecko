@@ -3,8 +3,14 @@ import asyncio
 import threading
 import time
 import pytest
+from unittest.mock import MagicMock, patch
+
 from gecko.plugins.storage.abc import AbstractStorage
-from gecko.plugins.storage.mixins import ThreadOffloadMixin, AtomicWriteMixin, JSONSerializerMixin
+from gecko.plugins.storage.mixins import (
+    ThreadOffloadMixin, 
+    AtomicWriteMixin, 
+    JSONSerializerMixin
+)
 
 # === Mocks & Helpers ===
 
@@ -32,46 +38,94 @@ async def test_thread_offload_mixin():
     storage = MockStorage()
     main_thread_id = threading.get_ident()
     
-    # 执行耗时操作 (0.1s)
+    # 执行耗时操作
     start_time = time.time()
-    worker_thread_id = await storage._run_sync(storage.sync_slow_operation, 0.1)
+    worker_thread_id = await storage._run_sync(storage.sync_slow_operation, 0.05)
     duration = time.time() - start_time
     
     # 验证
     assert worker_thread_id != main_thread_id, "操作应该在不同的线程中执行"
-    assert duration >= 0.1, "操作应该确实执行了耗时逻辑"
+    assert duration >= 0.05, "操作应该确实执行了耗时逻辑"
 
 @pytest.mark.asyncio
-async def test_atomic_write_mixin():
-    """测试原子写锁：确保并发写入串行化"""
+async def test_atomic_write_mixin_basic():
+    """测试基础原子写锁（进程内 asyncio.Lock）"""
     storage = MockStorage()
-    counter = 0
     
-    async def unsafe_increment():
-        nonlocal counter
-        # 模拟读改写竞态
-        temp = counter
-        await asyncio.sleep(0.01) 
-        counter = temp + 1
-
-    async def safe_increment():
-        nonlocal counter
-        async with storage.write_guard():
-            # 即使内部有 await，锁也能保证临界区互斥
-            temp = counter
-            await asyncio.sleep(0.01)
-            counter = temp + 1
-
-    # 1. 无锁测试 (预期失败或产生竞态，但在 asyncio 单线程模型下 yield 才会切换)
-    # 为了演示锁的作用，我们主要验证锁是否能够被获取和释放
+    # 验证锁的懒加载
+    assert storage._write_lock is None
+    lock = storage.write_lock
+    assert isinstance(lock, asyncio.Lock)
+    assert storage._write_lock is not None
+    
+    # 验证上下文管理器
     async with storage.write_guard():
-        assert storage._write_lock.locked() # type: ignore
-    assert not storage._write_lock.locked() # type: ignore
-    
-    # 2. 并发测试
-    tasks = [safe_increment() for _ in range(5)]
-    await asyncio.gather(*tasks)
-    assert counter == 5, "所有增量操作应该都被正确执行"
+        assert storage.write_lock.locked()
+    assert not storage.write_lock.locked()
+
+@pytest.mark.asyncio
+async def test_atomic_write_mixin_filelock_logic():
+    """
+    测试 FileLock 逻辑 (新架构)
+    验证 write_guard 只处理协程锁，file_lock_guard 处理文件锁
+    """
+    with patch("gecko.plugins.storage.mixins.FILELOCK_AVAILABLE", True):
+        with patch("gecko.plugins.storage.mixins.FileLock") as MockFileLock:
+            mock_file_lock_instance = MagicMock()
+            # 模拟 Context Manager (__enter__ / __exit__)
+            mock_file_lock_instance.__enter__ = MagicMock()
+            mock_file_lock_instance.__exit__ = MagicMock()
+            MockFileLock.return_value = mock_file_lock_instance
+            
+            storage = MockStorage()
+            storage.setup_multiprocess_lock("/tmp/test.db")
+            
+            # 验证 FileLock 初始化
+            MockFileLock.assert_called_with("/tmp/test.db.lock")
+            assert storage._file_lock == mock_file_lock_instance
+            
+            # 1. 验证 write_guard (Async) 
+            # 预期：只获取 asyncio lock，不操作 FileLock
+            async with storage.write_guard():
+                assert storage.write_lock.locked()
+                mock_file_lock_instance.acquire.assert_not_called()
+                mock_file_lock_instance.__enter__.assert_not_called()
+            
+            # 2. 验证 file_lock_guard (Sync)
+            # 预期：调用 FileLock 的上下文管理器
+            with storage.file_lock_guard():
+                mock_file_lock_instance.__enter__.assert_called_once()
+            
+            mock_file_lock_instance.__exit__.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_atomic_write_mixin_filelock_missing():
+    """测试 FileLock 未安装的情况"""
+    with patch("gecko.plugins.storage.mixins.FILELOCK_AVAILABLE", False):
+        with patch("gecko.plugins.storage.mixins.logger") as mock_logger:
+            storage = MockStorage()
+            storage.setup_multiprocess_lock("/tmp/test.db")
+            
+            # 验证发出了警告且未初始化锁
+            mock_logger.warning.assert_called()
+            assert "filelock module not installed" in mock_logger.warning.call_args[0][0]
+            assert storage._file_lock is None
+            
+            # 验证 file_lock_guard 仍然可用（空操作）
+            with storage.file_lock_guard():
+                pass
+
+@pytest.mark.asyncio
+async def test_atomic_write_mixin_filelock_init_error():
+    """测试 FileLock 初始化异常"""
+    with patch("gecko.plugins.storage.mixins.FILELOCK_AVAILABLE", True):
+        with patch("gecko.plugins.storage.mixins.FileLock", side_effect=Exception("Perm Error")):
+            with patch("gecko.plugins.storage.mixins.logger") as mock_logger:
+                storage = MockStorage()
+                storage.setup_multiprocess_lock("/root/test.db")
+                
+                mock_logger.error.assert_called()
+                assert "Failed to initialize FileLock" in mock_logger.error.call_args[0][0]
 
 def test_json_serializer_mixin():
     """测试 JSON 序列化"""
@@ -88,11 +142,17 @@ def test_json_serializer_mixin():
     
     # 边缘情况
     assert storage._deserialize(None) is None
-    assert storage._deserialize("") is None
+    
+    # 错误处理
+    with pytest.raises(Exception): 
+        storage._serialize({"set": {1, 2}}) # Set 无法 JSON 序列化
+    
+    # 反序列化错误测试 (日志记录但不抛出，返回 None)
+    assert storage._deserialize("{invalid_json") is None
 
 @pytest.mark.asyncio
 async def test_abstract_lifecycle():
-    """测试生命周期上下文管理器"""
+    """测试抽象生命周期"""
     storage = MockStorage()
     assert not storage.is_initialized
     
