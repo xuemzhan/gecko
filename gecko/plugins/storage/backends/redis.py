@@ -3,10 +3,11 @@
 Redis 存储后端
 
 基于 redis-py (asyncio) 实现的高性能会话存储。
-Redis 原生支持异步，因此**不需要** ThreadOffloadMixin。
+由于 Redis 客户端原生支持 asyncio，因此不需要使用 ThreadOffloadMixin。
 
-支持接口:
-1. SessionInterface: 会话存储 (Key-Value)
+核心特性：
+1. **原生异步**：直接利用 asyncio Event Loop，性能极高。
+2. **TTL 管理**：支持会话自动过期。
 """
 from __future__ import annotations
 
@@ -36,7 +37,8 @@ class RedisStorage(
     """
     Redis 会话存储
     
-    URL 示例: redis://localhost:6379/0?ttl=3600
+    URL 示例: 
+        redis://localhost:6379/0?ttl=3600
     """
     
     def __init__(self, url: str, **kwargs):
@@ -49,7 +51,11 @@ class RedisStorage(
         scheme, path, params = parse_storage_url(url)
         
         # 解析 TTL 参数 (默认 7 天)
-        self.ttl = int(params.get("ttl", 3600 * 24 * 7))
+        try:
+            self.ttl = int(params.get("ttl", 3600 * 24 * 7))
+        except ValueError:
+            self.ttl = 3600 * 24 * 7
+            
         self.prefix = kwargs.get("prefix", "gecko:session:")
         
         # 客户端引用 (延迟初始化)
@@ -71,11 +77,14 @@ class RedisStorage(
         )
         
         try:
-            await self.client.ping() # type: ignore
+            # Ping 测试确保连接可用
+            if self.client:
+                await self.client.ping()
             self._is_initialized = True
             logger.debug("Redis connected successfully")
         except Exception as e:
             logger.error("Failed to connect to Redis", error=str(e))
+            # 连接失败时确保清理资源
             await self.shutdown()
             raise
 

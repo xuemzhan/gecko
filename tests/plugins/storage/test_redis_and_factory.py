@@ -40,10 +40,10 @@ async def test_redis_lifecycle():
 async def test_redis_operations():
     """测试 Redis CRUD"""
     storage = RedisStorage("redis://localhost:6379/0")
-    storage.client = mock_redis_client # 手动注入 Mock client
+    storage.client = mock_redis_client # type: ignore # 手动注入 Mock client
     
     # Set
-    await storage.set("s1", {"a": 1})
+    await storage.set("s1", {"a": 1}) # type: ignore
     mock_redis_client.setex.assert_awaited_with(
         "gecko:session:s1", 
         3600*24*7, 
@@ -52,11 +52,11 @@ async def test_redis_operations():
     
     # Get
     mock_redis_client.get.return_value = '{"a": 1}'
-    data = await storage.get("s1")
+    data = await storage.get("s1") # type: ignore
     assert data == {"a": 1}
     
     # Delete
-    await storage.delete("s1")
+    await storage.delete("s1") # type: ignore
     mock_redis_client.delete.assert_awaited_with("gecko:session:s1")
 
 @pytest.mark.asyncio
