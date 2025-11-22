@@ -6,7 +6,7 @@ from gecko.plugins.models.zhipu import glm_4_5_air
 
 # 自动加载所有工具（只需 import）
 from gecko.plugins.tools.standard.calculator import CalculatorTool  # noqa: F401
-from gecko.plugins.tools.standard.duckduckgo import DuckDuckGoSearch  # noqa: F401
+from gecko.plugins.tools.standard.duckduckgo import DuckDuckGoSearchTool  # noqa: F401
 
 async def main():
     agent = AgentBuilder()\

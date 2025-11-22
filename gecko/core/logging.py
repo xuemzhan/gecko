@@ -61,7 +61,7 @@ def _setup_structlog(level: int):
     """配置 structlog"""
     structlog.configure(
         processors=[
-            structlog.contextvars.merge_contextvars,
+            structlog.contextvars.merge_contextvars, 
             structlog.processors.add_log_level,
             structlog.processors.StackInfoRenderer(),
             structlog.dev.set_exc_info,
