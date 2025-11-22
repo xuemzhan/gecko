@@ -79,7 +79,7 @@ async def ensure_awaitable(
             coro = result
         else:
             # 同步函数，直接返回结果
-            return result
+            return result # type: ignore
     
     # 执行异步函数（带可选超时）
     if timeout:
@@ -119,7 +119,7 @@ def run_sync(coro: Awaitable[T]) -> T:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         # 没有运行中的 loop，直接 run
-        return asyncio.run(coro)
+        return asyncio.run(coro) # type: ignore
     
     if loop.is_running():
         # ⚠️ 检测到嵌套循环
@@ -227,7 +227,7 @@ async def retry_async(
             await asyncio.sleep(current_delay)
             current_delay *= backoff
     
-    raise last_exception
+    raise last_exception # type: ignore
 
 
 def retry(
@@ -283,7 +283,7 @@ def retry(
                         time.sleep(current_delay)
                         current_delay *= backoff
                 
-                raise last_exception
+                raise last_exception # type: ignore
             
             return sync_wrapper
     
@@ -440,7 +440,7 @@ def format_size(size_bytes: int) -> str:
     for unit in ["B", "KB", "MB", "GB", "TB"]:
         if size_bytes < 1024.0:
             return f"{size_bytes:.2f} {unit}"
-        size_bytes /= 1024.0
+        size_bytes /= 1024.0 # type: ignore
     return f"{size_bytes:.2f} PB"
 
 
@@ -533,7 +533,7 @@ class Timer:
     
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.end_time = time.time()
-        self.elapsed = self.end_time - self.start_time
+        self.elapsed = self.end_time - self.start_time # type: ignore
         
         if self.log:
             logger.info(

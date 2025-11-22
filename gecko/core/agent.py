@@ -80,7 +80,7 @@ class Agent:
   
         await self.event_bus.publish(AgentRunEvent(type="stream_started"))  
         try:  
-            async for chunk in self.engine.step_stream(input_msgs):  
+            async for chunk in self.engine.step_stream(input_msgs):   # type: ignore
                 yield chunk  
             await self.event_bus.publish(AgentRunEvent(type="stream_completed"))  
         except Exception as e:  
@@ -117,7 +117,7 @@ class Agent:
             if not messages:  
                 raise AgentError("消息列表为空")  
             if isinstance(messages[0], Message):  
-                return messages  # 已经是标准 Message  
+                return messages  # type: ignore # 已经是标准 Message  
             normalized = []  
             for item in messages:  
                 if isinstance(item, Message):  

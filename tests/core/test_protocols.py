@@ -329,13 +329,13 @@ class TestProtocols:
                 "prompt_tokens": 10,
                 "completion_tokens": 5,
                 "total_tokens": 15
-            }
+            } # type: ignore
         )
         
         assert response.model == "gpt-4"
         assert len(response.choices) == 1
         assert response.choices[0].message["content"] == "Hello!"
-        assert response.usage.total_tokens == 15
+        assert response.usage.total_tokens == 15 # type: ignore
     
     def test_stream_chunk_properties(self):
         """测试 StreamChunk 属性"""

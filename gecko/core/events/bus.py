@@ -1,48 +1,12 @@
-# gecko/core/events.py
-"""
-事件总线
-
-提供异步事件发布/订阅机制，支持中间件和后台任务管理。
-
-核心功能：
-1. 强类型事件（基于 Pydantic）
-2. 异步/同步订阅者支持
-3. 中间件拦截与处理
-4. 健壮的后台任务管理（任务追踪与优雅关闭）
-
-优化日志：
-1. 增加后台任务追踪集合，防止任务被 GC
-2. 增加 shutdown 方法等待后台任务完成
-3. 增加上下文管理器支持
-4. 优化中间件错误处理
-5. 修复对异步可调用对象（非函数）的支持
-"""
-
+"""事件总线逻辑"""
 from __future__ import annotations
-
 import asyncio
 import inspect
-import time
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Type, Union
-
-from pydantic import BaseModel, Field
-
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Union
 from gecko.core.logging import get_logger
+from gecko.core.events.types import BaseEvent
 
 logger = get_logger(__name__)
-
-
-# ===== 事件模型 =====
-
-class BaseEvent(BaseModel):
-    """事件基类"""
-    type: str
-    timestamp: float = Field(default_factory=time.time)
-    data: Dict[str, Any] = Field(default_factory=dict)
-    error: Optional[str] = None
-    
-    model_config = {"arbitrary_types_allowed": True}
-
 
 # EventHandler 可以是返回 None 的同步函数，或者返回 Awaitable 的函数
 EventHandler = Callable[[BaseEvent], Union[Awaitable[None], None, Any]]
@@ -108,7 +72,7 @@ class EventBus:
         # 1. 执行中间件
         try:
             for mw in self._middlewares:
-                event = await mw(event)
+                event = await mw(event) # type: ignore
                 if event is None:
                     logger.debug("Event blocked by middleware", event_type=original_type)
                     return
@@ -177,15 +141,3 @@ class EventBus:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.shutdown()
-
-
-# ==== 常用事件类型 ====
-
-class AgentRunEvent(BaseEvent):
-    """Agent 运行过程事件"""
-    pass
-
-
-class WorkflowEvent(BaseEvent):
-    """Workflow 运行过程事件"""
-    pass

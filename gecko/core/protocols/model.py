@@ -1,0 +1,110 @@
+"""
+LLM 模型相关协议与数据结构
+"""
+from __future__ import annotations
+from typing import Any, Dict, List, Optional, Protocol, AsyncIterator, runtime_checkable
+from pydantic import BaseModel, Field
+from gecko.core.protocols.base import check_protocol, get_missing_methods
+
+# ====================== 模型响应格式 ======================
+
+class CompletionChoice(BaseModel):
+    """单个补全选择"""
+    index: int = 0
+    message: Dict[str, Any]
+    finish_reason: Optional[str] = None
+    logprobs: Optional[Dict[str, Any]] = None
+
+class CompletionUsage(BaseModel):
+    """Token 使用统计"""
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+class CompletionResponse(BaseModel):
+    """标准的模型补全响应格式"""
+    id: str = Field(default="", description="响应 ID")
+    object: str = Field(default="chat.completion", description="对象类型")
+    created: int = Field(default=0, description="创建时间戳")
+    model: str = Field(default="", description="模型名称")
+    choices: List[CompletionChoice] = Field(default_factory=list)
+    usage: Optional[CompletionUsage] = Field(default=None)
+    system_fingerprint: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+class StreamChunk(BaseModel):
+    """流式响应的单个数据块"""
+    id: str = ""
+    object: str = "chat.completion.chunk"
+    created: int = 0
+    model: str = ""
+    choices: List[Dict[str, Any]] = Field(default_factory=list)
+    
+    @property
+    def delta(self) -> Dict[str, Any]:
+        if self.choices:
+            return self.choices[0].get("delta", {})
+        return {}
+    
+    @property
+    def content(self) -> Optional[str]:
+        return self.delta.get("content")
+
+# ====================== 模型协议 ======================
+
+@runtime_checkable
+class ModelProtocol(Protocol):
+    """LLM 模型核心协议"""
+    async def acompletion(self, messages: List[Dict[str, Any]], **kwargs) -> CompletionResponse:
+        ...
+
+@runtime_checkable
+class StreamableModelProtocol(ModelProtocol, Protocol):
+    """支持流式输出的模型协议"""
+    async def astream(self, messages: List[Dict[str, Any]], **kwargs) -> AsyncIterator[StreamChunk]:
+        ...
+        yield # type: ignore
+
+# ====================== 工具函数 ======================
+
+def supports_streaming(model: Any) -> bool:
+    return isinstance(model, StreamableModelProtocol)
+
+def supports_function_calling(model: Any) -> bool:
+    if hasattr(model, "_supports_function_calling"):
+        return model._supports_function_calling
+    if hasattr(model, "supports_function_calling"):
+        method = getattr(model, "supports_function_calling")
+        if callable(method):
+            return method() # type: ignore
+    return False
+
+def supports_vision(model: Any) -> bool:
+    if hasattr(model, "_supports_vision"):
+        return model._supports_vision
+    if hasattr(model, "supports_vision"):
+        method = getattr(model, "supports_vision")
+        if callable(method):
+            return method() # type: ignore
+    return False
+
+def get_model_name(model: Any) -> str:
+    if hasattr(model, "model_name"): return model.model_name
+    if hasattr(model, "name"): return model.name
+    return model.__class__.__name__
+
+def validate_model(model: Any) -> None:
+    """
+    验证模型
+    
+    修复点：
+    调整错误消息格式，包含 "does not implement ModelProtocol" 以匹配测试正则。
+    """
+    if not isinstance(model, ModelProtocol):
+        missing = get_missing_methods(model, ModelProtocol)
+        # 之前的写法: raise TypeError(f"Model missing methods: {', '.join(missing)}")
+        # 修正后的写法:
+        raise TypeError(
+            f"Model does not implement ModelProtocol. "
+            f"Missing methods: {', '.join(missing) if missing else 'unknown'}"
+        )

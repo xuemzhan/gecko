@@ -175,7 +175,7 @@ class StructureEngine:
                 return [resolve_ref(item) for item in obj]
             return obj
 
-        return resolve_ref(schema)
+        return resolve_ref(schema) # type: ignore
     
     # ===== 解析方法 =====
     
@@ -232,8 +232,8 @@ class StructureEngine:
             # [修复] 增加 and e.attempts 判断
             # 如果子异常有 attempts 且不为空，说明是深层策略失败，合并历史
             # 否则（如快速失败），将其视为当前步骤的一个错误记录下来
-            if hasattr(e, 'attempts') and e.attempts:
-                attempts.extend(e.attempts)
+            if hasattr(e, 'attempts') and e.attempts: # type: ignore
+                attempts.extend(e.attempts) # type: ignore
             else:
                 attempts.append({
                     "strategy": "text_extraction",

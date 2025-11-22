@@ -1,0 +1,9 @@
+"""向量存储协议"""
+from __future__ import annotations
+from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
+
+@runtime_checkable
+class VectorStoreProtocol(Protocol):
+    async def add(self, ids: List[str], vectors: List[List[float]], metadata: Optional[List[Dict[str, Any]]] = None) -> None: ...
+    async def search(self, query_vector: List[float], top_k: int = 5, filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]: ...
+    async def delete(self, ids: List[str]) -> None: ...
