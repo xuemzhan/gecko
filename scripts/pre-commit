@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+########################################
+# 0. 定位到仓库根目录
+########################################
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+########################################
+# 1. 从 git 配置中自动获取作者和邮箱
+########################################
+
+AUTHOR="$(git config --get user.name || true)"
+EMAIL="$(git config --get user.email || true)"
+
+if [[ -z "$AUTHOR" || -z "$EMAIL" ]]; then
+  echo "ERROR: 未在 git config 中找到 user.name 或 user.email。"
+  echo "请先配置，例如："
+  echo "  git config --global user.name  \"Your Name\""
+  echo "  git config --global user.email \"you@example.com\""
+  exit 1
+fi
+
+########################################
+# 2. 基本配置
+########################################
+
+# Salt 必须与第一次加水印时一致
+SALT="${WATERPRINT_SALT:-404222}"
+
+# waterprint.py 的路径（相对仓库根目录）
+WATERPRINT_SCRIPT="scripts/waterprint.py"
+
+# Python 解释器
+PYTHON_BIN="python3"
+
+if [ ! -f "$WATERPRINT_SCRIPT" ]; then
+  echo "ERROR: 找不到水印工具脚本: $WATERPRINT_SCRIPT"
+  echo "请检查路径或修改 pre-commit 中的 WATERPRINT_SCRIPT 配置。"
+  exit 1
+fi
+
+########################################
+# 3. 找出本次提交中已暂存的 Python 文件
+########################################
+# 只对已 stage 的改动生效，避免干扰工作区未stage的更改
+
+mapfile -t PY_FILES < <(
+  git diff --cached --name-only --diff-filter=ACMRTUXB \
+    | grep -E '\.py$' || true
+)
+
+if [ ${#PY_FILES[@]} -eq 0 ]; then
+  # 没有待提交的 python 文件，直接允许提交
+  exit 0
+fi
+
+echo "[pre-commit] 检测到以下已暂存的 Python 文件，将自动更新/添加水印签名："
+for f in "${PY_FILES[@]}"; do
+  echo "  - $f"
+done
+echo
+
+########################################
+# 4. 对每个已暂存的 Python 文件执行 waterprint.py --ensure
+########################################
+
+for f in "${PY_FILES[@]}"; do
+  # 文件可能在工作区被删掉，先判断是否存在
+  if [ ! -f "$f" ]; then
+    echo "  (跳过, 文件不存在于工作区) $f"
+    continue
+  fi
+
+  echo "  -> 处理 $f"
+  "$PYTHON_BIN" "$WATERPRINT_SCRIPT" \
+    -f "$f" \
+    -a "$AUTHOR" \
+    -e "$EMAIL" \
+    -s "$SALT" \
+    --ensure \
+    --no-backup
+
+  # waterprint.py 修改了工作区内容，需要重新 add 以更新 stage
+  git add "$f"
+done
+
+echo
+echo "[pre-commit] 水印/签名已处理完毕。"
+
+# 正常结束，允许提交继续
+exit 0
