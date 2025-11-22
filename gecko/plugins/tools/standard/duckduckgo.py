@@ -49,18 +49,17 @@ class DuckDuckGoSearchTool(BaseTool):
             try:
                 # 使用上下文管理器确保 session 关闭
                 with DDGS() as ddgs:
-                    # [修改] 移除已废弃的 backend 参数
+                    # [修改] 移除 backend='api'，让库自动选择 (通常是 html 或 api)
+                    # text() 方法在新版中可能返回 None 或生成器
                     raw_results = ddgs.text(
                         keywords=query,
                         max_results=args.max_results
                     )
-                    # [修改] 增加空值检查，ddgs.text 可能返回 None
                     if raw_results:
                         results = list(raw_results)
             except Exception as e:
-                # 记录错误但不抛出，返回空列表让上层处理
-                logger.warning(f"DuckDuckGo search request failed: {e}")
-                return []
+                logger.error("DuckDuckGo search failed", error=str(e))
+                raise e
             return results
 
         try:

@@ -2,6 +2,8 @@
 import pytest
 from gecko.core.memory import TokenMemory
 from gecko.core.message import Message
+from unittest.mock import AsyncMock, MagicMock
+from gecko.core.memory import SummaryTokenMemory
 
 
 class TestTokenMemory:
@@ -236,3 +238,73 @@ class TestTokenMemory:
         
         assert "TokenMemory" in repr_str
         assert "test_session" in repr_str
+
+class TestSummaryTokenMemory:
+    """SummaryTokenMemory 测试"""
+
+    @pytest.fixture
+    def mock_model(self):
+        model = MagicMock()
+        model.acompletion = AsyncMock(return_value=MagicMock(
+            choices=[MagicMock(message={"content": "Summary of old messages"})]
+        ))
+        return model
+
+    @pytest.fixture
+    def summary_memory(self, mock_model):
+        return SummaryTokenMemory(
+            session_id="summary_sess",
+            model=mock_model,
+            max_tokens=100  # 设置很小的阈值以触发摘要
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_history_triggers_summary(self, summary_memory, mock_model):
+        """测试历史记录过长触发摘要"""
+        # 构造 3 条消息，假设每条约 20 tokens (User: Msg X)
+        # max_tokens=100, reserved=500 (defaut logic might need adjustment for test)
+        # Wait, SummaryTokenMemory implementation reserves 500 tokens for system/summary.
+        # If max_tokens is 100, available for history is negative?
+        # 我们需要调整 memory 的 max_tokens 或者 mock count_message_tokens
+        
+        summary_memory.max_tokens = 1000
+        # Mock tokenizer to return large length
+        summary_memory.count_message_tokens = MagicMock(return_value=300)
+        
+        raw_messages = [
+            {"role": "user", "content": "Msg 1"}, # Should be summarized
+            {"role": "assistant", "content": "Msg 2"}, # Should be summarized
+            {"role": "user", "content": "Msg 3"}, # Kept
+        ]
+        
+        # Logic: 
+        # Msg 3 (300) + Reserved (500) = 800 < 1000. OK.
+        # Msg 2 (300) + 800 = 1100 > 1000. Msg 2 & Msg 1 go to summary.
+        
+        history = await summary_memory.get_history(raw_messages, preserve_system=False)
+        
+        # 验证
+        assert len(history) == 2 # 1 Summary System Msg + 1 Recent Msg (Msg 3)
+        assert history[0].role == "system"
+        assert "Summary of old messages" in history[0].content
+        assert history[1].content == "Msg 3"
+        
+        # 验证模型调用
+        assert mock_model.acompletion.called
+        call_args = mock_model.acompletion.call_args[0][0]
+        prompt = call_args[0]["content"]
+        assert "Msg 1" in prompt
+        assert "Msg 2" in prompt
+
+    @pytest.mark.asyncio
+    async def test_get_history_no_summary_needed(self, summary_memory, mock_model):
+        """测试不需要摘要的情况"""
+        summary_memory.max_tokens = 2000
+        summary_memory.count_message_tokens = MagicMock(return_value=10)
+        
+        raw_messages = [{"role": "user", "content": "Short"}]
+        
+        history = await summary_memory.get_history(raw_messages)
+        
+        assert len(history) == 1
+        assert not mock_model.acompletion.called

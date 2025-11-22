@@ -154,7 +154,7 @@ class ReActEngine(CognitiveEngine):
 
     # ===================== 核心接口实现 =====================
 
-    async def step(
+    async def step( # type: ignore
         self,
         input_messages: List[Message],
         response_model: Optional[Type[T]] = None,
@@ -230,7 +230,7 @@ class ReActEngine(CognitiveEngine):
             await self.on_error(e, input_messages, **kwargs)
             raise
 
-    async def step_stream(
+    async def step_stream( # type: ignore
         self, input_messages: List[Message], **kwargs
     ) -> AsyncIterator[str]:
         """
@@ -271,6 +271,56 @@ class ReActEngine(CognitiveEngine):
 
     # ===================== 推理循环逻辑 =====================
 
+    # [新增辅助方法] 提取通用的回合处理逻辑
+    async def _process_turn_results(
+        self, 
+        context: ExecutionContext, 
+        assistant_msg: Message, 
+        response_model: Optional[Type[T]] = None
+    ) -> bool:
+        """
+        处理 LLM 生成后的通用逻辑：
+        1. 死循环检测
+        2. 更新上下文
+        3. 判断是否终止 (结构化提取/无工具调用)
+        4. 执行工具
+        
+        返回:
+            should_continue: 是否继续下一轮循环 (True=继续, False=终止)
+        """
+        # 1. 死循环检测
+        if self._detect_infinite_loop(assistant_msg, context):
+            logger.warning("Detected infinite tool loop, breaking.")
+            context.add_message(assistant_msg)
+            return False
+
+        context.add_message(assistant_msg)
+
+        # 2. 终止条件检查
+        # 条件 A: 是结构化提取 (Implicit Tool Call)
+        if response_model and self._is_structure_extraction(
+            assistant_msg, response_model
+        ):
+            await self._trigger_turn_end(context)
+            return False
+
+        # 条件 B: 无工具调用 (纯文本回复)
+        if not assistant_msg.tool_calls:
+            await self._trigger_turn_end(context)
+            return False
+
+        # 3. 执行工具
+        if self.stats:
+            self.stats.tool_calls += len(assistant_msg.tool_calls)
+
+        await self._execute_tool_calls(assistant_msg.tool_calls, context)
+
+        # Hook: Turn End
+        await self._trigger_turn_end(context)
+        
+        return True
+
+    # [修改方法] 重构同步循环，使用 _process_turn_results
     async def _run_reasoning_loop(
         self,
         context: ExecutionContext,
@@ -279,8 +329,6 @@ class ReActEngine(CognitiveEngine):
     ) -> AgentOutput:
         """
         ReAct 主循环 (同步模式)
-        
-        负责：调用 LLM -> 解析响应 -> 检测死循环 -> 执行工具 -> 更新上下文
         """
         while context.turn < self.max_turns:
             context.turn += 1
@@ -292,36 +340,15 @@ class ReActEngine(CognitiveEngine):
             # 1. LLM 推理
             response = await self._call_llm(context, llm_params)
             assistant_msg = self._parse_llm_response(response)
-
-            # 2. 死循环检测
-            if self._detect_infinite_loop(assistant_msg, context):
-                logger.warning("Detected infinite tool loop, breaking.")
-                break
-
-            context.add_message(assistant_msg)
             context.metadata["last_response"] = response
 
-            # 3. 终止条件检查
-            # 条件 A: 是结构化提取 (Implicit Tool Call)
-            if response_model and self._is_structure_extraction(
-                assistant_msg, response_model
-            ):
-                await self._trigger_turn_end(context)
+            # 2. 处理回合逻辑 (复用)
+            should_continue = await self._process_turn_results(
+                context, assistant_msg, response_model
+            )
+            
+            if not should_continue:
                 break
-
-            # 条件 B: 无工具调用 (纯文本回复)
-            if not assistant_msg.tool_calls:
-                await self._trigger_turn_end(context)
-                break
-
-            # 4. 执行工具
-            if self.stats:
-                self.stats.tool_calls += len(assistant_msg.tool_calls)
-
-            await self._execute_tool_calls(assistant_msg.tool_calls, context)
-
-            # Hook: Turn End
-            await self._trigger_turn_end(context)
 
         # 循环结束，返回最后结果
         last_msg = context.get_last_message()
@@ -329,18 +356,17 @@ class ReActEngine(CognitiveEngine):
             return AgentOutput(content="No response generated.")
 
         return AgentOutput(
-            content=last_msg.content or "",
+            content=last_msg.content or "", # type: ignore
             raw=context.metadata.get("last_response"),
             tool_calls=last_msg.tool_calls or [],
         )
 
+    # [修改方法] 重构流式循环，使用 _process_turn_results
     async def _run_streaming_loop(
         self, context: ExecutionContext, llm_params: Dict[str, Any]
     ) -> AsyncIterator[str]:
         """
         ReAct 流式循环 (递归模式)
-        
-        负责：消费 Stream Chunks -> 累积工具调用 -> 执行工具 -> 递归调用自身
         """
         if context.turn >= self.max_turns:
             return
@@ -358,7 +384,7 @@ class ReActEngine(CognitiveEngine):
         tool_calls_data: List[Dict[str, Any]] = []
 
         # 1. 消费流
-        async for chunk in self.model.astream(messages=messages_payload, **llm_params):
+        async for chunk in self.model.astream(messages=messages_payload, **llm_params): # type: ignore
             delta = self._extract_delta(chunk)
 
             # A. 文本内容：实时 Yield
@@ -384,29 +410,17 @@ class ReActEngine(CognitiveEngine):
             if valid_calls:
                 assistant_msg.tool_calls = valid_calls
 
-        # 3. 死循环检测
-        if self._detect_infinite_loop(assistant_msg, context):
-            logger.warning("Infinite loop detected in stream, stopping.")
-            context.add_message(assistant_msg)
-            return
+        # 3. 处理回合逻辑 (复用)
+        # 流式模式下 response_model 通常由外层处理或不支持，这里传 None 简化
+        should_continue = await self._process_turn_results(
+            context, assistant_msg, response_model=None
+        )
 
-        context.add_message(assistant_msg)
-
-        # 4. 分支处理
-        if assistant_msg.tool_calls:
-            # Case A: 有工具调用 -> 执行并递归
-            if self.stats:
-                self.stats.tool_calls += len(assistant_msg.tool_calls)
-
-            await self._execute_tool_calls(assistant_msg.tool_calls, context)
-            await self._trigger_turn_end(context)
-            
-            # 递归：进入下一轮
-            async for token in self._run_streaming_loop(context, llm_params):
+        # 4. 递归：如果需要继续且有工具被执行了(蕴含在 should_continue 逻辑里)，则进入下一轮
+        # 注意：_process_turn_results 返回 True 表示 "工具已执行，请继续"
+        if should_continue:
+             async for token in self._run_streaming_loop(context, llm_params):
                 yield token
-        else:
-            # Case B: 结束
-            await self._trigger_turn_end(context)
 
     # ===================== 辅助逻辑 =====================
     
@@ -771,7 +785,7 @@ class ReActEngine(CognitiveEngine):
                 msg = self._parse_llm_response(response)
                 context.add_message(msg)
                 output = AgentOutput(
-                    content=msg.content or "", tool_calls=msg.tool_calls or []
+                    content=msg.content or "", tool_calls=msg.tool_calls or [] # type: ignore
                 )
 
         raise AgentError("Structured parsing failed")

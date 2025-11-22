@@ -26,6 +26,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 from gecko.core.logging import get_logger
 from gecko.core.message import Message
+from gecko.core.prompt import PromptTemplate
+from gecko.core.protocols import ModelProtocol
 from gecko.plugins.storage.interfaces import SessionInterface
 
 logger = get_logger(__name__)
@@ -411,3 +413,144 @@ class TokenMemory:
             f"cache_size={len(self._token_cache)}/{self.cache_size}"
             f")"
         )
+    
+class SummaryTokenMemory(TokenMemory):
+    """
+    支持自动摘要的记忆管理器
+    
+    当历史记录超出 max_tokens 时，不是简单丢弃，而是调用 LLM 对早期历史进行摘要。
+    """
+    
+    def __init__(
+        self,
+        session_id: str,
+        model: ModelProtocol,  # 需要传入模型实例用于摘要
+        summary_prompt: Optional[str] = None,
+        **kwargs
+    ):
+        super().__init__(session_id, **kwargs)
+        self.model = model
+        # 默认摘要模板
+        self.summary_template = PromptTemplate(
+            template=summary_prompt or (
+                "Please condense the following conversation history into a concise summary, "
+                "preserving key information and context:\n\n{{ history }}\n\nSummary:"
+            ),
+            input_variables=["history"]
+        )
+        # 内存中维护当前的摘要
+        self.current_summary: str = ""
+
+    async def get_history(
+        self,
+        raw_messages: List[Dict[str, Any]],
+        preserve_system: bool = True
+    ) -> List[Message]:
+        """
+        重写历史加载逻辑：
+        1. 加载原始消息
+        2. 如果 Token 超限，触发摘要流程
+        3. 返回 [System, Summary, ...Recent Messages]
+        """
+        # 1. 先用父类逻辑加载和清洗基础消息
+        messages = await super().get_history(raw_messages, preserve_system)
+        
+        # 计算总 Token (此时 messages 已经被父类截断过一次，但那是硬截断)
+        # 我们需要基于未截断的完整列表来做决策，或者在此处再次检查
+        # 这里简化逻辑：如果父类已经截断了，我们可能丢失了信息。
+        # 更理想的是完全重写 get_history，但为了复用，我们这里主要处理 "摘要注入"。
+        
+        # 实际上，TokenMemory.get_history 的逻辑是反向回填直到满。
+        # 这意味着早期的消息已经被丢弃了。
+        # 为了实现摘要，我们需要改变策略：
+        # 不直接丢弃，而是把丢弃的部分拿来做摘要。
+        
+        # === 重写核心逻辑 ===
+        if not raw_messages:
+            return []
+
+        parsed_messages = []
+        for raw in raw_messages:
+            try:
+                msg = Message(**raw)
+                self._truncate_message_safety(msg)
+                parsed_messages.append(msg)
+            except Exception:
+                pass
+
+        if not parsed_messages:
+            return []
+
+        # 分离 System
+        system_msg = None
+        candidates = parsed_messages
+        if preserve_system and parsed_messages[0].role == "system":
+            system_msg = parsed_messages[0]
+            candidates = parsed_messages[1:]
+
+        # 预留 System 和 Summary 的 Token 空间 (估算 500 tokens)
+        reserved_tokens = 500
+        if system_msg:
+            reserved_tokens += self.count_message_tokens(system_msg)
+        
+        current_tokens = 0
+        recent_messages = []
+        to_summarize = []
+
+        # 反向选取最近的消息
+        for msg in reversed(candidates):
+            tokens = self.count_message_tokens(msg)
+            if current_tokens + tokens > (self.max_tokens - reserved_tokens):
+                # 超出窗口，归入待摘要队列
+                to_summarize.append(msg)
+            else:
+                recent_messages.append(msg)
+                current_tokens += tokens
+        
+        recent_messages.reverse() # 恢复时间正序
+        to_summarize.reverse()    # 恢复时间正序
+
+        # 如果有需要摘要的消息，生成或更新摘要
+        if to_summarize:
+            await self._update_summary(to_summarize)
+
+        # 组装最终历史
+        final_history = []
+        if system_msg:
+            final_history.append(system_msg)
+        
+        # 注入摘要 (作为 System 消息或 User 提示)
+        if self.current_summary:
+            summary_msg = Message.system(f"Previous conversation summary: {self.current_summary}")
+            final_history.append(summary_msg)
+            
+        final_history.extend(recent_messages)
+        
+        return final_history
+
+    async def _update_summary(self, messages: List[Message]):
+        """调用 LLM 更新摘要"""
+        if not messages:
+            return
+
+        # 将消息转为文本
+        history_text = "\n".join([f"{m.role}: {m.get_text_content()}" for m in messages])
+        
+        # 如果已有摘要，将其合并进去
+        if self.current_summary:
+            history_text = f"Previous Summary: {self.current_summary}\n\nNew Conversation:\n{history_text}"
+
+        # 构造 Prompt
+        prompt = self.summary_template.format(history=history_text)
+        
+        try:
+            # 调用模型生成摘要
+            # 注意：这里是一个简单的阻塞调用，生产环境可能需要后台异步更新
+            response = await self.model.acompletion([{"role": "user", "content": prompt}])
+            new_summary = response.choices[0].message["content"]
+            if new_summary:
+                self.current_summary = new_summary
+                logger.info("Conversation summary updated", summary_len=len(new_summary))
+        except Exception as e:
+            logger.error("Failed to update summary", error=str(e))
+            # 失败时保持原有摘要，或者不做处理
