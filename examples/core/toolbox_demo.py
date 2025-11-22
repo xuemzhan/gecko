@@ -1,8 +1,8 @@
 # examples/toolbox_demo.py
 import asyncio
 from gecko.core.toolbox import ToolBox
-from gecko.plugins.tools.calculator import CalculatorTool
-from gecko.plugins.tools.duckduckgo import DuckDuckGoSearch
+from gecko.plugins.tools.standard.calculator import CalculatorTool
+from gecko.plugins.tools.standard.duckduckgo import DuckDuckGoSearch
 
 
 async def main():

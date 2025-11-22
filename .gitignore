@@ -186,7 +186,7 @@ uploads/
 benchmark/
 *.prof
 
-demo_lance
+demo_lance/
 
 ### 结束 ###
 # 总规则数：约 120 条，覆盖 99% 场景
