@@ -114,6 +114,16 @@ class WorkflowContext(BaseModel):
         default_factory=list,
         description="完整执行轨迹"
     )
+    # [新增] 动态跳转指针，用于断点恢复
+    # 格式: {"target_node": "NodeB", "input": ...}
+    next_pointer: Optional[Dict[str, Any]] = Field(
+        default=None, 
+        description="Next 指令产生的动态跳转目标"
+    )
+
+    def clear_next_pointer(self):
+        """消费完指针后清除"""
+        self.next_pointer = None
 
     def add_execution(self, execution: NodeExecution):
         """添加执行记录"""
@@ -393,7 +403,7 @@ class Workflow:
 
     async def resume(self, session_id: str) -> Any:
         """
-        [New] 从存储中恢复执行
+        从存储中恢复执行
         """
         if not self.storage:
             raise ValueError("Cannot resume: Storage not configured")
@@ -415,17 +425,29 @@ class Workflow:
         current_step = saved_data.get("step", 0)
         
         # 3. 确定下一步
-        # 如果从未执行过(None)，从入口开始
-        # 如果执行过，寻找 last_node 的下一个节点
-        next_node = self._entry_point
-        if last_node:
-            # 注意：last_node 代表该节点已经成功执行并保存了状态
-            # 所以我们需要基于当前 context (包含了 last_node 的输出) 去找下一个节点
-            next_node = await self._find_next_node(last_node, context)
+        next_node = None
+
+        # [优化] 优先检查是否存在动态跳转指针
+        if context.next_pointer:
+            logger.info("Resuming from dynamic Next pointer", target=context.next_pointer.get("target_node"))
+            next_node = context.next_pointer.get("target_node")
             
+            # 恢复可能存在的输入传递
+            if context.next_pointer.get("input"):
+                context.state["_next_input"] = context.next_pointer["input"]
+            
+            # 消费指针 (已使用，清除以避免重复)
+            context.clear_next_pointer()
+
+        elif last_node:
+            # 只有在没有动态指针时，才回退到基于静态图的推导
+            next_node = await self._find_next_node(last_node, context)
             if not next_node:
-                logger.info("Workflow already completed", session_id=session_id)
+                logger.info("Workflow already completed (no next node)", session_id=session_id)
                 return context.get_last_output()
+        else:
+            # 这是一个全新的会话（或者刚初始化未执行）
+            next_node = self._entry_point
         
         # 4. 继续执行循环
         try:
@@ -457,17 +479,28 @@ class Workflow:
 
         while current_node and steps < self.max_steps:
             steps += 1
-            logger.debug("Executing step", step=steps, node=current_node)
 
+            # 1. 如果是从 next_pointer 恢复的（Resume 场景），跳过执行，直接流转
+            # 但这里逻辑比较绕，更清晰的是：如果 next_pointer 存在，说明上一步是 Next 指令，
+            # 且已经持久化了，我们应该直接使用 next_pointer 指向的节点作为 current_node。
+            # 这在 resume() 方法中处理更合适，这里保持循环逻辑。
+
+            # 执行节点
+            logger.debug("Executing step", step=steps, node=current_node)
+            # 执行节点逻辑
             result = await self._execute_node_safe(current_node, context)
 
-            # 处理流转
+            # 准备持久化所需的临时变量
+            # 记录当前节点为“已完成节点”
+            persist_node = current_node 
+            next_target = None
+
+            # 处理流转逻辑
             if isinstance(result, Next):
-                # 记录当前节点完成（但在 Next 跳转前，逻辑上当前节点是 current_node）
-                # Next 指令实际上是一种“特殊输出”，它指引了下一个节点
-                prev_node = current_node
-                current_node = result.node
+                # === 动态跳转处理 ===
+                next_target = result.node
                 
+                # 更新 Input / State
                 if result.input is not None:
                     normalized = self._normalize_result(result.input)
                     context.history["last_output"] = normalized
@@ -476,33 +509,36 @@ class Workflow:
                 if result.update_state:
                     context.state.update(result.update_state)
                     
-                # 持久化：记录的是“刚刚完成的节点” (prev_node)，以便 resume 时能找到 current_node
-                # 如果在这里 crash，resume 时 last_node=prev_node，
-                # _find_next_node 需要能处理 Next 逻辑吗？
-                # ⚠️ 注意：_find_next_node 仅处理静态 Edge。
-                # 如果使用 Next 动态跳转，resume 机制可能会失效，因为静态图不知道 Next 的意图。
-                # 解决方案：Next 跳转应该在持久化 context.history/state 之后。
-                # Resume 时，如果 last_node 是 prev_node，且我们无法通过静态边推断下一跳，
-                # 这确实是目前架构的一个限制。
-                # V0.2 简化处理：假设 resume 主要用于 crash recovery，
-                # 只要 context 状态保存正确，重新执行逻辑应当能复现状态。
-                # 但为了更安全，我们在 Next 跳转场景下，强制保存 "Target Node" 作为 last_node 的一种变体？
-                # 不，保持简单：persist 保存的是 "已完成的节点"。
+                # [关键优化] 记录动态指针，确保持久化时包含此信息
+                context.next_pointer = {
+                    "target_node": next_target,
+                    "input": context.state.get("_next_input")
+                }
                 
+                # 即使是跳转，也需要在 history 中留痕，证明此节点已执行完毕
+                # 这里记录一个特殊的标识，方便调试
+                context.history[current_node] = f"<Next -> {next_target}>"
+
             else:
+                # === 静态流转处理 ===
                 normalized = self._normalize_result(result)
                 context.history[current_node] = normalized
                 context.history["last_output"] = normalized
                 
-                # 保存当前节点为“已完成”
-                persist_node = current_node
+                # 既然走了静态流程，确保清除之前的指针（防御性编程）
+                context.clear_next_pointer()
                 
-                # 寻找下一个
-                current_node = await self._find_next_node(current_node, context)
-                
-                # 持久化
-                if self.storage and session_id:
-                    await self._persist_state(session_id, steps, persist_node, context)
+                # 基于静态图寻找下一跳
+                next_target = await self._find_next_node(current_node, context)
+
+            # [优化] 立即持久化 (Atomic Checkpoint)
+            # 此时 context 包含了最新的 history 和 next_pointer
+            # 即使下一秒 Crash，resume 时也能通过 next_pointer 找到 next_target
+            if self.storage and session_id:
+                await self._persist_state(session_id, steps, persist_node, context)
+
+            # 推进到下一个节点
+            current_node = next_target
 
         if steps >= self.max_steps:
             raise WorkflowError(f"Exceeded max steps: {self.max_steps}", context={"last": current_node})

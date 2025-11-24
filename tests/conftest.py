@@ -57,6 +57,20 @@ def event_loop():
     loop.close()
 
 @pytest.fixture
+def mock_toolbox():
+    tb = MagicMock(spec=ToolBox)
+    # [修复] 添加 description 防止 System Prompt 渲染报错
+    tb.to_openai_schema.return_value = [{
+        "type": "function", 
+        "function": {
+            "name": "t1", 
+            "description": "mock tool" 
+        }
+    }]
+    tb.execute_many = AsyncMock(return_value=[])
+    return tb
+
+@pytest.fixture
 def mock_llm():
     """
     [Critical Fix] Mock LLM 对象

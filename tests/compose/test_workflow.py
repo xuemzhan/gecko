@@ -591,3 +591,110 @@ async def test_persistence_with_unserializable_state(simple_workflow, mock_stora
     assert isinstance(lock_data, dict)
     # 验证对象被正确转换为不可序列化标记，而不是导致程序崩溃
     assert lock_data.get("__gecko_unserializable__") is True
+
+@pytest.mark.asyncio
+async def test_workflow_context_next_pointer_logic():
+    """
+    [New] 测试 WorkflowContext 中 next_pointer 的行为
+    验证优化点：Context 增强
+    """
+    ctx = WorkflowContext(input="start")
+    assert ctx.next_pointer is None
+    
+    # 模拟设置指针
+    ctx.next_pointer = {"target_node": "B", "input": "data"}
+    
+    # 验证消费清除逻辑
+    ctx.clear_next_pointer()
+    assert ctx.next_pointer is None
+
+@pytest.mark.asyncio
+async def test_next_instruction_persistence(simple_workflow, mock_storage):
+    """
+    [New] 测试 Next 指令触发立即持久化，并包含 next_pointer
+    验证优化点：Workflow._execute_loop 中的原子持久化
+    """
+    simple_workflow.storage = mock_storage
+    
+    # 定义返回 Next 的节点
+    def node_a():
+        return Next(node="B", input="jump_data")
+    
+    def node_b(inp):
+        return "done"
+        
+    simple_workflow.add_node("A", node_a)
+    simple_workflow.add_node("B", node_b)
+    simple_workflow.set_entry_point("A")
+    
+    # 执行
+    await simple_workflow.execute("start", session_id="sess_next_persist")
+    
+    # 验证 storage.set 调用
+    # 我们期望在 Node A 执行完返回 Next 后，立即调用了一次 set
+    # 检查调用参数中是否包含 next_pointer
+    
+    # 找到 Node A 完成时的那次保存
+    calls = mock_storage.set.call_args_list
+    found_pointer = False
+    
+    for call_args in calls:
+        _, data = call_args[0] # key, value
+        context_data = data.get("context", {})
+        
+        # 检查是否记录了 next_pointer
+        if context_data.get("next_pointer"):
+            pointer = context_data["next_pointer"]
+            if pointer["target_node"] == "B" and pointer["input"] == "jump_data":
+                found_pointer = True
+                # 验证此时 last_node 应该是 A (即便 A 返回的是 Next)
+                assert data["last_node"] == "A"
+                
+    assert found_pointer, "持久化数据中未找到 next_pointer，断点恢复将失败"
+
+@pytest.mark.asyncio
+async def test_resume_from_next_pointer(simple_workflow, mock_storage):
+    """
+    [New] 测试基于 next_pointer 的断点恢复
+    验证优化点：Workflow.resume 的优先恢复逻辑
+    """
+    simple_workflow.storage = mock_storage
+    
+    node_a_mock = MagicMock(return_value="should_not_run")
+    node_b_mock = MagicMock(return_value="recovered_success")
+    
+    simple_workflow.add_node("A", lambda: node_a_mock())
+    simple_workflow.add_node("B", lambda: node_b_mock())
+    simple_workflow.set_entry_point("A")
+    
+    # 模拟存储状态：
+    # 场景：A 节点执行完毕，返回 Next("B")，此时 next_pointer 已保存，但 B 尚未执行系统就 Crash 了
+    mock_storage.get.return_value = {
+        "step": 1,
+        "last_node": "A",
+        "context": {
+            "input": "start",
+            "history": {"A": "<Next -> B>"}, # 历史中有痕迹
+            "state": {},
+            "next_pointer": { # [关键] 存在动态指针
+                "target_node": "B",
+                "input": "restored_input"
+            },
+            "executions": []
+        }
+    }
+    
+    # 执行 Resume
+    result = await simple_workflow.resume("sess_crash_after_next")
+    
+    # 验证：
+    # 1. A 不应被重新执行 (避免副作用)
+    node_a_mock.assert_not_called()
+    
+    # 2. B 应该被执行，且 Context 状态已包含 input
+    node_b_mock.assert_called_once()
+    assert result == "recovered_success"
+    
+    # 验证内部状态流转
+    # 这里比较难直接验证 state["_next_input"]，因为 execute 内部是瞬态的
+    # 但可以通过 B 的执行结果间接验证，或者 Mock B 检查参数

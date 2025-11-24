@@ -274,3 +274,15 @@ class TestSerializationUtils:
         assert isinstance(clean["self"], dict)
         # 验证确实有内容
         assert "self" in clean["self"]
+
+def test_safe_serialize_unserializable():
+    """测试不可序列化对象的降级处理"""
+    import threading
+    lock = threading.Lock()
+    data = {"lock": lock}
+    
+    clean = safe_serialize_context(data)
+    
+    # 必须变为 dict 标记，且不抛错
+    assert isinstance(clean["lock"], dict)
+    assert clean["lock"].get("__gecko_unserializable__") is True

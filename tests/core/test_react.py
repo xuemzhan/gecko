@@ -29,7 +29,7 @@ from gecko.core.protocols import StreamableModelProtocol
 
 # ========================= Helpers =========================
 
-def create_mock_response(content: str = None, tool_calls: list = None):
+def create_mock_response(content: str = None, tool_calls: list = None): # type: ignore
     """创建模拟的 CompletionResponse"""
     msg = {}
     if content is not None:
@@ -350,3 +350,42 @@ async def test_system_prompt_rendering(mock_model, mock_toolbox, mock_memory):
     current_year = str(datetime.datetime.now().year)
     assert "Time:" in sys_content
     assert current_year in sys_content
+
+@pytest.mark.asyncio
+async def test_step_stream_recursion_depth_safety(engine, mock_model, mock_toolbox):
+    """
+    [New] 测试流式推理在高轮次下不会触发 RecursionError
+    验证优化点：ReActEngine._run_streaming_loop 改为迭代式
+    """
+    engine.max_turns = 50
+
+    # [修复] 使用计数器生成唯一的参数，避开 ReAct 引擎的 Hash 死循环检测
+    counter = 0
+    async def endless_tool_stream(*args, **kwargs):
+        nonlocal counter
+        counter += 1
+        # 构造动态参数 {"i": 1}, {"i": 2}...
+        unique_args = f'{{"i": {counter}}}'
+        
+        yield SimpleNamespace(choices=[{
+            "delta": {
+                "tool_calls": [{
+                    "index": 0, 
+                    "function": {
+                        "name": "t1", 
+                        "arguments": unique_args
+                    }
+                }]
+            }
+        }])
+
+    mock_model.astream.side_effect = endless_tool_stream
+    mock_toolbox.execute_many.return_value = [ToolExecutionResult("t1", "1", "res", False)]
+
+    # 执行流式推理
+    count = 0
+    async for _ in engine.step_stream([Message.user("Start")]):
+        count += 1
+
+    # 验证确实执行了多次 LLM 调用 (达到 max_turns 上限)
+    assert mock_model.astream.call_count >= 50

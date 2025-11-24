@@ -1,4 +1,5 @@
 # tests/core/test_session.py
+from unittest.mock import AsyncMock, MagicMock
 import pytest
 import asyncio
 import time
@@ -247,3 +248,51 @@ class TestSessionManager:
         # 验证清理任务已取消
         if manager._cleanup_task:
             assert manager._cleanup_task.cancelled() or manager._cleanup_task.done()
+
+@pytest.mark.asyncio
+async def test_session_save_consistency_snapshot():
+    """
+    [New] 测试 Session 保存时的数据一致性 (防止竞态条件)
+    验证优化点：Session.save 中的同步快照机制
+    """
+    # 1. 创建一个慢速存储后端
+    slow_storage = MagicMock()
+    
+    # 定义一个 set 方法，模拟耗时 IO
+    save_event = asyncio.Event()
+    
+    async def slow_set(key, value):
+        # 模拟 IO 延迟
+        await asyncio.sleep(0.1)
+        # 记录实际写入的数据
+        slow_storage.saved_value = value
+        save_event.set()
+    
+    slow_storage.set = AsyncMock(side_effect=slow_set)
+    
+    # 2. 初始化 Session
+    session = Session(session_id="race_test", storage=slow_storage)
+    session.set("counter", 1)
+    
+    # 3. 触发保存 (此时 counter=1)
+    # 不等待它完成，让它在后台跑
+    save_task = asyncio.create_task(session.save())
+    
+    # 4. 立即修改内存中的状态 (模拟并发修改)
+    # 在 save 进入 await sleep 期间，我们修改了 counter -> 2
+    await asyncio.sleep(0.01) # 确保 save 已经进入了 async with lock 之后的逻辑
+    session.set("counter", 2)
+    
+    # 5. 等待保存完成
+    await save_task
+    await save_event.wait()
+    
+    # 6. 验证：
+    # 存储中的数据应该是保存开始时的快照 (counter=1)
+    # 而不是修改后的数据 (counter=2)
+    saved_data = slow_storage.saved_value
+    assert saved_data["state"]["counter"] == 1, \
+        "Session 保存发生了竞态条件！写入了修改后的数据而非快照。"
+        
+    # 内存中的数据应该是新的
+    assert session.get("counter") == 2

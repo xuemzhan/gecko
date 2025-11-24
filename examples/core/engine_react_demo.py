@@ -22,7 +22,7 @@ from gecko.plugins.models import ZhipuChat
 class CalculatorTool(BaseTool):
     name: str = "calculator"
     description: str = "Useful for performing basic arithmetic operations. Input should be a math expression string."
-    parameters: Dict[str, Any] = {
+    parameters: Dict[str, Any] = { # type: ignore
         "type": "object",
         "properties": {
             "expression": {
@@ -41,7 +41,7 @@ class CalculatorTool(BaseTool):
         expression: str
     args_schema: type[BaseModel] = Args
 
-    async def _run(self, args: Args) -> str:
+    async def _run(self, args: Args) -> str: # type: ignore
         expression = args.expression
         try:
             # 注意：eval 在生产环境中是不安全的，仅用于演示
@@ -58,7 +58,7 @@ class WeatherTool(BaseTool):
         unit: str = "celsius"
     args_schema: type[BaseModel] = Args
 
-    async def _run(self, args: Args) -> str:
+    async def _run(self, args: Args) -> str: # type: ignore
         return f"The weather in {args.location} is sunny and 25°C."
 
 # ==========================================
@@ -96,7 +96,8 @@ async def main():
         toolbox=toolbox,
         memory=memory,
         engine_cls=ReActEngine,
-        max_turns=5 # 限制最大思考轮数
+        # 增加最大轮数(5->10)，测试迭代循环的稳定性
+        max_turns=10 # 限制最大思考轮数
     )
 
     print("\n🚀 ReAct Agent Demo (Powered by ZhipuChat)\n")
@@ -108,7 +109,7 @@ async def main():
     
     # 使用 run() 方法 (非流式)
     response1 = await agent.run(query1)
-    print(f"💡 Final Answer: {response1.content}\n")
+    print(f"💡 Final Answer: {response1.content}\n") # type: ignore
     
     # 查看统计
     if agent.engine.stats:
@@ -126,14 +127,20 @@ async def main():
 
     print("-" * 50)
 
-    # --- 场景 3: 流式输出 ---
-    query3 = "Tell me a short story about a Gecko programmer."
-    print(f"\n👤 User: {query3} (Streaming Mode)")
+    # --- 场景 3: 流式输出 (长文本/多步推理) ---
+    # [修改] 构造一个需要多步思考的问题，验证流式迭代
+    query3 = "请先计算 50 的阶乘，然后搜索这个数字的位数，最后写一首关于这个数字的短诗。"
+    print(f"\n👤 User: {query3} (Streaming Mode - Iterative)")
     print("🌊 Stream: ", end="", flush=True)
     
-    async for chunk in agent.stream(query3):
-        print(chunk, end="", flush=True)
-    print("\n")
+    try:
+        async for chunk in agent.stream(query3):
+            print(chunk, end="", flush=True)
+        print("\n")
+    except RecursionError:
+        print("\n❌ Error: Recursion depth exceeded! (Optimization needed)")
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())

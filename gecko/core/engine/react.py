@@ -368,59 +368,62 @@ class ReActEngine(CognitiveEngine):
         """
         ReAct 流式循环 (递归模式)
         """
-        if context.turn >= self.max_turns:
-            return
+        # 循环控制：只要 turn 未达上限，且 should_continue 为 True，就一直循环
+        while context.turn < self.max_turns:
+            context.turn += 1
+            
+            # Hook: Turn Start
+            if self.on_turn_start:
+                await ensure_awaitable(self.on_turn_start, context)
 
-        context.turn += 1
-        
-        # Hook: Turn Start
-        if self.on_turn_start:
-            await ensure_awaitable(self.on_turn_start, context)
+            messages_payload = [m.to_openai_format() for m in context.messages]
+            
+            # 状态累积器 (每轮开始前重置)
+            collected_content = []
+            tool_calls_data: List[Dict[str, Any]] = []
 
-        messages_payload = [m.to_openai_format() for m in context.messages]
-        
-        # 状态累积器
-        collected_content = []
-        tool_calls_data: List[Dict[str, Any]] = []
+            # 1. 消费流 (Inner Loop: Streaming Consumer)
+            # 负责将 LLM 的 Token 实时透传给用户，并累积工具调用信息
+            async for chunk in self.model.astream(messages=messages_payload, **llm_params): # type: ignore
+                delta = self._extract_delta(chunk)
 
-        # 1. 消费流
-        async for chunk in self.model.astream(messages=messages_payload, **llm_params): # type: ignore
-            delta = self._extract_delta(chunk)
+                # A. 文本内容：实时 Yield
+                content = delta.get("content")
+                if content:
+                    collected_content.append(content)
+                    yield content
 
-            # A. 文本内容：实时 Yield
-            content = delta.get("content")
-            if content:
-                collected_content.append(content)
-                yield content
+                # B. 工具调用：后台累积
+                if delta.get("tool_calls"):
+                    self._accumulate_tool_chunks(tool_calls_data, delta["tool_calls"])
 
-            # B. 工具调用：后台累积
-            if delta.get("tool_calls"):
-                self._accumulate_tool_chunks(tool_calls_data, delta["tool_calls"])
+            # 2. 组装完整消息 (Turn Completion)
+            final_text = "".join(collected_content)
+            assistant_msg = Message.assistant(content=final_text)
+            
+            # 清洗并组装工具调用
+            if tool_calls_data:
+                valid_calls = [
+                    tc for tc in tool_calls_data 
+                    if tc["function"]["name"] or tc["function"]["arguments"]
+                ]
+                if valid_calls:
+                    assistant_msg.tool_calls = valid_calls
 
-        # 2. 组装完整消息
-        final_text = "".join(collected_content)
-        assistant_msg = Message.assistant(content=final_text)
-        
-        # 清洗无效的工具调用
-        if tool_calls_data:
-            valid_calls = [
-                tc for tc in tool_calls_data 
-                if tc["function"]["name"] or tc["function"]["arguments"]
-            ]
-            if valid_calls:
-                assistant_msg.tool_calls = valid_calls
+            # 3. 处理回合逻辑 (Decision Making)
+            # 复用基类的 _process_turn_results 方法
+            # 返回 True 表示 "工具已执行完毕，状态已更新，请继续下一轮 LLM 推理"
+            # 返回 False 表示 "任务完成" 或 "检测到死循环/无需工具"，应退出循环
+            should_continue = await self._process_turn_results(
+                context, assistant_msg, response_model=None
+            )
 
-        # 3. 处理回合逻辑 (复用)
-        # 流式模式下 response_model 通常由外层处理或不支持，这里传 None 简化
-        should_continue = await self._process_turn_results(
-            context, assistant_msg, response_model=None
-        )
-
-        # 4. 递归：如果需要继续且有工具被执行了(蕴含在 should_continue 逻辑里)，则进入下一轮
-        # 注意：_process_turn_results 返回 True 表示 "工具已执行，请继续"
-        if should_continue:
-             async for token in self._run_streaming_loop(context, llm_params):
-                yield token
+            # 如果不需要继续，跳出 while 循环，结束流式生成
+            if not should_continue:
+                break
+            
+            # 如果 should_continue 为 True，while 循环会自动进入下一轮
+            # context.turn 增加，context.messages 已包含工具结果
 
     # ===================== 辅助逻辑 =====================
     

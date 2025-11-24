@@ -168,32 +168,58 @@ class Session:
     
     async def save(self, force: bool = False):
         """
-        保存会话到存储
+        [优化] 保存会话到存储 (线程安全与一致性保证)
+        
+        策略：
+        1. 持有锁时进行状态检查和数据快照 (Snapshotting)。
+        2. 使用 utils.safe_serialize_context 确保数据深拷贝和清洗。
+        3. 持有锁进行 IO 操作，确保写入顺序性（针对单个 Session 的并发保护）。
         """
         if not self.storage:
             return
         
-        if not force and not self._dirty:
-            return
-        
+        # 全程持有锁，防止在 Snapshotting 和 IO 之间状态发生变更
+        # 虽然这会略微增加锁的持有时间，但对于单 Session 粒度来说，一致性优于微小的并发性能提升。
         async with self._lock:
+            # 双重检查
+            if not force and not self._dirty:
+                return
+
             try:
-                data = self.to_dict()
-                await self.storage.set(self.session_id, data)
+                # 1. 准备数据快照 (CPU 密集型)
+                # 引入 utils 中的序列化工具，它会递归处理并返回纯净的 dict/list 副本
+                # 这实际上切断了 storage 数据与内存 self.state 的引用关系
+                from gecko.core.utils import safe_serialize_context
+                
+                # 获取当前状态的字典表示
+                raw_data = self.to_dict()
+                
+                # 清洗并深拷贝
+                clean_data = safe_serialize_context(raw_data)
+                
+                # 2. 执行 IO (IO 密集型)
+                # 这里的 await 会释放 GIL，但不会释放 self._lock (协程锁)
+                # 因此其他协程无法在此期间修改 self.state 或发起新的 save
+                await self.storage.set(self.session_id, clean_data)
+                
+                # 3. 状态重置
+                # 只有成功写入后才清除 dirty 标记
                 self._dirty = False
                 
                 logger.debug("Session saved", session_id=self.session_id)
-                
                 await self.event_bus.publish(SessionEvent(
                     type="session_saved",
                     data={"session_id": self.session_id}
                 ))
+                
             except Exception as e:
                 logger.error(
                     "Failed to save session",
                     session_id=self.session_id,
                     error=str(e)
                 )
+                # 发生异常时，保持 dirty = True，以便下次重试
+                # 抛出异常让上层知道保存失败
                 raise
     
     async def load(self) -> bool:
@@ -274,6 +300,20 @@ class Session:
         cloned.metadata.tags = self.metadata.tags.copy()
         cloned.metadata.custom = self.metadata.custom.copy()
         return cloned
+    
+    def get_info(self) -> Dict[str, Any]:
+        """
+        [新增] 获取会话的统计信息
+        """
+        return {
+            "session_id": self.session_id,
+            "created_at": self.metadata.created_at,
+            "updated_at": self.metadata.updated_at,
+            "access_count": self.metadata.access_count,
+            "state_keys": len(self.state),
+            "ttl": self.metadata.ttl,
+            "tags": list(self.metadata.tags)
+        }
     
     # ===== 上下文管理器支持 =====
     

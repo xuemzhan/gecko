@@ -15,7 +15,7 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
 from gecko.compose.workflow import Workflow, WorkflowContext, CheckpointStrategy
-from gecko.compose.nodes import step
+from gecko.compose.nodes import step, Next
 from gecko.plugins.storage.backends.sqlite import SQLiteStorage
 from gecko.core.logging import setup_logging
 # [Fix] Import WorkflowError
@@ -47,16 +47,20 @@ async def step_b(context: WorkflowContext):
     
     if FAIL_FLAG:
         print("    💀 模拟系统崩溃! (System Crash)")
-        FAIL_FLAG = False # 确保下次重试能通过
+        FAIL_FLAG = False 
         raise RuntimeError("Unexpected System Failure in Node B")
     
     print("    ✅ 节点 B 执行成功")
-    return f"Processed({prev})"
+    
+    # [修改] 使用 Next 跳转，验证动态指针恢复
+    return Next(node="C", input=f"Processed({prev})")
 
 @step("Step_C")
 async def step_c(context: WorkflowContext):
     print("\n>>> 执行节点 C (最终汇总)...")
+    # [修改] 验证输入是否通过 Next 传递过来
     prev = context.get_last_output()
+    print(f"    节点 C 收到: {prev}")
     return f"FinalResult -> {prev}"
 
 # ========================= 主流程 =========================
