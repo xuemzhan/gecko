@@ -105,3 +105,30 @@ async def test_zhipu_live_stream():
             text += chunk.content
     
     assert len(text) > 0
+
+@pytest.mark.asyncio
+async def test_litellm_driver_count_tokens_strategies():
+    """[New] 测试 LiteLLMDriver 的多级计数策略"""
+    from gecko.plugins.models.drivers.litellm_driver import LiteLLMDriver
+    
+    # 1. 测试 Tiktoken 路径 (模拟 gpt-4)
+    config_gpt = ModelConfig(model_name="gpt-4")
+    driver_gpt = LiteLLMDriver(config_gpt)
+    
+    # 确保 tokenizer 被加载
+    assert driver_gpt._tokenizer is not None
+    count = driver_gpt.count_tokens("hello world")
+    assert count > 0
+    
+    # 2. 测试 Fallback 路径 (模拟未知模型)
+    # 这里的关键是确保没有安装对应 tokenizer 时不会报错，而是走降级
+    config_unknown = ModelConfig(model_name="unknown-model-123")
+    driver_unknown = LiteLLMDriver(config_unknown)
+    
+    # 应该为 None (加载失败)
+    assert driver_unknown._tokenizer is None
+    
+    # 调用计数，应该走字符估算或 litellm
+    # "hello" (5 chars) // 3 = 1
+    count_fallback = driver_unknown.count_tokens("hello") 
+    assert count_fallback > 0

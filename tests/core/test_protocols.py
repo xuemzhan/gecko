@@ -37,6 +37,10 @@ class TestProtocols:
                         )
                     ]
                 )
+
+            # 实现 count_tokens
+            def count_tokens(self, text_or_messages):
+                return 0
         
         model = ValidModel()
         assert check_protocol(model, ModelProtocol)
@@ -51,6 +55,9 @@ class TestProtocols:
             
             async def astream(self, messages, **kwargs):
                 yield StreamChunk(model="test-streaming")
+
+            def count_tokens(self, text_or_messages):
+                return 0
         
         model = StreamingModel()
         assert check_protocol(model, ModelProtocol)
@@ -69,13 +76,29 @@ class TestProtocols:
             validate_model(model)
     
     def test_get_missing_methods_model_protocol(self):
-        """测试获取 ModelProtocol 缺失的方法"""
+        """[Updated] 测试获取 ModelProtocol 缺失的方法 (包含 count_tokens)"""
         class PartialModel:
-            pass
+            # 仅实现了 acompletion，缺少 count_tokens
+            async def acompletion(self, messages, **kwargs):
+                return CompletionResponse(model="test", choices=[])
         
         missing = get_missing_methods(PartialModel(), ModelProtocol)
-        assert "acompletion" in missing
-        assert "astream" not in missing
+        # 验证 count_tokens 被识别为缺失
+        assert "count_tokens" in missing
+        assert "acompletion" not in missing
+
+    def test_valid_model_full_implementation(self):
+        """[New] 测试完整实现了 ModelProtocol (含 count_tokens) 的模型"""
+        class FullModel:
+            async def acompletion(self, messages, **kwargs):
+                return CompletionResponse(model="test", choices=[])
+            
+            def count_tokens(self, text_or_messages):
+                return 10
+        
+        model = FullModel()
+        assert check_protocol(model, ModelProtocol)
+        validate_model(model)
     
     def test_get_missing_methods_streamable_protocol(self):
         """测试获取 StreamableModelProtocol 缺失的方法"""
@@ -391,6 +414,9 @@ class TestProtocolIntegration:
             
             async def astream(self, messages, **kwargs):
                 yield StreamChunk(model=self.model_name)
+
+            def count_tokens(self, text_or_messages):
+                return 0
         
         model = FullFeaturedModel()
         

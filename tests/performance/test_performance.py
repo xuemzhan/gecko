@@ -98,9 +98,17 @@ async def test_agent_execution_baseline():
     from unittest.mock import AsyncMock, MagicMock
     from gecko.core.agent import Agent
     from gecko.core.toolbox import ToolBox
+
+    # [Fix] 使用 MagicMock 作为基类，因为 ModelProtocol 包含同步和异步方法
+    model = MagicMock()
     
-    # Mock 模型（避免真实 API 调用）
-    model = AsyncMock()
+    # 1. 模拟异步推理方法
+    model.acompletion = AsyncMock()
+    
+    # 2. [Fix] 模拟新增的同步计数方法，以通过 isinstance(model, ModelProtocol) 检查
+    model.count_tokens = MagicMock(return_value=10)
+
+    # 配置返回值
     mock_response = MagicMock()
     mock_response.choices = [MagicMock()]
     mock_response.choices[0].message.model_dump.return_value = {
@@ -109,23 +117,25 @@ async def test_agent_execution_baseline():
         "tool_calls": None
     }
     model.acompletion.return_value = mock_response
-    
+
     # 创建 Agent
     toolbox = ToolBox([])
     memory = TokenMemory(session_id="bench")
-    agent = Agent(model=model, toolbox=toolbox, memory=memory)
     
+    # 现在 model 满足 ModelProtocol 协议，不会抛出 TypeError
+    agent = Agent(model=model, toolbox=toolbox, memory=memory)
+
     # 测试 10 次执行
     iterations = 10
     start = time.perf_counter()
     for _ in range(iterations):
         await agent.run([Message.user("test")])
     duration = time.perf_counter() - start
-    
+
     avg_time = duration / iterations
-    
+
     print(f"\nAgent execution: {avg_time*1000:.2f} ms/run")
-    
+
     # 单次执行应该在 50ms 内（Mock 模式）
     assert avg_time < 0.05, f"Agent too slow: {avg_time*1000:.2f} ms"
 

@@ -119,9 +119,12 @@ class AgentBuilder:
             **self._toolbox_config  
         )  
   
-    def _build_memory(self) -> TokenMemory:  
-        return TokenMemory(  
-            session_id=self._session_id,  
-            storage=self._storage,  
-            max_tokens=self._max_tokens  
-        )  
+    def _build_memory(self) -> TokenMemory:
+        # [优化] 将 self._model (ModelProtocol) 注入到 TokenMemory
+        # 这样 Memory 就能使用模型特定的 Tokenizer，而不是硬编码的 tiktoken
+        return TokenMemory(
+            session_id=self._session_id,
+            storage=self._storage,
+            max_tokens=self._max_tokens,
+            model_driver=self._model  # 依赖注入
+        )

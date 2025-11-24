@@ -1,4 +1,6 @@
 # tests/core/test_utils.py
+import threading
+from pydantic import BaseModel
 import pytest
 import asyncio
 from gecko.core.utils import (
@@ -6,6 +8,7 @@ from gecko.core.utils import (
     retry,
     safe_dict,
     merge_dicts,
+    safe_serialize_context,
     truncate,
     format_size,
     format_duration,
@@ -216,3 +219,58 @@ class TestFunctionUtils:
         
         assert has_argument(test_func, "a")
         assert not has_argument(test_func, "c")
+
+class TestSerializationUtils:
+    """[New] 序列化工具测试"""
+
+    def test_safe_serialize_basic(self):
+        """测试基础类型和 Pydantic 对象"""
+        class MyModel(BaseModel):
+            name: str = "test"
+        
+        data = {
+            "a": 1,
+            "b": MyModel(),
+            "c": [1, 2]
+        }
+        
+        clean = safe_serialize_context(data)
+        assert clean["a"] == 1
+        assert clean["b"] == {"name": "test"} # Pydantic 转 dict
+        assert clean["c"] == [1, 2]
+
+    def test_safe_serialize_unserializable(self):
+        """[Core] 测试不可序列化对象的安全降级"""
+        lock = threading.Lock()
+        data = {
+            "valid": "data",
+            "dangerous": lock,
+            "nested": {"inner_lock": lock}
+        }
+        
+        clean = safe_serialize_context(data)
+        
+        assert clean["valid"] == "data"
+        
+        # 验证被替换为标记字典，而不是抛出异常
+        assert isinstance(clean["dangerous"], dict)
+        assert clean["dangerous"].get("__gecko_unserializable__") is True
+        assert "lock" in clean["dangerous"]["type"].lower()
+        
+        # 验证递归处理
+        assert clean["nested"]["inner_lock"].get("__gecko_unserializable__") is True
+
+    def test_safe_serialize_recursion_limit(self):
+        """测试防止无限递归"""
+        # 构造循环引用
+        d = {}
+        d["self"] = d
+    
+        # 应该优雅处理
+        clean = safe_serialize_context(d)
+        
+        # [修改] clean['self'] 本身还是一个 dict (因为递归在更深层被截断)，只要不抛错且是 dict 即可
+        # 结构会是 {'self': {'self': ... {'self': "<...>"}}}
+        assert isinstance(clean["self"], dict)
+        # 验证确实有内容
+        assert "self" in clean["self"]

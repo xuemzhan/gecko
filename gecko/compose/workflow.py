@@ -30,6 +30,8 @@ import asyncio
 import inspect
 import time
 import uuid
+# 明确导入 run_sync，避免模块/函数混淆
+from anyio.to_thread import run_sync
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar, Union, Set
 
@@ -40,7 +42,7 @@ from gecko.core.events import BaseEvent, EventBus
 from gecko.core.exceptions import WorkflowCycleError, WorkflowError
 from gecko.core.logging import get_logger
 from gecko.core.message import Message
-from gecko.core.utils import ensure_awaitable
+from gecko.core.utils import ensure_awaitable, safe_serialize_context
 from gecko.plugins.storage.interfaces import SessionInterface
 
 logger = get_logger(__name__)
@@ -719,6 +721,11 @@ class Workflow:
         
         使用 Pydantic 的 mode='json' 确保完整序列化，不进行截断。
         参数 force: 是否强制保存（忽略策略）
+
+        [优化] 异步非阻塞状态持久化
+        1. 获取原始数据 (mode='python') 避免 Pydantic 报错。
+        2. 在线程池中执行深层清洗 (CPU 密集型)。
+        3. 异步写入存储。
         """
         # 如果策略是 MANUAL 且非强制，跳过
         if not force and self.checkpoint_strategy == CheckpointStrategy.MANUAL:
@@ -729,13 +736,24 @@ class Workflow:
             return
 
         try:
-            context_data = context.model_dump(mode="json")
+            # 1. 快速获取 Python 原生字典 (包含未序列化的 Lock 等对象)
+            # 这一步很快，因为不涉及 JSON 转换
+            raw_data = context.model_dump(mode='python')
+            
+            # 2. [核心优化] 将耗时的清洗工作卸载到线程池
+            # 避免 Context 很大时阻塞 Event Loop
+            def _heavy_clean_task():
+                return safe_serialize_context(raw_data)
+            
+            clean_context_data = await run_sync(_heavy_clean_task)
+
+            # 3. 写入存储 (clean_context_data 已经是纯净的 dict)
             await self.storage.set( # type: ignore
                 f"workflow:{session_id}",
                 {
                     "step": steps,
-                    "last_node": current_node, # 这里的 current_node 语义是“刚刚执行完的节点”
-                    "context": context_data,
+                    "last_node": current_node,
+                    "context": clean_context_data,
                     "updated_at": time.time(),
                 },
             )

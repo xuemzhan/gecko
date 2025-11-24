@@ -717,6 +717,57 @@ def deduplicate(
     
     return result
 
+def safe_serialize_context(data: Any) -> Any:
+    """
+    [新增] 高性能序列化清洗工具
+    
+    功能：
+    1. 递归遍历对象结构 (Dict, List, Pydantic)。
+    2. 检测不可序列化的对象 (如 Lock, Socket)。
+    3. 将不可序列化对象替换为标记字典，而不是直接抛错。
+    4. 纯 Python 操作，便于卸载到 ThreadPool 执行。
+    """
+    def _clean(obj, depth=0):
+        # 防止无限递归
+        if depth > 20: 
+            return str(obj)
+
+        # 1. 基础类型直通
+        if obj is None or isinstance(obj, (str, int, float, bool)):
+            return obj
+        
+        # 2. 列表/元组处理
+        if isinstance(obj, (list, tuple)):
+            return [_clean(x, depth + 1) for x in obj]
+        
+        # 3. 字典处理
+        if isinstance(obj, dict):
+            new_obj = {}
+            for k, v in obj.items():
+                # 递归清洗 Value
+                new_obj[str(k)] = _clean(v, depth + 1)
+            return new_obj
+        
+        # 4. Pydantic 对象 (转为 dict 后继续清洗)
+        if hasattr(obj, "model_dump"):
+            return _clean(obj.model_dump(mode='python'), depth + 1)
+            
+        # 5. 其他对象：尝试检测是否可 JSON 序列化
+        try:
+            json.dumps(obj)
+            return obj
+        except (TypeError, OverflowError):
+            # 6. [关键] 不可序列化对象，转换为特殊标记
+            # 这样 Resume 时虽然无法恢复该对象，但至少不会导致整个流程崩溃
+            # 同时也给调试留下了线索
+            return {
+                "__gecko_unserializable__": True,
+                "type": type(obj).__name__,
+                "repr": str(obj)[:100]
+            }
+
+    return _clean(data)
+
 
 # ===== 向后兼容导出 =====
 
@@ -730,6 +781,7 @@ __all__ = [
     # 数据转换
     "safe_dict",
     "merge_dicts",
+    "safe_serialize_context",
     # 字符串
     "truncate",
     "format_size",

@@ -58,24 +58,56 @@ def event_loop():
 
 @pytest.fixture
 def mock_llm():
-    """Mock LLM 对象"""
-    llm = MagicMock()
-    llm.acompletion = AsyncMock(return_value=MagicMock(
-        choices=[MagicMock(message=MagicMock(content="Test Response", tool_calls=None))]
-    ))
+    """
+    [Critical Fix] Mock LLM 对象
+    必须返回对象，且实现 count_tokens 以通过 ModelProtocol 检查
+    """
+    # 1. 使用 spec 自动模拟协议特征
+    llm = MagicMock(spec=ModelProtocol)
+    
+    # 2. 模拟 acompletion (异步推理)
+    mock_response = MagicMock()
+    mock_response.choices = [
+        MagicMock(message=MagicMock(content="Test Response", tool_calls=None))
+    ]
+    # 确保 model_dump 可调用 (Agent 内部会调用)
+    mock_response.choices[0].message.model_dump.return_value = {
+        "role": "assistant", 
+        "content": "Test Response"
+    }
+    
+    llm.acompletion = AsyncMock(return_value=mock_response)
+    
+    # 3. [关键] 模拟 count_tokens (同步计数)
+    # 这是修复 "model 必须实现 ModelProtocol" 错误的核心
+    llm.count_tokens = MagicMock(return_value=10)
+    
+    # 4. [关键] 必须返回对象，否则测试中收到 None
     return llm
 
 @pytest.fixture
-def model():
-    model = MagicMock(spec=ModelProtocol) 
-    model.acompletion = AsyncMock(return_value=MagicMock(
-        choices=[MagicMock(message=MagicMock(content="Test Response", tool_calls=None))]
-    ))
-    return model
+def model(mock_llm):
+    """
+    model fixture 是 mock_llm 的别名，用于某些特定测试
+    """
+    return mock_llm
 
 @pytest.fixture
-def memory():
-    return TokenMemory(session_id="test_session", model_name="gpt-3.5-turbo")
+def memory(mock_llm):
+    """
+    Memory Fixture
+    [Fix] 注入 model_driver 以支持新的计数逻辑
+    """
+    return TokenMemory(
+        session_id="test_session", 
+        max_tokens=4000, 
+        model_name="gpt-3.5-turbo",
+        model_driver=mock_llm  # 注入 Mock 驱动
+    )
+
+# @pytest.fixture
+# def memory():
+#     return TokenMemory(session_id="test_session", model_name="gpt-3.5-turbo")
 
 @pytest.fixture
 def toolbox():

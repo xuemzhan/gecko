@@ -1,13 +1,18 @@
 # examples/memory_demo.py
 import asyncio
+from unittest.mock import MagicMock
 from gecko.core.memory import TokenMemory
 from gecko.core.message import Message
-from gecko.plugins.storage.sqlite import SQLiteSessionStorage
+from gecko.plugins.storage.backends.sqlite import SQLiteStorage
 
 
 async def main():
     # 1. 创建存储
-    storage = SQLiteSessionStorage("sqlite://./test.db")
+    storage = SQLiteStorage("sqlite://./test.db")
+    
+    # [New] 创建一个简单的 Mock Driver 用于演示计数委托
+    mock_driver = MagicMock()
+    mock_driver.count_tokens.return_value = 10 # 模拟每次返回 10 tokens
     
     # 2. 创建 TokenMemory
     memory = TokenMemory(
@@ -15,6 +20,8 @@ async def main():
         storage=storage,
         max_tokens=4000,
         model_name="gpt-4",
+        # [New] 注入 driver
+        model_driver=mock_driver, 
         cache_size=1000,
         max_message_length=10000
     )
@@ -24,7 +31,7 @@ async def main():
     # 3. 计算单条消息
     msg = Message.user("What's the weather today?")
     tokens = memory.count_message_tokens(msg)
-    print(f"\n单条消息 tokens: {tokens}")
+    print(f"\n单条消息 tokens: {tokens} (Mocked value should be > 0)")
     
     # 4. 批量计算
     messages = [

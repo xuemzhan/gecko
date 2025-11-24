@@ -49,6 +49,8 @@ class TokenMemory:
         cache_size: int = 2000,
         max_message_length: int = 20000,
         enable_cache_for_batch: bool = True,
+        # [新增] 接收注入的驱动
+        model_driver: Optional[ModelProtocol] = None,
     ):
         """
         初始化 Memory
@@ -74,6 +76,7 @@ class TokenMemory:
         self.cache_size = cache_size  # 公开属性
         self.max_message_length = max_message_length
         self.enable_cache_for_batch = enable_cache_for_batch
+        self.model_driver = model_driver
         
         # LRU 缓存: Hash(Content) -> TokenCount
         self._token_cache: OrderedDict[str, int] = OrderedDict()
@@ -209,6 +212,13 @@ class TokenMemory:
             message: 消息对象
             encode: 可选的编码函数（性能优化用）
         """
+        # [优化] 优先委托给模型驱动层计算
+        # 这解决了 Tokenizer Mismatch 问题，且利用了 Driver 层的性能优化
+        if self.model_driver:
+            # 转换为 OpenAI 格式传给 Driver
+            return self.model_driver.count_tokens([message.to_openai_format()])
+        
+        # 以下保留原有的 tiktoken 回退逻辑作为兜底
         if not encode:
             if self.tokenizer:
                 encode = self.tokenizer.encode

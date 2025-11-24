@@ -58,6 +58,15 @@ class ModelProtocol(Protocol):
     async def acompletion(self, messages: List[Dict[str, Any]], **kwargs) -> CompletionResponse:
         ...
 
+    # [新增] 同步 Token 计数接口
+    # 允许上层模块（如 Memory）在不阻塞 Event Loop 的前提下获取 Token 数
+    def count_tokens(self, text_or_messages: str | List[Dict[str, Any]]) -> int:
+        """
+        计算输入内容的 Token 数量。
+        应尽量使用本地 Tokenizer (如 tiktoken) 以保证性能。
+        """
+        ...
+
 @runtime_checkable
 class StreamableModelProtocol(ModelProtocol, Protocol):
     """支持流式输出的模型协议"""

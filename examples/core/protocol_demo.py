@@ -102,6 +102,9 @@ class SimpleModel:
                 total_tokens=len(user_message) + len(response_content)
             )
         )
+    
+    def count_tokens(self, text_or_messages) -> int:
+        return 100 # Demo implementation
 
 
 # ==================== 2. StreamableModelProtocol 示例 ====================
@@ -178,6 +181,9 @@ class StreamingModel:
             )
             
             yield chunk
+
+    def count_tokens(self, text_or_messages) -> int:
+        return 100 # Demo implementation
 
 
 # ==================== 3. StorageProtocol 示例 ====================
@@ -517,7 +523,7 @@ async def demo_model_protocol():
     response = await model.acompletion(messages)
     print(f"\n请求: {messages[0]['content']}")
     print(f"响应: {response.choices[0].message['content']}")
-    print(f"Token 使用: {response.usage.total_tokens}")
+    print(f"Token 使用: {response.usage.total_tokens}") # type: ignore
 
 
 async def demo_streaming_model():

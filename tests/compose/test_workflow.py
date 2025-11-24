@@ -554,3 +554,40 @@ async def test_resume_functionality(simple_workflow, mock_storage):
     node_b_mock.assert_called_once()
     
     assert result == "res_b"
+
+@pytest.mark.asyncio
+async def test_persistence_with_unserializable_state(simple_workflow, mock_storage):
+    """[Critical] 测试 Context 中包含 Lock 等不可序列化对象时，持久化不崩溃"""
+    import threading
+    
+    simple_workflow.storage = mock_storage
+    
+    # 1. 定义一个会将 Lock 放入 Context 的节点
+    def risky_node(context: WorkflowContext):
+        # 用户错误地将锁放入了 state
+        context.state["db_lock"] = threading.Lock()
+        return "done"
+        
+    simple_workflow.add_node("Risky", risky_node)
+    simple_workflow.set_entry_point("Risky")
+    
+    # 2. 执行
+    await simple_workflow.execute("start", session_id="sess_crash_test")
+    
+    # 3. 验证 Storage set 被调用（没有因为序列化错误而中断）
+    assert mock_storage.set.called
+    
+    # 4. 验证保存的数据中，Lock 被转换为了标记
+    # [Fix] 正确获取调用参数
+    # call_args 返回 (args, kwargs)，取 [0] 获取位置参数元组
+    args_tuple = mock_storage.set.call_args[0] 
+    # set 方法签名为 set(key, value)，所以 args_tuple 是 (key, value)
+    _, data = args_tuple 
+    
+    saved_state = data["context"]["state"]
+    
+    assert "db_lock" in saved_state
+    lock_data = saved_state["db_lock"]
+    assert isinstance(lock_data, dict)
+    # 验证对象被正确转换为不可序列化标记，而不是导致程序崩溃
+    assert lock_data.get("__gecko_unserializable__") is True

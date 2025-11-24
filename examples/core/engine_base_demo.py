@@ -36,7 +36,7 @@ class MockModel(ModelProtocol):
             choices=[
                 CompletionChoice(message={"role": "assistant", "content": response_text})
             ],
-            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15} # type: ignore
         )
 
     async def astream(self, messages: List[Dict[str, Any]], **kwargs) -> AsyncIterator[StreamChunk]:
@@ -47,6 +47,14 @@ class MockModel(ModelProtocol):
             yield StreamChunk(
                 choices=[{"delta": {"content": word + " "}}]
             )
+
+    def count_tokens(self, text_or_messages) -> int:
+        # 简单模拟：按字符数估算，不阻塞主线程
+        if isinstance(text_or_messages, list):
+            text = "".join(str(m.get("content", "")) for m in text_or_messages)
+        else:
+            text = str(text_or_messages)
+        return len(text) // 4
 
 # ==========================================
 # 2. 自定义引擎实现 (Custom Engine)
@@ -86,7 +94,7 @@ class DemoEngine(CognitiveEngine):
             if isinstance(usage_info, dict):
                 total_tokens = usage_info.get("total_tokens", 0)
             elif hasattr(usage_info, "total_tokens"):
-                total_tokens = usage_info.total_tokens
+                total_tokens = usage_info.total_tokens # type: ignore
 
             # 6. 构建输出
             output = AgentOutput(
@@ -113,13 +121,13 @@ class DemoEngine(CognitiveEngine):
             await self.on_error(e, input_messages)
             raise
 
-    async def step_stream(self, input_messages: List[Message], **kwargs) -> AsyncIterator[str]:
+    async def step_stream(self, input_messages: List[Message], **kwargs) -> AsyncIterator[str]: # type: ignore
         """
         覆盖流式推理方法
         """
         formatted_msgs = [m.to_openai_format() for m in input_messages]
         
-        async for chunk in self.model.astream(formatted_msgs):
+        async for chunk in self.model.astream(formatted_msgs): # type: ignore
             content = chunk.content
             if content:
                 yield content
@@ -206,10 +214,10 @@ async def main():
         # --- 查看统计 ---
         print("4️⃣  Execution Stats")
         stats = engine.get_stats()
-        print(f"   Total Steps: {stats['total_steps']}")
-        print(f"   Total Time:  {stats['total_time']:.4f}s")
-        print(f"   Avg Time:    {stats['avg_step_time']:.4f}s")
-        print(f"   Errors:      {stats['errors']}")
+        print(f"   Total Steps: {stats['total_steps']}") # type: ignore
+        print(f"   Total Time:  {stats['total_time']:.4f}s") # type: ignore
+        print(f"   Avg Time:    {stats['avg_step_time']:.4f}s") # type: ignore
+        print(f"   Errors:      {stats['errors']}") # type: ignore
 
 if __name__ == "__main__":
     asyncio.run(main())
