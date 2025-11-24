@@ -59,12 +59,12 @@ def event_loop():
 @pytest.fixture
 def mock_toolbox():
     tb = MagicMock(spec=ToolBox)
-    # [修复] 添加 description 防止 System Prompt 渲染报错
+    # [Fix] 添加 description 字段以通过 System Prompt 的 Jinja2 渲染
     tb.to_openai_schema.return_value = [{
         "type": "function", 
         "function": {
             "name": "t1", 
-            "description": "mock tool" 
+            "description": "mock tool description" 
         }
     }]
     tb.execute_many = AsyncMock(return_value=[])

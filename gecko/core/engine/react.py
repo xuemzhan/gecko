@@ -291,7 +291,21 @@ class ReActEngine(CognitiveEngine):
         # 1. 死循环检测
         if self._detect_infinite_loop(assistant_msg, context):
             logger.warning("Detected infinite tool loop, breaking.")
-            context.add_message(assistant_msg)
+            
+            # [关键] 不要把错误的 tool call 加入 context 的历史
+            # 如果把死循环的 tool call 加入历史，LLM 在重试时看到历史里自己刚调用了这个工具，
+            # 可能会再次困惑。
+            # 策略：
+            # 1. 记录这个由 Assistant 发出的错误尝试
+            context.add_message(assistant_msg) 
+            # 2. 紧接着追加 User/System 的警告，强制打断它的思维惯性
+            context.add_message(Message.user(
+                f"System Alert: Execution stopped because you are"
+                f" calling tool '{assistant_msg.tool_calls[0]['function']['name']}' " # type: ignore
+                "repeatedly with identical arguments. " # type: ignore
+                "Stop looping. Provide the final answer immediately using the correct format."
+            ))
+            
             return False
 
         context.add_message(assistant_msg)
@@ -765,30 +779,62 @@ class ReActEngine(CognitiveEngine):
         context: ExecutionContext,
         llm_params: Dict[str, Any],
         max_retries: int,
-    ) -> T:
+    ) -> T: # type: ignore
         """处理结构化输出解析与自动重试"""
+        expected_tool_name = StructureEngine.to_openai_tool(response_model)["function"]["name"]
+
         for attempt in range(max_retries + 1):
             try:
+                # ------------------------------------------------------------------
+                # [增强逻辑] 智能定位目标工具调用
+                # ------------------------------------------------------------------
+                target_tool_call = None
+                
+                if output.tool_calls and self._supports_functions:
+                    # 1. 尝试在所有工具调用中寻找匹配预期的那个
+                    for tc in output.tool_calls:
+                        name = tc.get("function", {}).get("name")
+                        if name == expected_tool_name:
+                            target_tool_call = tc
+                            break
+                    
+                    # 2. 如果有工具调用，但没一个是目标工具 -> 判定为推理中断/死循环/逻辑错误
+                    if not target_tool_call:
+                        # 获取第一个工具名用于报错信息
+                        first_tool = output.tool_calls[0].get("function", {}).get("name")
+                        raise StructureParseError(
+                            f"Incorrect tool used. Expected final tool '{expected_tool_name}', "
+                            f"but detected intermediate tool(s) like '{first_tool}'. "
+                            "Execution stopped prematurely (e.g., infinite loop or max turns reached). "
+                            "Please directly call the final tool with the answer."
+                        )
+                
+                # ------------------------------------------------------------------
+                # 解析逻辑 (传入过滤后的 target_tool_call)
+                # ------------------------------------------------------------------
+                # 注意：如果是纯文本，target_tool_call 为 None，parse 会尝试从 content 提取
                 return await StructureEngine.parse(
                     content=output.content,
                     model_class=response_model,
-                    raw_tool_calls=output.tool_calls,
+                    # 关键：只传给解析器它关心的那个工具调用，或者 None
+                    raw_tool_calls=[target_tool_call] if target_tool_call else None,
                     auto_fix=True,
                 )
+
             except StructureParseError as e:
                 if attempt >= max_retries:
-                    raise AgentError(f"Failed to parse structured output: {e}")
+                    raise AgentError(f"Failed to parse structured output after {max_retries} retries: {e}")
 
-                # 重试反馈
+                # 构造反馈消息 (保持不变)
                 feedback_msg = Message.user(
-                    f"Error parsing response: {e}. Please ensure strict JSON format."
+                    f"Error parsing response: {e}. Please ensure you call the '{expected_tool_name}' function correctly."
                 )
                 context.add_message(feedback_msg)
+                
+                # 重新生成
                 response = await self._call_llm(context, llm_params)
                 msg = self._parse_llm_response(response)
                 context.add_message(msg)
                 output = AgentOutput(
                     content=msg.content or "", tool_calls=msg.tool_calls or [] # type: ignore
                 )
-
-        raise AgentError("Structured parsing failed")

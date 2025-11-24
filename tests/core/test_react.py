@@ -121,14 +121,16 @@ async def test_step_with_tool_execution(engine, mock_model, mock_toolbox):
 @pytest.mark.asyncio
 async def test_step_max_turns(engine, mock_model):
     """测试最大轮数限制"""
+    # 构造导致死循环的相同调用
     resp = create_mock_response(tool_calls=[{"id": "1", "function": {"name": "t1", "arguments": "{}"}}])
     mock_model.acompletion.return_value = resp
     engine.max_turns = 2
     
     output = await engine.step([Message.user("Loop")])
     
-    # 超过轮数强制结束
-    assert "No response" in output.content or output.tool_calls
+    # [Fix] 更新断言：新的死循环检测逻辑会注入 System Alert
+    # 检查内容中是否包含 "Execution stopped" 或 "System Alert"
+    assert "Execution stopped" in output.content or "System Alert" in output.content
 
 # ========================= 2. 流式推理测试 =========================
 
@@ -389,3 +391,153 @@ async def test_step_stream_recursion_depth_safety(engine, mock_model, mock_toolb
 
     # 验证确实执行了多次 LLM 调用 (达到 max_turns 上限)
     assert mock_model.astream.call_count >= 50
+
+# ========================= 8. 修复验证与增强测试 =========================
+
+@pytest.mark.asyncio
+async def test_structured_output_with_intermediate_tool(engine, mock_model):
+    """
+    [Fix Verification] 测试非目标工具拦截逻辑
+    
+    场景：用户请求结构化输出 (TargetModel)，但模型因死循环或逻辑错误，
+    返回了一个中间工具 (e.g., search)，而不是最终结果工具。
+    
+    期望：
+    1. 系统不应尝试用 search 的参数去解析 TargetModel (防止 ValidationError)。
+    2. 系统应抛出 StructureParseError 并触发重试。
+    3. 重试后若模型返回正确结果，应成功。
+    """
+    class TargetModel(BaseModel):
+        reason: str
+        score: int
+
+    target_tool_name = "targetmodel"
+    
+    resp_wrong = create_mock_response(tool_calls=[
+        {"id": "1", "function": {"name": "calculator", "arguments": '{"expr": "1+1"}'}}
+    ])
+    
+    resp_correct = create_mock_response(tool_calls=[
+        {"id": "2", "function": {
+            "name": target_tool_name, 
+            "arguments": '{"reason": "ok", "score": 100}'
+        }}
+    ])
+    
+    mock_model.acompletion.side_effect = [resp_wrong, resp_correct]
+    
+    # [Fix] 关键修改：将 max_turns 设置为 1
+    # 这强制引擎在第一轮（错误工具）后停止，将其作为最终结果返回，
+    # 从而触发 _handle_structured_output 中的校验和重试逻辑。
+    engine.max_turns = 1
+    
+    # 执行
+    result = await engine.step(
+        [Message.user("Evaluate")], 
+        response_model=TargetModel,
+        max_retries=1
+    )
+    
+    # 验证
+    assert isinstance(result, TargetModel)
+    assert result.score == 100
+    
+    # 验证调用次数 (1次 ReAct + 1次 Retry)
+    assert mock_model.acompletion.call_count == 2
+    
+    # 检查重试时的反馈消息
+    # call_args_list[1] 是第二次调用 (Retry)
+    # [1]['messages'] 是参数中的 messages 列表
+    retry_input_msgs = mock_model.acompletion.call_args_list[1][1]['messages']
+    last_msg = retry_input_msgs[-1]
+    
+    # 验证反馈内容
+    assert last_msg['role'] == 'user'
+    assert "Incorrect tool used" in last_msg['content']
+
+@pytest.mark.asyncio
+async def test_structured_output_with_parallel_tools(engine, mock_model):
+    """
+    [Enhancement] 测试并行工具调用筛选
+    
+    场景：模型很聪明，在一次返回中同时调用了 'save_log' (副作用) 和 'final_result' (目标)。
+    期望：系统能遍历 tool_calls，忽略 log，精准找到 final_result 进行解析。
+    """
+    class FinalResult(BaseModel):
+        answer: str
+
+    target_name = "finalresult"
+    
+    # 模拟并行调用：列表里有两个工具
+    parallel_resp = create_mock_response(tool_calls=[
+        # 干扰项：排在第一个
+        {"id": "1", "function": {"name": "save_log", "arguments": '{"msg": "thinking"}'}},
+        # 目标项
+        {"id": "2", "function": {"name": target_name, "arguments": '{"answer": "42"}'}}
+    ])
+    
+    mock_model.acompletion.return_value = parallel_resp
+    
+    # 执行
+    result = await engine.step([Message.user("Run")], response_model=FinalResult)
+    
+    # 验证
+    assert isinstance(result, FinalResult)
+    assert result.answer == "42"
+    # 确保只调用了一次 LLM (没有因为解析错误而重试)
+    assert mock_model.acompletion.call_count == 1
+
+@pytest.mark.asyncio
+async def test_infinite_loop_feedback_injection(engine, mock_model, mock_toolbox):
+    """
+    [Fix Verification] 测试死循环时的 System Alert 注入
+    
+    场景：模型陷入死循环，被 detect_infinite_loop 拦截。
+    期望：
+    1. 循环中断。
+    2. 上下文中被注入了一条 System Alert (User Role)。
+    """
+    # 构造完全相同的工具调用
+    repeat_call = create_mock_response(tool_calls=[
+        {"id": "x", "function": {"name": "t1", "arguments": "{}"}}
+    ])
+    
+    # 设置为每次都返回相同内容
+    mock_model.acompletion.return_value = repeat_call
+    mock_toolbox.execute_many.return_value = [ToolExecutionResult("t1", "x", "res", False)]
+    
+    engine.max_turns = 5
+    
+    # 执行 (这会触发死循环保护)
+    # 我们不关心返回值，只关心上下文状态
+    await engine.step([Message.user("Loop")])
+    
+    # 获取最后一次调用时的上下文消息历史
+    last_call_args = mock_model.acompletion.call_args
+    messages_sent = last_call_args[1]['messages']
+    
+    # 验证最后一条消息是否包含 System Alert
+    # 注意：Engine 内部逻辑是：检测到循环 -> 添加 AssitantMsg(ToolCall) -> 添加 UserMsg(Alert) -> Break
+    # 但因为 Break 了，最后一条 Alert 实际上不会发给 LLM (因为没有下一轮了)。
+    # 但是 step 方法最后会保存 context。我们需要检查 engine 内部的 context 或者通过 Side Effect 验证。
+    
+    # 这里我们通过检查 engine 运行过程中的行为来验证。
+    # 由于 step 方法结束后 context 就销毁了（局部变量），我们可以 Mock on_turn_end 来捕获 Context。
+    
+    captured_context = None
+    async def capture_ctx(ctx):
+        nonlocal captured_context
+        captured_context = ctx
+    
+    engine.on_turn_end = capture_ctx
+    
+    # 重新运行
+    await engine.step([Message.user("Loop2")])
+    
+    assert captured_context is not None
+    last_msg = captured_context.messages[-1]
+    
+    # 验证注入了警告
+    assert last_msg.role == "user"
+    assert "System Alert" in str(last_msg.content)
+    assert "Stop looping" in str(last_msg.content)
