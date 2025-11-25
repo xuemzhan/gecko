@@ -99,6 +99,28 @@ class TestToolBoxBasics:
 
 class TestToolExecution:
     """测试工具执行"""
+
+    @pytest.mark.asyncio
+    async def test_execute_with_json_error_flag(self, toolbox):
+        """
+        [New] 测试 ToolBox 处理来自 Engine 的 JSON 解析错误标记
+        """
+        # 构造带有错误标记的参数 (模拟 ReAct 引擎的行为)
+        bad_args = {
+            "__gecko_parse_error__": "Unexpected end of string"
+        }
+        
+        # 执行
+        # 即使工具名 "mock_tool" 存在，也不应该调用它，而是直接返回错误
+        result = await toolbox.execute_with_result("mock_tool", bad_args)
+        
+        # 验证
+        assert result.is_error is True
+        assert "System Error: Failed to parse arguments" in result.result
+        assert "Unexpected end of string" in result.result
+        assert "Please correct your JSON format" in result.result
+        
+        # 验证没有抛出 ToolNotFoundError 或其他异常
     
     @pytest.mark.asyncio
     async def test_execute_success(self, toolbox):
@@ -268,3 +290,4 @@ class TestRetry:
         # 由于重试有 sleep，这个测试会稍微慢一点
         result = await toolbox.execute_with_result("error_tool", {})
         assert result.is_error
+

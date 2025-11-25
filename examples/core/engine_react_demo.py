@@ -12,8 +12,8 @@ from gecko.core.memory import TokenMemory
 from gecko.core.toolbox import ToolBox
 from gecko.core.engine.react import ReActEngine
 from gecko.plugins.tools.base import BaseTool
-# [修改] 导入新的模型类
-from gecko.plugins.models import ZhipuChat
+from gecko.core.events import EventBus, AgentRunEvent
+from gecko.plugins.models.presets.zhipu import ZhipuChat
 
 # ==========================================
 # 1. 定义简单的工具 (保持不变)
@@ -72,6 +72,19 @@ class AnalysisReport(BaseModel):
     priority: str = Field(description="优先级 (High/Medium/Low)")
 
 # ==========================================
+# Event Handler
+# ==========================================
+async def on_tool_event(event: AgentRunEvent):
+    """监听工具执行事件，模拟前端 UI 更新"""
+    if event.type == "tool_execution_start":
+        tools = event.data.get("tools", [])
+        names = ", ".join([t["name"] for t in tools])
+        print(f"\n[UI Event] ⏳ 正在调用工具: {names} ...")
+    elif event.type == "tool_execution_end":
+        count = event.data.get("result_count", 0)
+        print(f"[UI Event] ✅ 工具执行完成 ({count} 个结果)\n")
+
+# ==========================================
 # 3. 主演示流程
 # ==========================================
 
@@ -90,14 +103,19 @@ async def main():
     # 3. 初始化记忆
     memory = TokenMemory(session_id="react_demo_session", max_tokens=2000)
 
-    # 4. 构建 Agent (使用 ReActEngine)
+    # [New] 创建 EventBus 并注册监听器
+    event_bus = EventBus()
+    event_bus.subscribe("tool_execution_start", on_tool_event) # type: ignore
+    event_bus.subscribe("tool_execution_end", on_tool_event) # type: ignore
+
+    # [New] 注入 EventBus
     agent = Agent(
         model=llm,
         toolbox=toolbox,
         memory=memory,
         engine_cls=ReActEngine,
-        # 增加最大轮数(5->10)，测试迭代循环的稳定性
-        max_turns=10 # 限制最大思考轮数
+        event_bus=event_bus, # 注入
+        max_turns=10
     )
 
     print("\n🚀 ReAct Agent Demo (Powered by ZhipuChat)\n")

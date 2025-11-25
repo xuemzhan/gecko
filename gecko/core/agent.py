@@ -26,20 +26,21 @@ class Agent:
     def __init__(  
         self,  
         model: Any,  
-        toolbox: ToolBox,  
+        toolbox: ToolBox,
         memory: TokenMemory,  
         engine_cls: Type[CognitiveEngine] = ReActEngine,  
         event_bus: Optional[EventBus] = None,  
         **engine_kwargs: Any,  
     ):  
-        self.event_bus = event_bus or EventBus()  
-        self.toolbox = toolbox  
-        self.memory = memory  
-        self.engine = engine_cls(  
-            model=model,  
-            toolbox=toolbox,  
+        self.event_bus = event_bus or EventBus()
+        self.toolbox = toolbox
+        self.memory = memory
+        self.engine = engine_cls(
+            model=model,
+            toolbox=toolbox,
+            event_bus=self.event_bus,
             memory=memory,  
-            **engine_kwargs  
+            **engine_kwargs
         )  
   
     async def run(  

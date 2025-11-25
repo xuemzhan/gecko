@@ -13,15 +13,13 @@ ReAct Engine 单元测试 (完整版)
 7. 上下文与记忆管理
 """
 import pytest
-import json
-import time
-from unittest.mock import MagicMock, AsyncMock, call
+from unittest.mock import MagicMock, AsyncMock
 from types import SimpleNamespace
-from typing import Any, List
 
 from pydantic import BaseModel
 
 from gecko.core.engine.react import ReActEngine, ExecutionContext
+from gecko.core.events.bus import EventBus
 from gecko.core.message import Message
 from gecko.core.output import AgentOutput
 from gecko.core.toolbox import ToolBox, ToolExecutionResult
@@ -60,6 +58,24 @@ def mock_toolbox():
     tb.execute_many = AsyncMock(return_value=[])
     return tb
 
+# [修复] 显式定义 mock_event_bus fixture
+@pytest.fixture
+def mock_event_bus():
+    bus = MagicMock(spec=EventBus)
+    bus.publish = AsyncMock()
+    return bus
+
+# [修复] 确保 engine fixture 接收 mock_event_bus 参数
+@pytest.fixture
+def engine(mock_model, mock_toolbox, mock_memory, mock_event_bus):
+    return ReActEngine(
+        model=mock_model,
+        toolbox=mock_toolbox,
+        memory=mock_memory,
+        event_bus=mock_event_bus, # 注入
+        max_turns=5,
+        max_observation_length=100
+    )
 @pytest.fixture
 def mock_model():
     return MockModel()
@@ -74,15 +90,6 @@ def mock_memory():
     mem.get_history = AsyncMock(return_value=[])
     return mem
 
-@pytest.fixture
-def engine(mock_model, mock_toolbox, mock_memory):
-    return ReActEngine(
-        model=mock_model,
-        toolbox=mock_toolbox,
-        memory=mock_memory,
-        max_turns=5,
-        max_observation_length=100  # 设置较小的截断阈值方便测试
-    )
 
 # ========================= 1. 基础推理测试 =========================
 
@@ -541,3 +548,87 @@ async def test_infinite_loop_feedback_injection(engine, mock_model, mock_toolbox
     assert last_msg.role == "user"
     assert "System Alert" in str(last_msg.content)
     assert "Stop looping" in str(last_msg.content)
+
+# [新增] 测试流式工具事件
+@pytest.mark.asyncio
+async def test_step_stream_events(engine, mock_model, mock_toolbox, mock_event_bus):
+    """
+    测试流式模式下是否发送工具开始/结束事件
+    解决前端'静默'问题
+    """
+    # 1. 模拟第一轮：LLM 调用工具
+    async def stream_gen_tool(*args, **kwargs):
+        # 模拟返回一个 Tool Call
+        yield SimpleNamespace(choices=[{
+            "delta": {
+                "tool_calls": [{
+                    "index": 0, 
+                    "id": "c1", 
+                    "function": {"name": "t1", "arguments": "{}"}
+                }]
+            }
+        }])
+    
+    # 2. [新增] 模拟第二轮：LLM 在工具执行后返回最终结果
+    # 如果不提供这个，ReAct 循环再次调用 astream 时会因为 side_effect 耗尽而崩溃
+    async def stream_gen_final(*args, **kwargs):
+        yield SimpleNamespace(choices=[{
+            "delta": {
+                "content": "Done"
+            }
+        }])
+    
+    # 配置 side_effect 包含两轮响应
+    mock_model.astream.side_effect = [stream_gen_tool(), stream_gen_final()]
+    
+    mock_toolbox.execute_many.return_value = [ToolExecutionResult("t1", "c1", "Res", False)]
+    
+    # 执行流式
+    async for _ in engine.step_stream([Message.user("Run")]):
+        pass
+        
+    # 验证 EventBus 调用
+    # 至少调用2次 (Start, End)
+    assert mock_event_bus.publish.call_count >= 2
+    
+    # 验证具体事件类型
+    calls = mock_event_bus.publish.call_args_list
+    event_types = [c[0][0].type for c in calls] # c[0][0] is the Event object
+    
+    assert "tool_execution_start" in event_types
+    assert "tool_execution_end" in event_types
+
+# [新增] 测试 JSON 容错与反馈
+@pytest.mark.asyncio
+async def test_react_json_fault_tolerance(engine, mock_model, mock_toolbox):
+    """
+    测试 LLM 返回非法 JSON 时的处理流程
+    """
+    # 1. LLM 返回非法 JSON (少个引号)
+    bad_json_args = '{"arg": "value"' 
+    
+    resp1 = create_mock_response(tool_calls=[
+        {"id": "1", "function": {"name": "t1", "arguments": bad_json_args}}
+    ])
+    # 2. 第二轮 LLM 收到错误反馈后，修正并返回正确结果
+    resp2 = create_mock_response(content="Sorry, here is the result.")
+    
+    mock_model.acompletion.side_effect = [resp1, resp2]
+    
+    # 3. ToolBox 应该收到带有错误标记的参数
+    # 我们需要模拟 ToolBox 的 execute_many 行为，这里它会识别标记并返回系统错误提示
+    # 实际集成中由 ToolBox 代码处理，但在单元测试中我们需要 Mock 它的返回值或者使用真实 ToolBox
+    # 为了测试 Engine 的逻辑，我们验证 Engine 传递给 ToolBox 的参数是否包含标记
+    
+    await engine.step([Message.user("Break JSON")])
+    
+    # 验证 Engine 调用 ToolBox 时传递了错误标记
+    execute_call = mock_toolbox.execute_many.call_args
+    passed_tool_calls = execute_call[0][0] # 第一个参数
+    
+    assert len(passed_tool_calls) == 1
+    args = passed_tool_calls[0]["arguments"]
+    
+    # 关键断言：Engine 捕获了 JSON 错误并转换为了特殊 Key
+    assert "__gecko_parse_error__" in args
+    assert "JSON format error" in args["__gecko_parse_error__"]

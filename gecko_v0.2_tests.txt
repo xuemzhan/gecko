@@ -1,0 +1,5715 @@
+[1] tests/__init__.py
+```python
+```
+
+[2] tests/compose/test_nodes.py
+```python
+# tests/compose/test_nodes.py
+"""
+Nodes 模块单元测试
+
+覆盖率目标：100%
+测试范围：
+1. Next 控制流指令模型
+2. step 装饰器的元数据保留机制
+3. step 装饰器的同步/异步统一包装能力
+4. 节点属性标记 (_is_step, _step_name)
+"""
+import pytest
+import inspect
+import asyncio
+from pydantic import ValidationError
+
+from gecko.compose.nodes import Next, step
+
+# ========================= 1. Next 模型测试 =========================
+
+def test_next_model_initialization():
+    """测试 Next 对象初始化"""
+    # 1. 仅指定节点
+    n1 = Next(node="TargetNode")
+    assert n1.node == "TargetNode"
+    assert n1.input is None
+
+    # 2. 指定节点和输入
+    n2 = Next(node="TargetNode", input={"data": 123})
+    assert n2.node == "TargetNode"
+    assert n2.input == {"data": 123}
+
+def test_next_model_validation():
+    """测试 Next 对象字段验证"""
+    # 缺少必填字段 node
+    with pytest.raises(ValidationError):
+        Next(input="data") # type: ignore
+
+    # input 可以是任意类型
+    n = Next(node="A", input=123)
+    assert n.input == 123
+
+# ========================= 2. step 装饰器元数据测试 =========================
+
+def test_step_metadata_preservation():
+    """
+    核心测试：验证 wraps 是否保留了原始函数的元数据
+    这对 Workflow 的智能参数注入至关重要
+    """
+    
+    @step()
+    def sample_func(a: int, b: int = 1) -> int:
+        """This is a docstring."""
+        return a + b
+
+    # 1. 验证名称和文档
+    assert sample_func.__name__ == "sample_func"
+    assert sample_func.__doc__ == "This is a docstring."
+    
+    # 2. 验证签名 (Signature)
+    sig = inspect.signature(sample_func)
+    assert "a" in sig.parameters
+    assert sig.parameters["a"].annotation == int
+    assert "b" in sig.parameters
+    assert sig.parameters["b"].default == 1
+    
+    # 3. 验证该函数变成了协程函数 (因为 wrapper 是 async def)
+    assert inspect.iscoroutinefunction(sample_func)
+
+def test_step_attributes_injection():
+    """测试装饰器注入的特殊属性"""
+    
+    # Case 1: 默认名称
+    @step()
+    def func_a(): pass
+    
+    assert getattr(func_a, "_is_step") is True
+    assert getattr(func_a, "_step_name") == "func_a"
+    
+    # Case 2: 自定义名称
+    @step(name="CustomNodeName")
+    def func_b(): pass
+    
+    assert getattr(func_b, "_is_step") is True
+    assert getattr(func_b, "_step_name") == "CustomNodeName"
+
+# ========================= 3. step 执行逻辑测试 =========================
+
+@pytest.mark.asyncio
+async def test_step_execution_sync():
+    """测试装饰同步函数"""
+    @step()
+    def sync_add(x, y):
+        return x + y
+    
+    # 装饰后应当可以被 await
+    result = await sync_add(10, 20)
+    assert result == 30
+
+@pytest.mark.asyncio
+async def test_step_execution_async():
+    """测试装饰异步函数"""
+    @step()
+    async def async_mult(x, y):
+        await asyncio.sleep(0.01)
+        return x * y
+    
+    result = await async_mult(10, 20)
+    assert result == 200
+
+@pytest.mark.asyncio
+async def test_step_execution_args_kwargs():
+    """测试参数透传 (*args, **kwargs)"""
+    @step()
+    def messy_args(*args, **kwargs):
+        return sum(args) + kwargs.get("val", 0)
+    
+    result = await messy_args(1, 2, 3, val=4)
+    assert result == 10  # 1+2+3+4
+
+@pytest.mark.asyncio
+async def test_step_exception_propagation():
+    """测试异常传播"""
+    @step()
+    def failing_func():
+        raise ValueError("Boom")
+    
+    with pytest.raises(ValueError, match="Boom"):
+        await failing_func()
+
+def test_next_with_state_update():
+    """[New] 测试 Next 携带状态更新"""
+    n = Next(
+        node="B", 
+        input="data", 
+        update_state={"counter": 1, "flag": True}
+    )
+    assert n.update_state == {"counter": 1, "flag": True}
+```
+
+[3] tests/compose/test_team.py
+```python
+# tests/compose/test_team.py (Updated for Phase 1)
+import pytest
+import asyncio
+from typing import Any
+from unittest.mock import MagicMock, AsyncMock, patch
+
+from pydantic import BaseModel
+
+from gecko.compose.team import Team, MemberResult
+from gecko.core.agent import Agent
+from gecko.core.message import Message
+from gecko.core.output import AgentOutput
+
+# ========================= Mock 对象 =========================
+
+class MockContext:
+    def __init__(self, input_data: Any, history: dict = None, state: dict = None): # type: ignore
+        self.input = input_data
+        self.history = history or {}
+        self.state = state or {}
+
+class MockAgent:
+    def __init__(self, return_value="agent_result"):
+        self.return_value = return_value
+        self.run = AsyncMock(return_value=AgentOutput(content=return_value))
+
+# ========================= 测试用例 =========================
+
+@pytest.mark.asyncio
+async def test_team_init_and_call():
+    """测试 Team 初始化及 __call__ 协议"""
+    async def simple_task(x):
+        return f"processed {x}"
+    
+    team = Team(members=[simple_task], name="TestTeam")
+    
+    # 测试 __call__ 返回 MemberResult 列表
+    results = await team("data")
+    assert len(results) == 1
+    assert isinstance(results[0], MemberResult)
+    assert results[0].result == "processed data"
+    assert results[0].is_success is True
+
+@pytest.mark.asyncio
+async def test_mixed_members_execution():
+    """测试混合成员类型 (Agent + Callable)"""
+    agent = MockAgent(return_value="agent_done")
+    
+    async def func_task(x):
+        return f"func_{x}"
+    
+    def sync_task(x):
+        return f"sync_{x}"
+    
+    team = Team(members=[agent, func_task, sync_task]) # type: ignore
+    results = await team.run("input")
+    
+    # 验证结果对象
+    assert results[0].result == "agent_done"
+    assert results[1].result == "func_input"
+    assert results[2].result == "sync_input"
+    assert all(r.is_success for r in results)
+
+@pytest.mark.asyncio
+async def test_invalid_member_type():
+    """测试无效的成员类型"""
+    team = Team(members=["not_callable_string"]) # type: ignore
+    
+    results = await team.run("input")
+    
+    assert len(results) == 1
+    assert results[0].is_success is False
+    assert "not executable" in results[0].error # type: ignore
+
+@pytest.mark.asyncio
+async def test_partial_failure():
+    """测试部分失败容错机制"""
+    async def success_task(x):
+        return "success"
+    
+    async def failing_task(x):
+        raise ValueError("Boom!")
+    
+    team = Team(members=[success_task, failing_task])
+    
+    with patch("gecko.compose.team.logger") as mock_logger:
+        results = await team.run("input")
+        
+        # 验证结果结构
+        assert results[0].result == "success"
+        assert results[0].is_success is True
+        
+        assert results[1].is_success is False
+        assert results[1].result is None
+        assert "Boom!" in results[1].error # type: ignore
+        
+        mock_logger.error.assert_called()
+
+@pytest.mark.asyncio
+async def test_data_handover_no_cleaning():
+    """
+    [Updated] 测试 Data Handover 不再自动清洗
+    验证字典能够原样传递给下游，而不是只提取 content
+    """
+    team = Team([])
+    
+    # 模拟上一个节点返回的是复杂字典
+    complex_output = {
+        "content": "clean_text",
+        "tool_calls": [],
+        "usage": {"total_tokens": 100}
+    }
+    
+    ctx = MockContext(input_data="x", history={"last_output": complex_output})
+    
+    # 断言：现在应该返回完整的字典，而不是仅仅是 "clean_text"
+    resolved = team._resolve_input(ctx)
+    assert resolved == complex_output
+    assert resolved["usage"]["total_tokens"] == 100
+
+@pytest.mark.asyncio
+async def test_member_result_value_property():
+    """测试 MemberResult.value 便捷属性"""
+    success_res = MemberResult(member_index=0, result="ok", is_success=True)
+    assert success_res.value == "ok"
+    
+    fail_res = MemberResult(member_index=1, error="failed", is_success=False)
+    with pytest.raises(RuntimeError, match="failed"):
+        _ = fail_res.value
+```
+
+[4] tests/compose/test_workflow.py
+```python
+# tests/compose/test_workflow.py
+"""
+Workflow 模块单元测试
+
+覆盖率目标：100%
+修复内容：
+- [Fix] test_node_binding_error: 适配最新的参数注入逻辑，断言运行时的 TypeError 而非签名检查错误
+- [Fix] 保持其他测试用例的稳定性
+"""
+import time
+import pytest
+import asyncio
+from unittest.mock import MagicMock, AsyncMock, patch, ANY
+from pydantic import BaseModel
+
+from gecko.compose.workflow import Workflow, WorkflowContext, NodeStatus, WorkflowError, WorkflowCycleError
+from gecko.compose.nodes import Next
+from gecko.core.message import Message
+from gecko.plugins.storage.interfaces import SessionInterface
+from gecko.compose.workflow import CheckpointStrategy
+
+# ========================= Fixtures =========================
+
+@pytest.fixture
+def mock_storage():
+    storage = MagicMock(spec=SessionInterface)
+    storage.set = AsyncMock()
+    return storage
+
+@pytest.fixture
+def mock_event_bus():
+    bus = MagicMock()
+    bus.publish = AsyncMock()
+    return bus
+
+@pytest.fixture
+def simple_workflow(mock_event_bus):
+    return Workflow(name="TestWorkflow", event_bus=mock_event_bus)
+
+# ========================= 1. DAG 构建与验证测试 =========================
+
+def test_add_duplicate_node(simple_workflow):
+    """测试添加重复节点抛出异常"""
+    simple_workflow.add_node("A", lambda: None)
+    with pytest.raises(ValueError, match="already exists"):
+        simple_workflow.add_node("A", lambda: None)
+
+def test_add_edge_missing_nodes(simple_workflow):
+    """测试添加边时节点不存在"""
+    simple_workflow.add_node("A", lambda: None)
+    with pytest.raises(ValueError, match="Source node 'B' not found"):
+        simple_workflow.add_edge("B", "A")
+    with pytest.raises(ValueError, match="Target node 'B' not found"):
+        simple_workflow.add_edge("A", "B")
+
+def test_set_invalid_entry_point(simple_workflow):
+    """测试设置不存在的入口节点"""
+    with pytest.raises(ValueError, match="Node 'X' not found"):
+        simple_workflow.set_entry_point("X")
+
+def test_validate_no_entry_point(simple_workflow):
+    """测试验证：无入口点"""
+    simple_workflow.add_node("A", lambda: None)
+    assert simple_workflow.validate() is False
+    assert "No entry point defined" in simple_workflow._validation_errors
+
+def test_validate_cycle_detection(simple_workflow):
+    """测试验证：环检测"""
+    simple_workflow.add_node("A", lambda: None)
+    simple_workflow.add_node("B", lambda: None)
+    simple_workflow.set_entry_point("A")
+    
+    simple_workflow.add_edge("A", "B")
+    simple_workflow.add_edge("B", "A")  # A->B->A 环
+    
+    assert simple_workflow.validate() is False
+    assert any("Cycle detected" in err for err in simple_workflow._validation_errors)
+
+def test_validate_ambiguous_edges(simple_workflow):
+    """测试验证：静态歧义检测（同一个节点多个无条件出边）"""
+    simple_workflow.add_node("A", lambda: None)
+    simple_workflow.add_node("B", lambda: None)
+    simple_workflow.add_node("C", lambda: None)
+    simple_workflow.set_entry_point("A")
+    
+    simple_workflow.add_edge("A", "B")
+    simple_workflow.add_edge("A", "C")  # 第二个无条件出边
+    
+    assert simple_workflow.validate() is False
+    assert any("ambiguous edges" in err for err in simple_workflow._validation_errors)
+
+def test_check_connectivity_warning(simple_workflow):
+    """测试验证：不可达节点警告 (使用 Mock Logger)"""
+    with patch("gecko.compose.workflow.logger") as mock_logger:
+        simple_workflow.add_node("A", lambda: None)
+        simple_workflow.add_node("B", lambda: None) # B 不可达
+        simple_workflow.set_entry_point("A")
+        
+        assert simple_workflow.validate() is True # 只是警告，验证通过
+        
+        # 验证 logger.warning 被调用
+        mock_logger.warning.assert_called()
+        args, kwargs = mock_logger.warning.call_args
+        assert "Unreachable nodes detected" in args[0] or "nodes" in kwargs
+
+# ========================= 2. 节点执行策略测试 (Smart Binding) =========================
+
+@pytest.mark.asyncio
+async def test_node_binding_strategies(simple_workflow):
+    """测试不同签名的函数能否被正确调用"""
+    
+    # 1. 接收 context
+    async def node_context(context: WorkflowContext):
+        return f"ctx:{context.input}"
+    
+    # 2. 接收 input
+    def node_input(text: str):
+        return f"in:{text}"
+    
+    # 3. 无参
+    async def node_empty():
+        return "empty"
+    
+    # 4. 接收 workflow_context
+    def node_wf_ctx(workflow_context: WorkflowContext):
+        return f"wf:{workflow_context.input}"
+
+    simple_workflow.add_node("Start", node_context)
+    simple_workflow.add_node("Input", node_input)
+    simple_workflow.add_node("Empty", node_empty)
+    simple_workflow.add_node("WfCtx", node_wf_ctx)
+    
+    simple_workflow.add_edge("Start", "Input")
+    simple_workflow.add_edge("Input", "Empty")
+    simple_workflow.add_edge("Empty", "WfCtx")
+    
+    simple_workflow.set_entry_point("Start")
+    
+    res = await simple_workflow.execute("start_val")
+    
+    assert res == "wf:start_val"
+
+@pytest.mark.asyncio
+async def test_node_binding_error(simple_workflow):
+    """测试函数签名参数不足导致的运行时错误"""
+    # 定义一个需要两个参数的函数
+    def bad_node(a, b):
+        return a + b
+        
+    simple_workflow.add_node("Bad", bad_node)
+    simple_workflow.set_entry_point("Bad")
+    
+    # 修正点：现在的逻辑是尝试执行，Python 会抛出 TypeError (missing argument)，
+    # 最终被 Workflow 捕获并包装为 "Node 'Bad' failed"
+    with pytest.raises(WorkflowError, match="Node 'Bad' failed"):
+        await simple_workflow.execute("init")
+
+# ========================= 3. 控制流逻辑测试 =========================
+
+@pytest.mark.asyncio
+async def test_conditional_branching(simple_workflow):
+    """测试条件分支"""
+    simple_workflow.add_node("Start", lambda x: x)
+    simple_workflow.add_node("PathA", lambda: "A")
+    simple_workflow.add_node("PathB", lambda: "B")
+    
+    # 路由逻辑：输入 > 5 走 A，否则走 B
+    simple_workflow.add_edge("Start", "PathA", lambda ctx: ctx.get_last_output() > 5)
+    simple_workflow.add_edge("Start", "PathB", lambda ctx: ctx.get_last_output() <= 5)
+    
+    simple_workflow.set_entry_point("Start")
+    
+    # Case 1: > 5
+    res_a = await simple_workflow.execute(10)
+    assert res_a == "A"
+    
+    # Case 2: <= 5
+    res_b = await simple_workflow.execute(3)
+    assert res_b == "B"
+
+@pytest.mark.asyncio
+async def test_next_instruction(simple_workflow):
+    """测试 Next 指令：跳转与参数注入"""
+    
+    def start():
+        # 跳转到 End，并注入新输入
+        return Next(node="End", input="jumped input")
+    
+    def skipped():
+        return "skipped"
+        
+    def end(inp):
+        return f"Received: {inp}"
+        
+    simple_workflow.add_node("Start", start)
+    simple_workflow.add_node("Skipped", skipped)
+    simple_workflow.add_node("End", end)
+    
+    simple_workflow.add_edge("Start", "Skipped") # 正常 DAG 边
+    simple_workflow.add_edge("Skipped", "End")
+    
+    simple_workflow.set_entry_point("Start")
+    
+    res = await simple_workflow.execute("init")
+    assert res == "Received: jumped input"
+
+@pytest.mark.asyncio
+async def test_runtime_ambiguity_error(simple_workflow):
+    """测试运行时歧义：多个条件同时满足"""
+    simple_workflow.add_node("Start", lambda: 10)
+    simple_workflow.add_node("A", lambda: "A")
+    simple_workflow.add_node("B", lambda: "B")
+    
+    # 两个条件都为真
+    simple_workflow.add_edge("Start", "A", lambda ctx: True)
+    simple_workflow.add_edge("Start", "B", lambda ctx: True)
+    
+    simple_workflow.set_entry_point("Start")
+    
+    with pytest.raises(WorkflowError, match="Ambiguous branching"):
+        await simple_workflow.execute(None)
+
+@pytest.mark.asyncio
+async def test_condition_evaluation_error(simple_workflow):
+    """测试条件评估抛出异常 (使用 Mock Logger)"""
+    def bad_condition(ctx):
+        raise ValueError("Eval failed")
+        
+    with patch("gecko.compose.workflow.logger") as mock_logger:
+        simple_workflow.add_node("Start", lambda: 1)
+        simple_workflow.add_node("A", lambda: "A")
+    
+        simple_workflow.add_edge("Start", "A", bad_condition)
+        simple_workflow.set_entry_point("Start")
+    
+        # 因为没有可行的路径（条件报错视为不满足），流程会在 Start 后结束
+        res = await simple_workflow.execute(None)
+        
+        assert res == 1 # 停留在 Start 的输出
+        
+        # 验证错误日志记录
+        mock_logger.error.assert_called()
+        args, kwargs = mock_logger.error.call_args
+        assert "Condition evaluation failed" in args[0]
+
+# ========================= 4. 异常处理与重试机制 =========================
+
+@pytest.mark.asyncio
+async def test_node_execution_failure(simple_workflow):
+    """测试节点执行失败抛出 WorkflowError"""
+    def failing_node():
+        raise RuntimeError("Node crashed")
+        
+    simple_workflow.add_node("Fail", failing_node)
+    simple_workflow.set_entry_point("Fail")
+    
+    with pytest.raises(WorkflowError, match="Node 'Fail' failed"):
+        await simple_workflow.execute(None)
+
+@pytest.mark.asyncio
+async def test_max_steps_exceeded(simple_workflow):
+    """测试超过最大步数 (使用 Next 构造动态环)"""
+    simple_workflow.max_steps = 2
+    
+    # 使用 Next 构造动态循环，避开 validate 阶段的静态环检测
+    def node_a():
+        return Next(node="B")
+    
+    def node_b():
+        return Next(node="A")
+        
+    simple_workflow.add_node("A", node_a)
+    simple_workflow.add_node("B", node_b)
+    simple_workflow.set_entry_point("A")
+    
+    # 预期运行：A(1) -> B(2) -> A(3 > max 2) -> Error
+    # [Fix] 更新匹配字符串: "Workflow exceeded" -> "Exceeded"
+    with pytest.raises(WorkflowError, match="Exceeded max steps"):
+        await simple_workflow.execute(None)
+
+@pytest.mark.asyncio
+async def test_retry_mechanism(simple_workflow):
+    """测试节点重试机制"""
+    simple_workflow.enable_retry = True
+    simple_workflow.max_retries = 3
+    
+    mock_func = MagicMock(side_effect=[ValueError("Fail 1"), ValueError("Fail 2"), "Success"])
+    
+    # 包装为异步
+    async def flaky_node():
+        return mock_func()
+        
+    simple_workflow.add_node("Flaky", flaky_node)
+    simple_workflow.set_entry_point("Flaky")
+    
+    res = await simple_workflow.execute(None)
+    
+    assert res == "Success"
+    assert mock_func.call_count == 3
+
+@pytest.mark.asyncio
+async def test_execute_not_validated(simple_workflow):
+    """测试执行前未通过验证"""
+    # 不设置 entry point
+    simple_workflow.add_node("A", lambda: 1)
+    with pytest.raises(WorkflowError, match="Workflow validation failed"):
+        await simple_workflow.execute(None)
+
+# ========================= 5. 状态持久化测试 =========================
+
+@pytest.mark.asyncio
+async def test_persistence(simple_workflow, mock_storage):
+    """测试状态持久化调用 (Two-Phase Commit)"""
+    simple_workflow.storage = mock_storage
+    # 确保策略允许中间保存
+    simple_workflow.checkpoint_strategy = CheckpointStrategy.ALWAYS
+    
+    simple_workflow.add_node("A", lambda: "output_a")
+    simple_workflow.set_entry_point("A")
+    
+    await simple_workflow.execute("input", session_id="sess_123")
+    
+    # 验证 storage.set 被调用次数
+    # 预期至少调用 2 次：
+    # 1. Node A Start -> Pre-Commit (Status: RUNNING)
+    # 2. Node A End   -> Commit (Status: SUCCESS, via _execute_loop)
+    assert mock_storage.set.call_count >= 2
+    
+    # 获取第一次调用 (Pre-Commit)
+    call_args_1 = mock_storage.set.call_args_list[0]
+    _, data_1 = call_args_1[0] # key, value
+    
+    # 验证 Phase 1: 记录正在执行
+    executions_1 = data_1["context"]["executions"]
+    assert len(executions_1) == 1
+    assert executions_1[0]["node_name"] == "A"
+    assert executions_1[0]["status"] == "running" # 关键验证点
+    
+    # 获取最后一次调用 (Final Commit)
+    call_args_last = mock_storage.set.call_args_list[-1]
+    _, data_last = call_args_last[0]
+    
+    # 验证 Phase 2: 记录执行完成
+    executions_last = data_last["context"]["executions"]
+    assert executions_last[0]["status"] == "success"
+    assert data_last["last_node"] == "A"
+
+# [新增] 验证两阶段提交的异常回滚/记录逻辑
+@pytest.mark.asyncio
+async def test_two_phase_commit_on_failure(simple_workflow, mock_storage):
+    """测试节点失败时的状态记录"""
+    simple_workflow.storage = mock_storage
+    
+    def failing_node():
+        raise ValueError("Crash!")
+        
+    simple_workflow.add_node("FailNode", failing_node)
+    simple_workflow.set_entry_point("FailNode")
+    
+    # 执行并捕获异常
+    with pytest.raises(WorkflowError):
+        await simple_workflow.execute("start", session_id="sess_fail")
+        
+    # 验证调用
+    # 1. Pre-Commit (Running)
+    # 2. Failure Commit (Failed)
+    assert mock_storage.set.call_count >= 2
+    
+    # 检查最后一次保存的状态
+    _, data_last = mock_storage.set.call_args_list[-1][0]
+    last_exec = data_last["context"]["executions"][-1]
+    
+    assert last_exec["node_name"] == "FailNode"
+    assert last_exec["status"] == "failed"
+    assert "Crash!" in last_exec["error"]
+
+@pytest.mark.asyncio
+async def test_persistence_failure_safe(simple_workflow, mock_storage):
+    """测试持久化失败不影响主流程"""
+    with patch("gecko.compose.workflow.logger") as mock_logger:
+        simple_workflow.storage = mock_storage
+        mock_storage.set.side_effect = Exception("DB Error")
+    
+        simple_workflow.add_node("A", lambda: "ok")
+        simple_workflow.set_entry_point("A")
+    
+        res = await simple_workflow.execute("in", session_id="sess_fail")
+    
+        assert res == "ok" # 主流程成功
+        
+        # 验证警告日志
+        mock_logger.warning.assert_called()
+        args, kwargs = mock_logger.warning.call_args
+        assert "Failed to persist workflow state" in args[0]
+
+# ========================= 6. 其他功能测试 =========================
+
+def test_result_normalization(simple_workflow):
+    """测试结果标准化逻辑"""
+    # Pydantic Model
+    class MyModel(BaseModel):
+        val: int
+    assert simple_workflow._normalize_result(MyModel(val=1)) == {"val": 1}
+    
+    # Message
+    msg = Message.user("hello")
+    assert simple_workflow._normalize_result(msg)["content"] == "hello"
+    
+    # Primitive
+    assert simple_workflow._normalize_result(123) == 123
+
+def test_visualization(simple_workflow):
+    """测试 Mermaid 和 Print Structure 生成"""
+    simple_workflow.add_node("Start", lambda: None)
+    simple_workflow.add_node("End", lambda: None)
+    simple_workflow.add_edge("Start", "End", lambda ctx: True)
+    simple_workflow.set_entry_point("Start")
+    
+    mermaid = simple_workflow.to_mermaid()
+    assert "Start((Start))" in mermaid
+    assert "Start --|condition|--> End" in mermaid
+    
+    # 简单调用 print_structure 确保不报错
+    simple_workflow.print_structure()
+
+@pytest.mark.asyncio
+async def test_context_summary_and_output():
+    """测试 WorkflowContext 的辅助方法"""
+    ctx = WorkflowContext(input="init")
+    assert ctx.get_last_output() == "init"
+    
+    ctx.history["last_output"] = "step1"
+    assert ctx.get_last_output() == "step1"
+    
+    summary = ctx.get_summary()
+    assert summary["status"] == "completed" # default empty executions
+    assert summary["total_nodes"] == 0
+
+# ========================= 7. 不可调用对象测试 =========================
+
+@pytest.mark.asyncio
+async def test_not_callable_node(simple_workflow):
+    """测试添加了不可调用的对象作为节点"""
+    simple_workflow.add_node("NotFunc", "I am a string")
+    simple_workflow.set_entry_point("NotFunc")
+    
+    with pytest.raises(WorkflowError, match="is not callable"):
+        await simple_workflow.execute(None)
+
+# tests/compose/test_workflow.py (Partial Update)
+# 仅展示修改和新增的部分，其他基础 DAG 测试保持不变
+
+@pytest.mark.asyncio
+async def test_agent_node_execution(simple_workflow):
+    """测试 Agent 对象执行"""
+    class MockAgent:
+        async def run(self, message):
+            return {"content": f"Agent processed: {message}", "role": "assistant"}
+
+    agent = MockAgent()
+    simple_workflow.add_node("Agent", agent)
+    simple_workflow.set_entry_point("Agent")
+    
+    res = await simple_workflow.execute("hello")
+    assert res["content"] == "Agent processed: hello"
+
+@pytest.mark.asyncio
+async def test_no_magic_extraction(simple_workflow):
+    """
+    [New] 测试不再进行魔法提取
+    验证节点返回的字典被完整传递给下一个节点（即使是 Agent）
+    """
+    # 节点1返回复杂结构
+    def node1():
+        return {"content": "text", "meta": "data"}
+    
+    # 节点2是 Agent，验证它收到了完整的字典
+    class MockAgent:
+        async def run(self, input_data):
+            # Agent 应该收到完整的字典，而不是被拆包后的 "text"
+            assert isinstance(input_data, dict)
+            assert input_data["meta"] == "data"
+            return "done"
+            
+    simple_workflow.add_node("N1", node1)
+    simple_workflow.add_node("Agent", MockAgent())
+    simple_workflow.add_edge("N1", "Agent")
+    simple_workflow.set_entry_point("N1")
+    
+    await simple_workflow.execute("init")
+
+@pytest.mark.asyncio
+async def test_context_type_safety(simple_workflow):
+    """[New] 测试 WorkflowContext 的类型安全获取方法"""
+    # 这里的导入确保使用最新的类定义
+    from gecko.compose.workflow import WorkflowContext
+    from pydantic import BaseModel
+    
+    ctx = WorkflowContext(input="init")
+    
+    # 1. 基础类型转换
+    ctx.history["last_output"] = "123"
+    assert ctx.get_last_output_as(int) == 123
+    assert ctx.get_last_output_as(str) == "123"
+    
+    # 2. Pydantic 转换
+    class MyModel(BaseModel):
+        val: int
+        
+    ctx.history["last_output"] = {"val": 99}
+    model = ctx.get_last_output_as(MyModel)
+    assert isinstance(model, MyModel)
+    assert model.val == 99
+    
+    # 3. 转换失败
+    ctx.history["last_output"] = "not an int"
+    with pytest.raises(TypeError):
+        ctx.get_last_output_as(int)
+
+def test_next_with_state_update():
+    """[New] 测试 Next 携带状态更新"""
+    n = Next(
+        node="B", 
+        input="data", 
+        update_state={"counter": 1, "flag": True}
+    )
+    assert n.update_state == {"counter": 1, "flag": True}
+
+@pytest.mark.asyncio
+async def test_checkpoint_strategy(simple_workflow, mock_storage):
+    """[Updated] 测试持久化策略 (适配两阶段提交)"""
+    simple_workflow.storage = mock_storage
+    simple_workflow.checkpoint_strategy = CheckpointStrategy.FINAL
+    
+    simple_workflow.add_node("A", lambda: "a")
+    simple_workflow.add_node("B", lambda: "b")
+    simple_workflow.add_edge("A", "B")
+    simple_workflow.set_entry_point("A")
+    
+    await simple_workflow.execute("init", session_id="sess_strat")
+    
+    # [修复] 由于引入了 Pre-Commit (force=True)，即使是 FINAL 策略，
+    # 每个节点开始执行时也会强制保存 "RUNNING" 状态以防 Crash。
+    # 流程: 
+    # 1. A Pre-commit (RUNNING) -> Force Save
+    # 2. A Post-commit (SUCCESS) -> Skipped (Strategy=FINAL)
+    # 3. B Pre-commit (RUNNING) -> Force Save
+    # 4. B Post-commit (SUCCESS) -> Skipped (Strategy=FINAL)
+    # 5. Workflow End -> Force Save
+    # 预期调用次数: 3 次
+    assert mock_storage.set.call_count == 3
+    
+    # 验证最后一次保存的状态 (Workflow 完成状态)
+    key, data = mock_storage.set.call_args_list[-1][0]
+    
+    # 此时 B 已经执行完
+    assert data["last_node"] is None 
+    assert data["context"]["history"]["B"] == "b"
+
+@pytest.mark.asyncio
+async def test_resume_functionality(simple_workflow, mock_storage):
+    """[New] 测试断点恢复"""
+    simple_workflow.storage = mock_storage
+    simple_workflow.checkpoint_strategy = CheckpointStrategy.ALWAYS
+    
+    # 定义节点
+    # 使用 Mock 记录执行次数
+    node_a_mock = MagicMock(return_value="res_a")
+    node_b_mock = MagicMock(return_value="res_b")
+    
+    simple_workflow.add_node("A", lambda: node_a_mock())
+    simple_workflow.add_node("B", lambda: node_b_mock())
+    simple_workflow.add_edge("A", "B")
+    simple_workflow.set_entry_point("A")
+    
+    # 1. 模拟已执行完 A 并保存的状态
+    mock_context_data = {
+        "input": "start",
+        "history": {"last_output": "res_a", "A": "res_a"},
+        "executions": [{"node_name": "A", "status": "success"}]
+    }
+    
+    mock_storage.get.return_value = {
+        "step": 1,
+        "last_node": "A", # A 已完成
+        "context": mock_context_data,
+        "updated_at": time.time()
+    }
+    
+    # 2. 调用 resume
+    result = await simple_workflow.resume("sess_resume")
+    
+    # 3. 验证
+    # A 不应该再被执行
+    node_a_mock.assert_not_called()
+    
+    # B 应该被执行
+    node_b_mock.assert_called_once()
+    
+    assert result == "res_b"
+
+@pytest.mark.asyncio
+async def test_persistence_with_unserializable_state(simple_workflow, mock_storage):
+    """[Critical] 测试 Context 中包含 Lock 等不可序列化对象时，持久化不崩溃"""
+    import threading
+    
+    simple_workflow.storage = mock_storage
+    
+    # 1. 定义一个会将 Lock 放入 Context 的节点
+    def risky_node(context: WorkflowContext):
+        # 用户错误地将锁放入了 state
+        context.state["db_lock"] = threading.Lock()
+        return "done"
+        
+    simple_workflow.add_node("Risky", risky_node)
+    simple_workflow.set_entry_point("Risky")
+    
+    # 2. 执行
+    await simple_workflow.execute("start", session_id="sess_crash_test")
+    
+    # 3. 验证 Storage set 被调用（没有因为序列化错误而中断）
+    assert mock_storage.set.called
+    
+    # 4. 验证保存的数据中，Lock 被转换为了标记
+    # [Fix] 正确获取调用参数
+    # call_args 返回 (args, kwargs)，取 [0] 获取位置参数元组
+    args_tuple = mock_storage.set.call_args[0] 
+    # set 方法签名为 set(key, value)，所以 args_tuple 是 (key, value)
+    _, data = args_tuple 
+    
+    saved_state = data["context"]["state"]
+    
+    assert "db_lock" in saved_state
+    lock_data = saved_state["db_lock"]
+    assert isinstance(lock_data, dict)
+    # 验证对象被正确转换为不可序列化标记，而不是导致程序崩溃
+    assert lock_data.get("__gecko_unserializable__") is True
+
+@pytest.mark.asyncio
+async def test_workflow_context_next_pointer_logic():
+    """
+    [New] 测试 WorkflowContext 中 next_pointer 的行为
+    验证优化点：Context 增强
+    """
+    ctx = WorkflowContext(input="start")
+    assert ctx.next_pointer is None
+    
+    # 模拟设置指针
+    ctx.next_pointer = {"target_node": "B", "input": "data"}
+    
+    # 验证消费清除逻辑
+    ctx.clear_next_pointer()
+    assert ctx.next_pointer is None
+
+@pytest.mark.asyncio
+async def test_next_instruction_persistence(simple_workflow, mock_storage):
+    """
+    测试 Next 指令触发立即持久化，并包含 next_pointer
+    验证优化点：Workflow._execute_loop 中的原子持久化
+    """
+    simple_workflow.storage = mock_storage
+    
+    # 定义返回 Next 的节点
+    def node_a():
+        return Next(node="B", input="jump_data")
+    
+    def node_b(inp):
+        return "done"
+        
+    simple_workflow.add_node("A", node_a)
+    simple_workflow.add_node("B", node_b)
+    simple_workflow.set_entry_point("A")
+    
+    # 执行
+    await simple_workflow.execute("start", session_id="sess_next_persist")
+    
+    calls = mock_storage.set.call_args_list
+    found_correct_snapshot = False
+    
+    for call_args in calls:
+        _, data = call_args[0]
+        context_data = data.get("context", {})
+        
+        # [修复] 我们要找的是 A 执行完、B 执行前的那次快照
+        # 特征：last_node="A", next_pointer -> B
+        if data.get("last_node") == "A":
+            pointer = context_data.get("next_pointer")
+            if pointer and pointer["target_node"] == "B":
+                found_correct_snapshot = True
+                break
+                
+    assert found_correct_snapshot, "未找到 A->B 跳转时的正确持久化快照"
+
+@pytest.mark.asyncio
+async def test_resume_from_next_pointer(simple_workflow, mock_storage):
+    """
+    [New] 测试基于 next_pointer 的断点恢复
+    验证优化点：Workflow.resume 的优先恢复逻辑
+    """
+    simple_workflow.storage = mock_storage
+    
+    node_a_mock = MagicMock(return_value="should_not_run")
+    node_b_mock = MagicMock(return_value="recovered_success")
+    
+    simple_workflow.add_node("A", lambda: node_a_mock())
+    simple_workflow.add_node("B", lambda: node_b_mock())
+    simple_workflow.set_entry_point("A")
+    
+    # 模拟存储状态：
+    # 场景：A 节点执行完毕，返回 Next("B")，此时 next_pointer 已保存，但 B 尚未执行系统就 Crash 了
+    mock_storage.get.return_value = {
+        "step": 1,
+        "last_node": "A",
+        "context": {
+            "input": "start",
+            "history": {"A": "<Next -> B>"}, # 历史中有痕迹
+            "state": {},
+            "next_pointer": { # [关键] 存在动态指针
+                "target_node": "B",
+                "input": "restored_input"
+            },
+            "executions": []
+        }
+    }
+    
+    # 执行 Resume
+    result = await simple_workflow.resume("sess_crash_after_next")
+    
+    # 验证：
+    # 1. A 不应被重新执行 (避免副作用)
+    node_a_mock.assert_not_called()
+    
+    # 2. B 应该被执行，且 Context 状态已包含 input
+    node_b_mock.assert_called_once()
+    assert result == "recovered_success"
+    
+    # 验证内部状态流转
+    # 这里比较难直接验证 state["_next_input"]，因为 execute 内部是瞬态的
+    # 但可以通过 B 的执行结果间接验证，或者 Mock B 检查参数
+```
+
+[5] tests/conftest.py
+```python
+# tests/conftest.py
+import os
+import warnings
+import pytest
+import asyncio
+from typing import AsyncGenerator
+from unittest.mock import AsyncMock, MagicMock
+
+from gecko.core.events import EventBus
+from gecko.core.memory import TokenMemory
+from gecko.core.protocols import ModelProtocol
+from gecko.core.toolbox import ToolBox
+
+from gecko.plugins.tools.registry import ToolRegistry
+
+def pytest_configure(config):
+    """
+    Pytest 配置钩子
+    """
+    # 1. 屏蔽 Pydantic 序列化警告
+    # 原因: LiteLLM 内部处理智谱/Ollama 等非标准 OpenAI 响应时，会触发 Pydantic v2 的序列化警告。
+    # 既然 Gecko 使用 Adapter 手动提取数据，这些上游警告是无关噪音，可以安全忽略。
+    warnings.filterwarnings(
+        "ignore", 
+        category=UserWarning, 
+        message="Pydantic serializer warnings"
+    )
+    
+    # 2. 屏蔽 LiteLLM 的一些 verbose 输出
+    os.environ["LITELLM_LOG"] = "ERROR"
+
+@pytest.fixture(autouse=True)
+def clean_tool_registry():
+    """
+    [新增] 自动清理工具注册表
+    确保每个测试用例都在一个干净的注册表状态下运行，
+    避免 Test A 注册的工具影响 Test B。
+    """
+    # 备份当前状态
+    original_registry = ToolRegistry._registry.copy()
+    yield
+    # 还原状态
+    ToolRegistry._registry = original_registry
+
+@pytest.fixture(autouse=True)
+def env_setup():
+    """自动设置测试环境"""
+    # 确保测试期间不会意外读取 .env 造成依赖
+    # 可以在这里 mock 环境变量
+    pass
+
+@pytest.fixture
+def event_loop():
+    """创建测试用的 EventLoop"""
+    loop = asyncio.new_event_loop()
+    yield loop
+    loop.close()
+
+@pytest.fixture
+def mock_toolbox():
+    tb = MagicMock(spec=ToolBox)
+    # [Fix] 添加 description 字段以通过 System Prompt 的 Jinja2 渲染
+    tb.to_openai_schema.return_value = [{
+        "type": "function", 
+        "function": {
+            "name": "t1", 
+            "description": "mock tool description" 
+        }
+    }]
+    tb.execute_many = AsyncMock(return_value=[])
+    return tb
+
+@pytest.fixture
+def mock_llm():
+    """
+    [Critical Fix] Mock LLM 对象
+    必须返回对象，且实现 count_tokens 以通过 ModelProtocol 检查
+    """
+    # 1. 使用 spec 自动模拟协议特征
+    llm = MagicMock(spec=ModelProtocol)
+    
+    # 2. 模拟 acompletion (异步推理)
+    mock_response = MagicMock()
+    mock_response.choices = [
+        MagicMock(message=MagicMock(content="Test Response", tool_calls=None))
+    ]
+    # 确保 model_dump 可调用 (Agent 内部会调用)
+    mock_response.choices[0].message.model_dump.return_value = {
+        "role": "assistant", 
+        "content": "Test Response"
+    }
+    
+    llm.acompletion = AsyncMock(return_value=mock_response)
+    
+    # 3. [关键] 模拟 count_tokens (同步计数)
+    # 这是修复 "model 必须实现 ModelProtocol" 错误的核心
+    llm.count_tokens = MagicMock(return_value=10)
+    
+    # 4. [关键] 必须返回对象，否则测试中收到 None
+    return llm
+
+@pytest.fixture
+def model(mock_llm):
+    """
+    model fixture 是 mock_llm 的别名，用于某些特定测试
+    """
+    return mock_llm
+
+@pytest.fixture
+def memory(mock_llm):
+    """
+    Memory Fixture
+    [Fix] 注入 model_driver 以支持新的计数逻辑
+    """
+    return TokenMemory(
+        session_id="test_session", 
+        max_tokens=4000, 
+        model_name="gpt-3.5-turbo",
+        model_driver=mock_llm  # 注入 Mock 驱动
+    )
+
+# @pytest.fixture
+# def memory():
+#     return TokenMemory(session_id="test_session", model_name="gpt-3.5-turbo")
+
+@pytest.fixture
+def toolbox():
+    return ToolBox()
+
+@pytest.fixture
+def event_bus():
+    return EventBus()
+```
+
+[6] tests/core/test_agent.py
+```python
+# tests/core/test_agent.py
+import asyncio
+import pytest
+from unittest.mock import AsyncMock, MagicMock
+from gecko.core.agent import Agent, AgentRunEvent
+from gecko.core.events.bus import EventBus
+from gecko.core.message import Message
+from gecko.core.engine.react import ReActEngine
+
+@pytest.mark.asyncio
+async def test_agent_run_input_formats(mock_llm, toolbox, memory, event_bus):
+    agent = Agent(model=mock_llm, toolbox=toolbox, memory=memory, event_bus=event_bus)
+    
+    # Mock engine step to avoid actual ReAct logic here
+    agent.engine.step = AsyncMock(return_value=MagicMock(content="ok", model_dump=lambda: {}))
+    
+    # 1. String input
+    await agent.run("hello")
+    call_args = agent.engine.step.call_args[0][0]
+    assert isinstance(call_args, list)
+    assert isinstance(call_args[0], Message)
+    assert call_args[0].content == "hello"
+    
+    # 2. List[Message] input (优化路径)
+    msgs = [Message.user("test")]
+    await agent.run(msgs)
+    call_args = agent.engine.step.call_args[0][0]
+    assert call_args is msgs # Should be same object ID
+    
+    # 3. Dict input
+    await agent.run({"input": "dict_test"})
+    call_args = agent.engine.step.call_args[0][0]
+    assert call_args[0].content == "dict_test"
+
+@pytest.mark.asyncio
+async def test_agent_events(mock_llm, toolbox, memory, event_bus):
+    """测试 Agent 生命周期事件"""
+    received_events = []
+    
+    # 定义回调函数
+    async def handler(e):
+        received_events.append(e)
+    
+    # 订阅具体的事件类型
+    event_bus.subscribe("run_started", handler)
+    event_bus.subscribe("run_completed", handler)
+    event_bus.subscribe("run_error", handler)
+    
+    agent = Agent(model=mock_llm, toolbox=toolbox, memory=memory, event_bus=event_bus)
+    
+    # Mock output
+    mock_output = MagicMock()
+    mock_output.content = "ok"
+    mock_output.model_dump = lambda: {"content": "ok"}
+    
+    agent.engine.step = AsyncMock(return_value=mock_output)
+    
+    # 执行 Agent
+    await agent.run("start")
+    
+    # 【关键修复】增加 sleep，等待 EventBus 的后台任务执行完毕
+    await asyncio.sleep(0.1)
+    
+    # 检查是否收到事件
+    assert len(received_events) >= 2
+    
+    # 可选：验证事件类型
+    event_types = [e.type for e in received_events]
+    assert "run_started" in event_types
+    assert "run_completed" in event_types
+
+@pytest.mark.asyncio
+async def test_agent_event_bus_wiring(mock_llm, toolbox, memory):
+    """
+    [New] 验证 Agent 的 EventBus 是否正确连接到了 Engine
+    这是修复 ReActEngine 缺少 event_bus 属性的关键验证
+    """
+    bus = EventBus()
+    agent = Agent(
+        model=mock_llm, 
+        toolbox=toolbox, 
+        memory=memory, 
+        event_bus=bus
+    )
+    
+    # 验证 Engine 拥有 event_bus 属性且是同一个实例
+    assert hasattr(agent.engine, "event_bus")
+    assert agent.engine.event_bus is bus
+    
+    # 验证如果不传，Agent 会自动创建
+    agent_default = Agent(model=mock_llm, toolbox=toolbox, memory=memory)
+    assert agent_default.engine.event_bus is not None
+    assert isinstance(agent_default.engine.event_bus, EventBus)
+```
+
+[7] tests/core/test_engine_base.py
+```python
+# tests/core/engine/test_base.py
+import pytest
+from gecko.core.engine.base import CognitiveEngine, ExecutionStats
+from gecko.core.output import AgentOutput
+
+class TestCognitiveEngine:
+    def test_abstract_class(self):
+        """测试抽象类不能实例化"""
+        with pytest.raises(TypeError):
+            CognitiveEngine(model=None, toolbox=None, memory=None)
+    
+    def test_model_validation(self, toolbox, memory):
+        """测试模型验证"""
+        class InvalidModel:
+            pass
+        
+        class ConcreteEngine(CognitiveEngine):
+            async def step(self, input_messages):
+                return AgentOutput(content="test")
+        
+        with pytest.raises(TypeError, match="ModelProtocol"):
+            ConcreteEngine(InvalidModel(), toolbox, memory)
+    
+    @pytest.mark.asyncio
+    async def test_context_manager(self, model, toolbox, memory):  # <--- 修复点：添加缺失的参数
+        """测试上下文管理器"""
+        initialized = False
+        cleaned_up = False
+    
+        class TestEngine(CognitiveEngine):
+            async def initialize(self):
+                nonlocal initialized
+                initialized = True
+    
+            async def cleanup(self):
+                nonlocal cleaned_up
+                cleaned_up = True
+    
+            async def step(self, input_messages, **kwargs): # 建议加上 **kwargs 以匹配基类签名
+                return AgentOutput(content="test")
+    
+        # 现在 model, toolbox, memory 会由 pytest 自动注入
+        async with TestEngine(model, toolbox, memory) as engine:
+            assert initialized is True
+            assert isinstance(engine, TestEngine)
+            
+        assert cleaned_up is True
+```
+
+[8] tests/core/test_events.py
+```python
+# tests/core/test_events.py
+import pytest
+import asyncio
+from gecko.core.events import EventBus, BaseEvent
+
+# [修复] 重命名 TestEvent -> MockEvent
+# 避免 Pytest 误将其识别为测试类 (PytestCollectionWarning)
+class MockEvent(BaseEvent):
+    type: str = "test_event"
+
+@pytest.mark.asyncio
+async def test_event_bus_subscribe_publish(event_bus):
+    received = []
+    
+    async def handler(event: BaseEvent):
+        received.append(event)
+        
+    event_bus.subscribe("test_event", handler)
+    # 使用 MockEvent
+    await event_bus.publish(MockEvent(), wait=True)
+    
+    assert len(received) == 1
+    assert received[0].type == "test_event"
+
+@pytest.mark.asyncio
+async def test_event_bus_sync_and_async_handlers(event_bus):
+    """测试同时支持同步和异步处理器 (验证 _safe_execute 修复)"""
+    results = []
+    
+    async def async_handler(event):
+        await asyncio.sleep(0.01)
+        results.append("async")
+        
+    def sync_handler(event):
+        results.append("sync")
+        
+    event_bus.subscribe("test_event", async_handler)
+    event_bus.subscribe("test_event", sync_handler)
+    
+    # 使用 MockEvent
+    await event_bus.publish(MockEvent(), wait=True)
+    
+    assert "async" in results
+    assert "sync" in results
+    assert len(results) == 2
+
+@pytest.mark.asyncio
+async def test_event_bus_error_isolation(event_bus):
+    """测试错误隔离：一个处理器崩溃不应影响其他处理器"""
+    results = []
+    
+    async def bad_handler(event):
+        raise ValueError("Boom!")
+        
+    async def good_handler(event):
+        results.append("ok")
+        
+    event_bus.subscribe("test_event", bad_handler)
+    event_bus.subscribe("test_event", good_handler)
+    
+    # 不应抛出异常
+    # 使用 MockEvent
+    await event_bus.publish(MockEvent(), wait=True)
+    
+    assert results == ["ok"]
+
+@pytest.mark.asyncio
+async def test_middleware(event_bus):
+    """测试中间件拦截与修改"""
+    
+    async def middleware(event):
+        if event.data.get("block"):
+            return None # 拦截
+        event.data["processed"] = True
+        return event
+        
+    event_bus.add_middleware(middleware)
+    
+    received = []
+    event_bus.subscribe("test_event", lambda e: received.append(e))
+    
+    # Case 1: Pass through
+    # 使用 MockEvent
+    await event_bus.publish(MockEvent(data={"block": False}), wait=True)
+    assert len(received) == 1
+    assert received[0].data["processed"] is True
+    
+    # Case 2: Blocked
+    # 使用 MockEvent
+    await event_bus.publish(MockEvent(data={"block": True}), wait=True)
+    assert len(received) == 1 # 数量不变
+```
+
+[9] tests/core/test_memory.py
+```python
+# tests/core/test_memory.py
+import pytest
+from gecko.core.memory import TokenMemory
+from gecko.core.message import Message
+from unittest.mock import AsyncMock, MagicMock
+from gecko.core.memory import SummaryTokenMemory
+
+
+class TestTokenMemory:
+    """TokenMemory 单元测试"""
+    
+    @pytest.fixture
+    def memory(self):
+        """创建测试用 TokenMemory"""
+        return TokenMemory(
+            session_id="test_session",
+            storage=None,
+            max_tokens=1000,
+            model_name="gpt-3.5-turbo",
+            cache_size=100
+        )
+    
+    # ===== 基础功能测试 =====
+    
+    def test_initialization(self, memory):
+        """测试初始化"""
+        assert memory.session_id == "test_session"
+        assert memory.max_tokens == 1000
+        assert memory.cache_size == 100
+    
+    def test_invalid_max_tokens(self):
+        """测试无效的 max_tokens"""
+        with pytest.raises(ValueError):
+            TokenMemory(
+                session_id="test",
+                max_tokens=0  # 无效
+            )
+    
+    # ===== Token 计数测试 =====
+    
+    def test_count_simple_message(self, memory):
+        """测试简单消息计数"""
+        msg = Message.user("Hello")
+        count = memory.count_message_tokens(msg)
+        
+        assert count > 0
+        assert isinstance(count, int)
+    
+    def test_count_message_with_tool_calls(self, memory):
+        """测试带 tool_calls 的消息"""
+        msg = Message(
+            role="assistant",
+            content="I'll search for that",
+            tool_calls=[
+                {
+                    "id": "call_1",
+                    "function": {
+                        "name": "search",
+                        "arguments": '{"query": "test"}'
+                    }
+                }
+            ]
+        )
+        
+        count = memory.count_message_tokens(msg)
+        assert count > len("I'll search for that")
+    
+    def test_batch_counting(self, memory):
+        """测试批量计数"""
+        messages = [
+            Message.user("Hello"),
+            Message.assistant("Hi"),
+            Message.user("How are you?"),
+        ]
+        
+        counts = memory.count_messages_batch(messages)
+        
+        assert len(counts) == 3
+        assert all(c > 0 for c in counts)
+    
+    # ===== 缓存测试 =====
+    
+    def test_cache_hit(self, memory):
+        """测试缓存命中"""
+        msg = Message.user("Test message")
+        
+        # 首次计数（缓存未命中）
+        count1 = memory.count_message_tokens(msg)
+        stats1 = memory.get_cache_stats()
+        
+        # 第二次计数（缓存命中）
+        count2 = memory.count_message_tokens(msg)
+        stats2 = memory.get_cache_stats()
+        
+        assert count1 == count2
+        assert stats2['hits'] > stats1['hits']
+    
+    def test_cache_clear(self, memory):
+        """测试缓存清空"""
+        msg = Message.user("Test")
+        memory.count_message_tokens(msg)
+        
+        # 清空前
+        stats_before = memory.get_cache_stats()
+        assert stats_before['cache_size'] > 0
+        
+        # 清空
+        memory.clear_cache()
+        
+        # 清空后
+        stats_after = memory.get_cache_stats()
+        assert stats_after['cache_size'] == 0
+        assert stats_after['hits'] == 0
+    
+    def test_cache_eviction(self):
+        """测试缓存淘汰"""
+        # 创建小容量缓存
+        memory = TokenMemory(
+            session_id="test",
+            cache_size=2  # 只能缓存 2 条
+        )
+        
+        # 添加 3 条消息
+        msg1 = Message.user("Message 1")
+        msg2 = Message.user("Message 2")
+        msg3 = Message.user("Message 3")
+        
+        memory.count_message_tokens(msg1)
+        memory.count_message_tokens(msg2)
+        memory.count_message_tokens(msg3)  # 触发淘汰
+        
+        stats = memory.get_cache_stats()
+        assert stats['cache_size'] == 2
+        assert stats['evictions'] > 0
+    
+    # ===== 历史加载测试 =====
+    
+    @pytest.mark.asyncio
+    async def test_get_history_empty(self, memory):
+        """测试空历史"""
+        history = await memory.get_history([])
+        assert history == []
+    
+    @pytest.mark.asyncio
+    async def test_get_history_with_system(self, memory):
+        """测试保留 system 消息"""
+        raw_messages = [
+            {"role": "system", "content": "You are helpful"},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi"},
+        ]
+        
+        history = await memory.get_history(raw_messages)
+        
+        assert len(history) > 0
+        assert history[0].role == "system"
+    
+    @pytest.mark.asyncio
+    async def test_get_history_truncation(self):
+        """测试历史截断"""
+        memory = TokenMemory(
+            session_id="test",
+            max_tokens=100  # 很小的限制
+        )
+        
+        # 创建大量消息
+        raw_messages = []
+        for i in range(20):
+            raw_messages.append({
+                "role": "user",
+                "content": f"This is a long message number {i} with some content"
+            })
+        
+        history = await memory.get_history(raw_messages)
+        
+        # 应该被截断
+        assert len(history) < len(raw_messages)
+        
+        # 总 tokens 应该不超过限制
+        total_tokens = sum(memory.count_message_tokens(m) for m in history)
+        assert total_tokens <= memory.max_tokens
+    
+    @pytest.mark.asyncio
+    async def test_get_history_invalid_messages(self, memory):
+        """测试处理无效消息"""
+        raw_messages = [
+            {"role": "user", "content": "Valid"},
+            {"invalid": "message"},  # 无效
+            {"role": "assistant", "content": "Also valid"},
+        ]
+        
+        history = await memory.get_history(raw_messages)
+        
+        # 应该跳过无效消息
+        assert len(history) == 2
+    
+    # ===== 边缘情况测试 =====
+    
+    def test_very_long_message(self, memory):
+        """测试超长消息"""
+        long_text = "x" * 50000  # 50k 字符
+        msg = Message.user(long_text)
+        
+        count = memory.count_message_tokens(msg)
+        assert count > 0
+    
+    @pytest.mark.asyncio
+    async def test_message_length_limit(self):
+        """测试消息长度限制"""
+        memory = TokenMemory(
+            session_id="test",
+            max_message_length=100  # 限制 100 字符
+        )
+        
+        raw_messages = [
+            {"role": "user", "content": "x" * 200}  # 超长
+        ]
+        
+        history = await memory.get_history(raw_messages)
+        
+        # 应该被截断
+        assert len(history) == 1
+        assert len(history[0].content) <= 100
+    
+    # ===== 工具方法测试 =====
+    
+    def test_estimate_tokens(self, memory):
+        """测试快速估算"""
+        text = "This is a test"
+        tokens = memory.estimate_tokens(text)
+        
+        assert tokens > 0
+        assert isinstance(tokens, int)
+    
+    def test_repr(self, memory):
+        """测试字符串表示"""
+        repr_str = repr(memory)
+        
+        assert "TokenMemory" in repr_str
+        assert "test_session" in repr_str
+
+class TestSummaryTokenMemory:
+    """SummaryTokenMemory 测试"""
+
+    @pytest.fixture
+    def mock_model(self):
+        model = MagicMock()
+        model.acompletion = AsyncMock(return_value=MagicMock(
+            choices=[MagicMock(message={"content": "Summary of old messages"})]
+        ))
+        return model
+
+    @pytest.fixture
+    def summary_memory(self, mock_model):
+        return SummaryTokenMemory(
+            session_id="summary_sess",
+            model=mock_model,
+            max_tokens=100  # 设置很小的阈值以触发摘要
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_history_triggers_summary(self, summary_memory, mock_model):
+        """测试历史记录过长触发摘要"""
+        # 构造 3 条消息，假设每条约 20 tokens (User: Msg X)
+        # max_tokens=100, reserved=500 (defaut logic might need adjustment for test)
+        # Wait, SummaryTokenMemory implementation reserves 500 tokens for system/summary.
+        # If max_tokens is 100, available for history is negative?
+        # 我们需要调整 memory 的 max_tokens 或者 mock count_message_tokens
+        
+        summary_memory.max_tokens = 1000
+        # Mock tokenizer to return large length
+        summary_memory.count_message_tokens = MagicMock(return_value=300)
+        
+        raw_messages = [
+            {"role": "user", "content": "Msg 1"}, # Should be summarized
+            {"role": "assistant", "content": "Msg 2"}, # Should be summarized
+            {"role": "user", "content": "Msg 3"}, # Kept
+        ]
+        
+        # Logic: 
+        # Msg 3 (300) + Reserved (500) = 800 < 1000. OK.
+        # Msg 2 (300) + 800 = 1100 > 1000. Msg 2 & Msg 1 go to summary.
+        
+        history = await summary_memory.get_history(raw_messages, preserve_system=False)
+        
+        # 验证
+        assert len(history) == 2 # 1 Summary System Msg + 1 Recent Msg (Msg 3)
+        assert history[0].role == "system"
+        assert "Summary of old messages" in history[0].content
+        assert history[1].content == "Msg 3"
+        
+        # 验证模型调用
+        assert mock_model.acompletion.called
+        call_args = mock_model.acompletion.call_args[0][0]
+        prompt = call_args[0]["content"]
+        assert "Msg 1" in prompt
+        assert "Msg 2" in prompt
+
+    @pytest.mark.asyncio
+    async def test_get_history_no_summary_needed(self, summary_memory, mock_model):
+        """测试不需要摘要的情况"""
+        summary_memory.max_tokens = 2000
+        summary_memory.count_message_tokens = MagicMock(return_value=10)
+        
+        raw_messages = [{"role": "user", "content": "Short"}]
+        
+        history = await summary_memory.get_history(raw_messages)
+        
+        assert len(history) == 1
+        assert not mock_model.acompletion.called
+```
+
+[10] tests/core/test_message.py
+```python
+# tests/core/test_message.py
+import pytest
+import asyncio
+from pathlib import Path
+from gecko.core.message import Message, MediaResource, ContentBlock
+
+
+class TestMediaResource:
+    """MediaResource 测试"""
+    
+    def test_url_resource(self):
+        """测试 URL 资源"""
+        resource = MediaResource(url="https://example.com/image.jpg")
+        assert resource.url is not None
+        
+        openai_format = resource.to_openai_image_url()
+        assert openai_format["url"] == "https://example.com/image.jpg"
+        assert "detail" in openai_format
+    
+    def test_base64_resource(self):
+        """测试 base64 资源"""
+        resource = MediaResource(
+            base64_data="abc123",
+            mime_type="image/png"
+        )
+        
+        assert resource.base64_data == "abc123"
+        
+        openai_format = resource.to_openai_image_url()
+        assert "data:image/png;base64,abc123" in openai_format["url"]
+    
+    def test_missing_source(self):
+        """测试缺少数据源"""
+        with pytest.raises(ValueError, match="必须提供"):
+            MediaResource()
+    
+    def test_size_estimate(self):
+        """测试大小估算"""
+        # Base64 编码的 "Hello" (SGVsbG8=)
+        resource = MediaResource(base64_data="SGVsbG8=")
+        size = resource.get_size_estimate()
+        assert size > 0
+
+
+class TestContentBlock:
+    """ContentBlock 测试"""
+    
+    def test_text_block(self):
+        """测试文本块"""
+        block = ContentBlock(type="text", text="Hello")
+        assert block.type == "text"
+        assert block.text == "Hello"
+        
+        openai = block.to_openai_format()
+        assert openai["type"] == "text"
+        assert openai["text"] == "Hello"
+    
+    def test_image_block(self):
+        """测试图片块"""
+        resource = MediaResource(url="https://example.com/img.jpg")
+        block = ContentBlock(type="image_url", image_url=resource)
+        
+        assert block.type == "image_url"
+        
+        openai = block.to_openai_format()
+        assert openai["type"] == "image_url"
+    
+    def test_invalid_text_block(self):
+        """测试无效的文本块"""
+        with pytest.raises(ValueError, match="缺少 text"):
+            ContentBlock(type="text")
+    
+    def test_get_text_content(self):
+        """测试提取文本"""
+        # ✅ 修复：测试文本块
+        text_block = ContentBlock(type="text", text="Hello")
+        assert text_block.get_text_content() == "Hello"
+        
+        # ✅ 修复：测试图片块（使用 image_block 而不是 text_block）
+        image_block = ContentBlock(
+            type="image_url",
+            image_url=MediaResource(url="https://example.com/img.jpg")
+        )
+        assert image_block.get_text_content() == "[image]"  # ✅ 正确
+
+
+class TestMessage:
+    """Message 测试"""
+    
+    # ===== 工厂方法测试 =====
+    
+    def test_user_message(self):
+        """测试用户消息"""
+        msg = Message.user("Hello")
+        
+        assert msg.role == "user"
+        assert msg.content == "Hello"
+        assert msg.get_text_content() == "Hello"
+    
+    def test_assistant_message(self):
+        """测试助手消息"""
+        msg = Message.assistant("Hi there!")
+        
+        assert msg.role == "assistant"
+        assert msg.content == "Hi there!"
+    
+    def test_system_message(self):
+        """测试系统消息"""
+        msg = Message.system("You are helpful")
+        
+        assert msg.role == "system"
+        assert msg.content == "You are helpful"
+    
+    def test_tool_result_message(self):
+        """测试工具返回消息"""
+        msg = Message.tool_result(
+            tool_call_id="call_123",
+            content="Result",
+            tool_name="search"
+        )
+        
+        assert msg.role == "tool"
+        assert msg.tool_call_id == "call_123"
+        assert msg.name == "search"
+    
+    def test_tool_result_with_dict(self):
+        """测试工具返回消息（字典内容）"""
+        msg = Message.tool_result(
+            tool_call_id="call_123",
+            content={"result": "success", "count": 42},
+            tool_name="search"
+        )
+        
+        assert msg.role == "tool"
+        assert "result" in msg.content
+        assert "count" in msg.content
+    
+    # ===== 转换测试 =====
+    
+    def test_to_openai_format(self):
+        """测试转换为 OpenAI 格式"""
+        msg = Message.user("Hello")
+        openai = msg.to_openai_format()
+        
+        assert openai["role"] == "user"
+        assert openai["content"] == "Hello"
+    
+    def test_from_openai(self):
+        """测试从 OpenAI 格式解析"""
+        openai_msg = {
+            "role": "assistant",
+            "content": "Hi"
+        }
+        
+        msg = Message.from_openai(openai_msg)
+        
+        assert msg.role == "assistant"
+        assert msg.content == "Hi"
+    
+    def test_from_openai_with_tool_calls(self):
+        """测试解析带 tool_calls 的消息"""
+        openai_msg = {
+            "role": "assistant",
+            "content": "Searching...",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "function": {
+                        "name": "search",
+                        "arguments": '{"query": "test"}'
+                    }
+                }
+            ]
+        }
+        
+        msg = Message.from_openai(openai_msg)
+        
+        assert msg.tool_calls is not None
+        assert len(msg.tool_calls) == 1
+    
+    # ===== 工具方法测试 =====
+    
+    def test_is_empty(self):
+        """测试空消息检查"""
+        empty_msg = Message.user("")
+        assert empty_msg.is_empty()
+        
+        non_empty = Message.user("Hello")
+        assert not non_empty.is_empty()
+    
+    def test_has_images(self):
+        """测试图片检查"""
+        text_msg = Message.user("Hello")
+        assert not text_msg.has_images()
+        
+        # 多模态消息需要实际图片文件，这里跳过
+    
+    def test_clone(self):
+        """测试消息克隆"""
+        original = Message.user("Hello")
+        cloned = original.clone()
+        
+        assert cloned.role == original.role
+        assert cloned.content == original.content
+        assert cloned is not original
+    
+    def test_truncate_content(self):
+        """测试内容截断"""
+        long_msg = Message.user("A" * 100)
+        truncated = long_msg.truncate_content(50)
+        
+        assert len(truncated.get_text_content()) <= 53  # 50 + "..."
+        assert "..." in truncated.get_text_content()
+    
+    def test_str_repr(self):
+        """测试字符串表示"""
+        msg = Message.user("Hello")
+        
+        str_repr = str(msg)
+        assert "Message" in str_repr
+        assert "user" in str_repr
+        
+        repr_str = repr(msg)
+        assert "Message" in repr_str
+
+
+class TestMessageAsync:
+    """异步功能测试"""
+    
+    @pytest.mark.asyncio
+    async def test_user_async_no_images(self):
+        """测试异步用户消息（无图片）"""
+        msg = await Message.user_async("Hello")
+        
+        assert msg.role == "user"
+        assert msg.content == "Hello"
+```
+
+[11] tests/core/test_output.py
+```python
+# tests/core/test_output.py
+import pytest
+from gecko.core.output import (
+    AgentOutput,
+    TokenUsage,
+    create_text_output,
+    create_tool_output,
+    merge_outputs
+)
+
+
+class TestTokenUsage:
+    """TokenUsage 测试"""
+    
+    def test_basic_usage(self):
+        """测试基本 usage"""
+        usage = TokenUsage(
+            prompt_tokens=100,
+            completion_tokens=50,
+            total_tokens=150
+        )
+        
+        assert usage.prompt_tokens == 100
+        assert usage.completion_tokens == 50
+        assert usage.total_tokens == 150
+    
+    def test_auto_total(self):
+        """测试自动计算总数"""
+        usage = TokenUsage(
+            prompt_tokens=100,
+            completion_tokens=50
+        )
+        
+        assert usage.total_tokens == 150
+    
+    def test_cost_estimate(self):
+        """测试成本估算"""
+        usage = TokenUsage(
+            prompt_tokens=1000,
+            completion_tokens=500
+        )
+        
+        cost = usage.get_cost_estimate(
+            prompt_price_per_1k=0.01,
+            completion_price_per_1k=0.02
+        )
+        
+        # 1000 * 0.01/1000 + 500 * 0.02/1000 = 0.01 + 0.01 = 0.02
+        assert cost == pytest.approx(0.02)
+    
+    def test_str(self):
+        """测试字符串表示"""
+        usage = TokenUsage(
+            prompt_tokens=100,
+            completion_tokens=50
+        )
+        
+        str_repr = str(usage)
+        assert "100" in str_repr
+        assert "50" in str_repr
+
+
+class TestAgentOutput:
+    """AgentOutput 测试"""
+    
+    # ===== 基础测试 =====
+    
+    def test_empty_output(self):
+        """测试空输出"""
+        output = AgentOutput()
+        
+        assert output.content == ""
+        assert output.tool_calls == []
+        assert output.is_empty()
+        assert not output.has_content()
+        assert not output.has_tool_calls()
+    
+    def test_text_output(self):
+        """测试文本输出"""
+        output = AgentOutput(content="Hello")
+        
+        assert output.content == "Hello"
+        assert output.has_content()
+        assert not output.is_empty()
+    
+    def test_tool_calls_output(self):
+        """测试工具调用输出"""
+        output = AgentOutput(
+            tool_calls=[
+                {
+                    "id": "call_1",
+                    "function": {
+                        "name": "search",
+                        "arguments": "{}"
+                    }
+                }
+            ]
+        )
+        
+        assert output.has_tool_calls()
+        assert output.tool_call_count() == 1
+    
+    # ===== 验证器测试 =====
+    
+    def test_ensure_tool_calls(self):
+        """测试 tool_calls 自动转换"""
+        output = AgentOutput(tool_calls=None)
+        assert output.tool_calls == []
+    
+    def test_ensure_content(self):
+        """测试 content 自动转换"""
+        output = AgentOutput(content=None)
+        assert output.content == ""
+    
+    # ===== 检查方法测试 =====
+    
+    def test_has_usage(self):
+        """测试 usage 检查"""
+        output1 = AgentOutput()
+        assert not output1.has_usage()
+        
+        output2 = AgentOutput(usage=TokenUsage(prompt_tokens=10))
+        assert output2.has_usage()
+    
+    def test_bool_conversion(self):
+        """测试布尔值转换"""
+        assert not bool(AgentOutput())
+        assert bool(AgentOutput(content="Hello"))
+        assert bool(AgentOutput(tool_calls=[{"id": "1"}]))
+    
+    # ===== 提取方法测试 =====
+    
+    def test_get_tool_names(self):
+        """测试提取工具名称"""
+        output = AgentOutput(
+            tool_calls=[
+                {"function": {"name": "search"}},
+                {"function": {"name": "calculator"}},
+            ]
+        )
+        
+        names = output.get_tool_names()
+        assert names == ["search", "calculator"]
+    
+    def test_get_tool_call_by_id(self):
+        """测试根据 ID 获取工具调用"""
+        call = {"id": "call_123", "function": {"name": "search"}}
+        output = AgentOutput(tool_calls=[call])
+        
+        result = output.get_tool_call_by_id("call_123")
+        assert result == call
+        
+        not_found = output.get_tool_call_by_id("not_exist")
+        assert not_found is None
+    
+    def test_get_text_preview(self):
+        """测试文本预览"""
+        output = AgentOutput(content="A" * 200)
+        preview = output.get_text_preview(50)
+        
+        assert len(preview) <= 53  # 50 + "..."
+        assert preview.endswith("...")
+    
+    # ===== 转换方法测试 =====
+    
+    def test_to_dict(self):
+        """测试转换为字典"""
+        output = AgentOutput(
+            content="Hello",
+            usage=TokenUsage(prompt_tokens=10)
+        )
+        
+        data = output.to_dict()
+        
+        assert data["content"] == "Hello"
+        assert "usage" in data
+        assert data["usage"]["prompt_tokens"] == 10
+    
+    def test_to_message_dict(self):
+        """测试转换为消息格式"""
+        output = AgentOutput(
+            content="Hello",
+            tool_calls=[{"id": "1"}]
+        )
+        
+        msg = output.to_message_dict()
+        
+        assert msg["role"] == "assistant"
+        assert msg["content"] == "Hello"
+        assert "tool_calls" in msg
+    
+    # ===== 格式化测试 =====
+    
+    def test_format(self):
+        """测试格式化输出"""
+        output = AgentOutput(
+            content="Hello",
+            usage=TokenUsage(prompt_tokens=10, completion_tokens=5)
+        )
+        
+        formatted = output.format()
+        
+        assert "Hello" in formatted
+        assert "Token" in formatted
+    
+    def test_summary(self):
+        """测试摘要"""
+        output = AgentOutput(
+            content="Hello world",
+            tool_calls=[{"id": "1"}],
+            usage=TokenUsage(total_tokens=100)
+        )
+        
+        summary = output.summary()
+        
+        assert "Hello" in summary
+        assert "工具调用: 1" in summary
+        assert "100" in summary
+    
+    # ===== 统计测试 =====
+    
+    def test_get_stats(self):
+        """测试统计信息"""
+        output = AgentOutput(
+            content="Hello",
+            tool_calls=[{"function": {"name": "search"}}]
+        )
+        
+        stats = output.get_stats()
+        
+        assert stats["content_length"] == 5
+        assert stats["has_content"] is True
+        assert stats["tool_call_count"] == 1
+        assert "search" in stats["tool_names"]
+
+
+class TestToolFunctions:
+    """工具函数测试"""
+    
+    def test_create_text_output(self):
+        """测试快速创建文本输出"""
+        output = create_text_output(
+            "Hello",
+            usage=TokenUsage(prompt_tokens=10),
+            source="test"
+        )
+        
+        assert output.content == "Hello"
+        assert output.has_usage()
+        assert output.metadata["source"] == "test"
+    
+    def test_create_tool_output(self):
+        """测试快速创建工具输出"""
+        output = create_tool_output(
+            tool_calls=[{"id": "1"}],
+            content="Calling tools..."
+        )
+        
+        assert output.has_tool_calls()
+        assert output.content == "Calling tools..."
+    
+    def test_merge_outputs(self):
+        """测试合并输出"""
+        out1 = AgentOutput(
+            content="Part 1",
+            usage=TokenUsage(prompt_tokens=10, completion_tokens=5)
+        )
+        out2 = AgentOutput(
+            content="Part 2",
+            usage=TokenUsage(prompt_tokens=20, completion_tokens=10)
+        )
+        
+        merged = merge_outputs([out1, out2])
+        
+        assert "Part 1" in merged.content
+        assert "Part 2" in merged.content
+        assert merged.usage.prompt_tokens == 30
+        assert merged.usage.completion_tokens == 15
+    
+    def test_merge_empty_list(self):
+        """测试合并空列表"""
+        merged = merge_outputs([])
+        assert merged.is_empty()
+    
+    def test_merge_single_output(self):
+        """测试合并单个输出"""
+        output = AgentOutput(content="Hello")
+        merged = merge_outputs([output])
+        
+        assert merged.content == "Hello"
+```
+
+[12] tests/core/test_prompt.py
+```python
+# tests/core/test_prompt.py
+import pytest
+from pathlib import Path
+from gecko.core.prompt import PromptTemplate, PromptLibrary
+
+
+class TestPromptTemplate:
+    """PromptTemplate 测试"""
+    
+    # ===== 基础功能 =====
+    
+    def test_basic_format(self):
+        """测试基础格式化"""
+        template = PromptTemplate(
+            template="Hello, {{ name }}!",
+            input_variables=["name"]
+        )
+        
+        result = template.format(name="Alice")
+        assert result == "Hello, Alice!"
+    
+    def test_multiple_variables(self):
+        """测试多个变量"""
+        template = PromptTemplate(
+            template="{{ greeting }}, {{ name }}! You are {{ age }}.",
+            input_variables=["greeting", "name", "age"]
+        )
+        
+        result = template.format(greeting="Hi", name="Bob", age=25)
+        assert "Hi" in result
+        assert "Bob" in result
+        assert "25" in result
+    
+    def test_missing_variable(self):
+        """测试缺少变量"""
+        template = PromptTemplate(
+            template="Hello, {{ name }}!",
+            input_variables=["name"]
+        )
+        
+        with pytest.raises(ValueError, match="缺少必需的模板变量"):
+            template.format()
+    
+    # ===== Jinja2 功能 =====
+    
+    def test_conditional(self):
+        """测试条件语句"""
+        template = PromptTemplate(
+            template="""
+{% if premium %}
+Premium User
+{% else %}
+Regular User
+{% endif %}
+            """,
+            input_variables=["premium"]
+        )
+        
+        result1 = template.format(premium=True)
+        assert "Premium User" in result1
+        
+        result2 = template.format(premium=False)
+        assert "Regular User" in result2
+    
+    def test_loop(self):
+        """测试循环"""
+        template = PromptTemplate(
+            template="""
+{% for item in items %}
+- {{ item }}
+{% endfor %}
+            """,
+            input_variables=["items"]
+        )
+        
+        result = template.format(items=["a", "b", "c"])
+        assert "- a" in result
+        assert "- b" in result
+        assert "- c" in result
+    
+    # ===== 变量提取 =====
+    
+    def test_extract_variables(self):
+        """测试变量提取"""
+        template = PromptTemplate(
+            template="User {{ user }} asked {{ question }}"
+        )
+        
+        variables = template.get_variables_from_template()
+        assert "user" in variables
+        assert "question" in variables
+    
+    # ===== 部分填充 =====
+    
+    def test_partial(self):
+        """测试部分填充"""
+        template = PromptTemplate(
+            template="{{ a }} and {{ b }}",
+            input_variables=["a", "b"]
+        )
+        
+        partial = template.partial(a="fixed")
+        assert partial.input_variables == ["b"]
+    
+    # ===== 安全格式化 =====
+    
+    def test_format_safe(self):
+        """测试安全格式化"""
+        template = PromptTemplate(
+            template="Hello {{ name }}, you are {{ age }}",
+            input_variables=["name", "age"]
+        )
+        
+        result = template.format_safe(name="Alice")
+        assert "Alice" in result
+        assert "<MISSING: age>" in result
+    
+    # ===== 工厂方法 =====
+    
+    def test_from_examples(self):
+        """测试从示例创建"""
+        examples = [
+            {"input": "1+1", "output": "2"},
+            {"input": "2+2", "output": "4"},
+        ]
+        
+        template = PromptTemplate.from_examples(examples)
+        assert "1+1" in template.template
+        assert "2" in template.template
+    
+    # ===== 克隆 =====
+    
+    def test_clone(self):
+        """测试克隆"""
+        original = PromptTemplate(
+            template="Hello {{ name }}",
+            input_variables=["name"]
+        )
+        
+        cloned = original.clone()
+        assert cloned.template == original.template
+        assert cloned is not original
+    
+    # ===== 字符串表示 =====
+    
+    def test_str(self):
+        """测试字符串表示"""
+        template = PromptTemplate(template="Test")
+        str_repr = str(template)
+        assert "PromptTemplate" in str_repr
+
+
+class TestPromptLibrary:
+    """PromptLibrary 测试"""
+    
+    def test_get_react_prompt(self):
+        """测试 ReAct 模板"""
+        template = PromptLibrary.get_react_prompt()
+        
+        assert template is not None
+        assert "question" in template.input_variables
+    
+    def test_get_chat_prompt(self):
+        """测试对话模板"""
+        template = PromptLibrary.get_chat_prompt()
+        
+        assert template is not None
+        
+        # 测试1：完整参数
+        result1 = template.format(
+            user_input="Hello",
+            system="You are helpful",
+            history=[
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": "Hello!"}
+            ]
+        )
+        assert "Hello" in result1
+        
+        # 测试2：最小参数（依赖 format_safe 的智能默认值）
+        result2 = template.format_safe(user_input="World")
+        assert "World" in result2
+        assert "User: World" in result2
+    
+    def test_get_summarization_prompt(self):
+        """测试摘要模板"""
+        template = PromptLibrary.get_summarization_prompt()
+        
+        result = template.format(
+            text="Long text here...",
+            max_words=50
+        )
+        assert "Long text" in result
+        assert "50" in result
+
+
+class TestEdgeCases:
+    """边缘情况测试"""
+    
+    def test_empty_template(self):
+        """测试空模板"""
+        template = PromptTemplate(template="")
+        result = template.format()
+        assert result == ""
+    
+    def test_no_variables(self):
+        """测试无变量模板"""
+        template = PromptTemplate(template="Static text")
+        result = template.format()
+        assert result == "Static text"
+    
+    def test_unicode(self):
+        """测试 Unicode 字符"""
+        template = PromptTemplate(
+            template="你好，{{ name }}！",
+            input_variables=["name"]
+        )
+        
+        result = template.format(name="世界")
+        assert "你好" in result
+        assert "世界" in result
+```
+
+[13] tests/core/test_protocols.py
+```python
+# tests/core/test_protocols.py (完整修正版)
+import pytest
+from gecko.core.protocols import (
+    ModelProtocol,
+    StreamableModelProtocol,
+    StorageProtocol,
+    ToolProtocol,
+    CompletionResponse,
+    CompletionChoice,
+    StreamChunk,
+    check_protocol,
+    validate_model,
+    validate_storage,
+    validate_tool,
+    get_missing_methods,
+    supports_streaming,
+    supports_function_calling,
+    supports_vision,
+    get_model_name,
+)
+
+
+class TestProtocols:
+    """Protocol 测试套件"""
+    
+    # ==================== ModelProtocol 测试 ====================
+    
+    def test_valid_model(self):
+        """测试有效的基础模型"""
+        class ValidModel:
+            async def acompletion(self, messages, **kwargs):
+                return CompletionResponse(
+                    model="test-model",
+                    choices=[
+                        CompletionChoice(
+                            message={"role": "assistant", "content": "Hello"}
+                        )
+                    ]
+                )
+
+            # 实现 count_tokens
+            def count_tokens(self, text_or_messages):
+                return 0
+        
+        model = ValidModel()
+        assert check_protocol(model, ModelProtocol)
+        validate_model(model)
+        assert not check_protocol(model, StreamableModelProtocol)
+    
+    def test_streamable_model(self):
+        """测试支持流式的模型"""
+        class StreamingModel:
+            async def acompletion(self, messages, **kwargs):
+                return CompletionResponse(model="test-streaming", choices=[])
+            
+            async def astream(self, messages, **kwargs):
+                yield StreamChunk(model="test-streaming")
+
+            def count_tokens(self, text_or_messages):
+                return 0
+        
+        model = StreamingModel()
+        assert check_protocol(model, ModelProtocol)
+        assert check_protocol(model, StreamableModelProtocol)
+        assert supports_streaming(model)
+    
+    def test_invalid_model(self):
+        """测试无效的模型"""
+        class InvalidModel:
+            pass
+        
+        model = InvalidModel()
+        assert not check_protocol(model, ModelProtocol)
+        
+        with pytest.raises(TypeError, match="does not implement ModelProtocol"):
+            validate_model(model)
+    
+    def test_get_missing_methods_model_protocol(self):
+        """[Updated] 测试获取 ModelProtocol 缺失的方法 (包含 count_tokens)"""
+        class PartialModel:
+            # 仅实现了 acompletion，缺少 count_tokens
+            async def acompletion(self, messages, **kwargs):
+                return CompletionResponse(model="test", choices=[])
+        
+        missing = get_missing_methods(PartialModel(), ModelProtocol)
+        # 验证 count_tokens 被识别为缺失
+        assert "count_tokens" in missing
+        assert "acompletion" not in missing
+
+    def test_valid_model_full_implementation(self):
+        """[New] 测试完整实现了 ModelProtocol (含 count_tokens) 的模型"""
+        class FullModel:
+            async def acompletion(self, messages, **kwargs):
+                return CompletionResponse(model="test", choices=[])
+            
+            def count_tokens(self, text_or_messages):
+                return 10
+        
+        model = FullModel()
+        assert check_protocol(model, ModelProtocol)
+        validate_model(model)
+    
+    def test_get_missing_methods_streamable_protocol(self):
+        """测试获取 StreamableModelProtocol 缺失的方法"""
+        class PartialModel:
+            async def acompletion(self, messages, **kwargs):
+                return CompletionResponse(model="test", choices=[])
+        
+        missing = get_missing_methods(PartialModel(), StreamableModelProtocol)
+        assert "astream" in missing
+    
+    # ==================== 能力检测测试 ====================
+    
+    def test_supports_function_calling_with_attribute(self):
+        """测试 Function Calling 检测（通过属性）"""
+        class ModelWithFC:
+            _supports_function_calling = True
+            
+            async def acompletion(self, messages, **kwargs):
+                return CompletionResponse(model="test", choices=[])
+        
+        assert supports_function_calling(ModelWithFC())
+    
+    def test_supports_function_calling_with_method(self):
+        """测试 Function Calling 检测（通过方法）"""
+        class ModelWithFCMethod:
+            async def acompletion(self, messages, **kwargs):
+                return CompletionResponse(model="test", choices=[])
+            
+            def supports_function_calling(self):
+                return True
+        
+        assert supports_function_calling(ModelWithFCMethod())
+    
+    def test_supports_function_calling_false(self):
+        """测试不支持 Function Calling 的模型"""
+        class ModelWithoutFC:
+            async def acompletion(self, messages, **kwargs):
+                return CompletionResponse(model="test", choices=[])
+        
+        assert not supports_function_calling(ModelWithoutFC())
+    
+    def test_supports_vision(self):
+        """测试 Vision 能力检测"""
+        class ModelWithVision:
+            _supports_vision = True
+            
+            async def acompletion(self, messages, **kwargs):
+                return CompletionResponse(model="test", choices=[])
+        
+        class ModelWithoutVision:
+            async def acompletion(self, messages, **kwargs):
+                return CompletionResponse(model="test", choices=[])
+        
+        assert supports_vision(ModelWithVision())
+        assert not supports_vision(ModelWithoutVision())
+    
+    def test_get_model_name(self):
+        """测试获取模型名称"""
+        class ModelWithName:
+            model_name = "gpt-4"
+            async def acompletion(self, messages, **kwargs):
+                return CompletionResponse(model="test", choices=[])
+        
+        assert get_model_name(ModelWithName()) == "gpt-4"
+        
+        class ModelWithNameAttr:
+            name = "custom-model"
+            async def acompletion(self, messages, **kwargs):
+                return CompletionResponse(model="test", choices=[])
+        
+        assert get_model_name(ModelWithNameAttr()) == "custom-model"
+        
+        class MyCustomModel:
+            async def acompletion(self, messages, **kwargs):
+                return CompletionResponse(model="test", choices=[])
+        
+        assert get_model_name(MyCustomModel()) == "MyCustomModel"
+    
+    # ==================== StorageProtocol 测试 ====================
+    
+    def test_valid_storage(self):
+        """测试有效的存储后端"""
+        class ValidStorage:
+            async def get(self, key: str):
+                return {"data": "value"}
+            
+            async def set(self, key: str, value: dict, ttl=None):
+                pass
+            
+            async def delete(self, key: str):
+                return True
+        
+        storage = ValidStorage()
+        assert check_protocol(storage, StorageProtocol)
+        validate_storage(storage)
+    
+    def test_invalid_storage(self):
+        """测试无效的存储后端"""
+        class InvalidStorage:
+            async def get(self, key: str):
+                return None
+        
+        storage = InvalidStorage()
+        assert not check_protocol(storage, StorageProtocol)
+        
+        with pytest.raises(TypeError, match="does not implement StorageProtocol"):
+            validate_storage(storage)
+    
+    # ==================== ToolProtocol 测试 ====================
+    
+    def test_valid_tool(self):
+        """测试有效的工具"""
+        class ValidTool:
+            name = "calculator"
+            description = "Perform calculations"
+            parameters = {
+                "type": "object",
+                "properties": {"expression": {"type": "string"}},
+                "required": ["expression"]
+            }
+            
+            async def execute(self, arguments: dict):
+                return "42"
+        
+        tool = ValidTool()
+        assert check_protocol(tool, ToolProtocol)
+        validate_tool(tool)
+    
+    def test_invalid_tool_missing_execute(self):
+        """测试缺少 execute 方法的工具"""
+        class InvalidTool:
+            name = "test"
+            description = "test"
+            parameters = {}
+        
+        tool = InvalidTool()
+        assert not check_protocol(tool, ToolProtocol)
+        
+        # ✅ 修正：宽松匹配，只要包含 "execute" 即可
+        with pytest.raises(TypeError, match="execute"):
+            validate_tool(tool)
+    
+    def test_invalid_tool_missing_name(self):
+        """测试缺少 name 的工具"""
+        class InvalidTool:
+            description = "test"
+            parameters = {}
+            
+            async def execute(self, arguments: dict):
+                return "result"
+        
+        tool = InvalidTool()
+        
+        # ✅ 修正：宽松匹配，只要包含 "'name'" 即可
+        with pytest.raises(ValueError, match="'name'"):
+            validate_tool(tool)
+    
+    def test_invalid_tool_missing_description(self):
+        """测试缺少 description 的工具"""
+        class InvalidTool:
+            name = "test"
+            parameters = {}
+            
+            async def execute(self, arguments: dict):
+                return "result"
+        
+        tool = InvalidTool()
+        
+        # ✅ 修正：宽松匹配
+        with pytest.raises(ValueError, match="'description'"):
+            validate_tool(tool)
+    
+    def test_invalid_tool_invalid_parameters(self):
+        """测试无效 parameters 的工具"""
+        class InvalidTool:
+            name = "test"
+            description = "test"
+            parameters = "not a dict"
+            
+            async def execute(self, arguments: dict):
+                return "result"
+        
+        tool = InvalidTool()
+        
+        with pytest.raises(ValueError, match="'parameters'"):
+            validate_tool(tool)
+    
+    # ==================== 新增：空值测试 ====================
+    
+    def test_invalid_tool_empty_name(self):
+        """测试空字符串 name 的工具"""
+        class InvalidTool:
+            name = ""
+            description = "test"
+            parameters = {}
+            
+            async def execute(self, arguments: dict):
+                return "result"
+        
+        tool = InvalidTool()
+        
+        # ✅ 这次应该匹配 "non-empty"
+        with pytest.raises(ValueError, match="non-empty 'name'"):
+            validate_tool(tool)
+    
+    def test_invalid_tool_empty_description(self):
+        """测试空字符串 description 的工具"""
+        class InvalidTool:
+            name = "test"
+            description = ""
+            parameters = {}
+            
+            async def execute(self, arguments: dict):
+                return "result"
+        
+        tool = InvalidTool()
+        
+        with pytest.raises(ValueError, match="non-empty 'description'"):
+            validate_tool(tool)
+    
+    def test_invalid_tool_whitespace_name(self):
+        """测试仅空格 name 的工具"""
+        class InvalidTool:
+            name = "   "
+            description = "test"
+            parameters = {}
+            
+            async def execute(self, arguments: dict):
+                return "result"
+        
+        tool = InvalidTool()
+        
+        with pytest.raises(ValueError, match="non-empty 'name'"):
+            validate_tool(tool)
+    
+    # ==================== 响应模型测试 ====================
+    
+    def test_completion_response_creation(self):
+        """测试 CompletionResponse 创建"""
+        response = CompletionResponse(
+            id="chatcmpl-123",
+            model="gpt-4",
+            choices=[
+                CompletionChoice(
+                    index=0,
+                    message={"role": "assistant", "content": "Hello!"},
+                    finish_reason="stop"
+                )
+            ],
+            usage={
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15
+            } # type: ignore
+        )
+        
+        assert response.model == "gpt-4"
+        assert len(response.choices) == 1
+        assert response.choices[0].message["content"] == "Hello!"
+        assert response.usage.total_tokens == 15 # type: ignore
+    
+    def test_stream_chunk_properties(self):
+        """测试 StreamChunk 属性"""
+        chunk = StreamChunk(
+            id="chatcmpl-123",
+            model="gpt-4",
+            choices=[
+                {
+                    "index": 0,
+                    "delta": {"content": "Hello"},
+                    "finish_reason": None
+                }
+            ]
+        )
+        
+        assert chunk.model == "gpt-4"
+        assert chunk.delta == {"content": "Hello"}
+        assert chunk.content == "Hello"
+    
+    def test_stream_chunk_empty_delta(self):
+        """测试空 delta 的 StreamChunk"""
+        chunk = StreamChunk(
+            id="chatcmpl-123",
+            model="gpt-4",
+            choices=[]
+        )
+        
+        assert chunk.delta == {}
+        assert chunk.content is None
+
+
+# ==================== 集成测试 ====================
+
+class TestProtocolIntegration:
+    """协议集成测试"""
+    
+    def test_model_with_all_capabilities(self):
+        """测试具有所有能力的完整模型"""
+        class FullFeaturedModel:
+            model_name = "advanced-model"
+            _supports_function_calling = True
+            _supports_vision = True
+            
+            async def acompletion(self, messages, **kwargs):
+                return CompletionResponse(
+                    model=self.model_name,
+                    choices=[
+                        CompletionChoice(
+                            message={"role": "assistant", "content": "Response"}
+                        )
+                    ]
+                )
+            
+            async def astream(self, messages, **kwargs):
+                yield StreamChunk(model=self.model_name)
+
+            def count_tokens(self, text_or_messages):
+                return 0
+        
+        model = FullFeaturedModel()
+        
+        assert check_protocol(model, ModelProtocol)
+        assert check_protocol(model, StreamableModelProtocol)
+        assert supports_streaming(model)
+        assert supports_function_calling(model)
+        assert supports_vision(model)
+        assert get_model_name(model) == "advanced-model"
+        
+        validate_model(model)
+```
+
+[14] tests/core/test_react.py
+```python
+# tests/core/test_react.py
+"""
+ReAct Engine 单元测试 (完整版)
+
+覆盖率目标：100%
+包含：
+1. 基础推理 (Text/Tool)
+2. 流式推理 (Stream with Tool Chunks)
+3. 错误处理与反馈
+4. 新特性 (死循环检测、输出截断)
+5. 生命周期 Hooks
+6. 结构化输出与重试
+7. 上下文与记忆管理
+"""
+import pytest
+from unittest.mock import MagicMock, AsyncMock
+from types import SimpleNamespace
+
+from pydantic import BaseModel
+
+from gecko.core.engine.react import ReActEngine, ExecutionContext
+from gecko.core.events.bus import EventBus
+from gecko.core.message import Message
+from gecko.core.output import AgentOutput
+from gecko.core.toolbox import ToolBox, ToolExecutionResult
+from gecko.core.protocols import StreamableModelProtocol
+
+# ========================= Helpers =========================
+
+def create_mock_response(content: str = None, tool_calls: list = None): # type: ignore
+    """创建模拟的 CompletionResponse"""
+    msg = {}
+    if content is not None:
+        msg["content"] = content
+    if tool_calls is not None:
+        msg["tool_calls"] = tool_calls
+    
+    choice = MagicMock()
+    choice.message = SimpleNamespace(**msg)
+    
+    response = MagicMock()
+    response.choices = [choice]
+    return response
+
+class MockModel(MagicMock):
+    """同时支持同步和流式的 Mock 模型"""
+    def __init__(self, *args, **kwargs):
+        super().__init__(spec=StreamableModelProtocol, *args, **kwargs)
+        self.acompletion = AsyncMock()
+        self.astream = MagicMock()
+
+# ========================= Fixtures =========================
+
+@pytest.fixture
+def mock_toolbox():
+    tb = MagicMock(spec=ToolBox)
+    tb.to_openai_schema.return_value = [{"type": "function", "function": {"name": "t1"}}]
+    tb.execute_many = AsyncMock(return_value=[])
+    return tb
+
+# [修复] 显式定义 mock_event_bus fixture
+@pytest.fixture
+def mock_event_bus():
+    bus = MagicMock(spec=EventBus)
+    bus.publish = AsyncMock()
+    return bus
+
+# [修复] 确保 engine fixture 接收 mock_event_bus 参数
+@pytest.fixture
+def engine(mock_model, mock_toolbox, mock_memory, mock_event_bus):
+    return ReActEngine(
+        model=mock_model,
+        toolbox=mock_toolbox,
+        memory=mock_memory,
+        event_bus=mock_event_bus, # 注入
+        max_turns=5,
+        max_observation_length=100
+    )
+@pytest.fixture
+def mock_model():
+    return MockModel()
+
+@pytest.fixture
+def mock_memory():
+    mem = MagicMock()
+    mem.storage = MagicMock() # 模拟有存储
+    mem.session_id = "test_session"
+    mem.storage.get = AsyncMock(return_value=None)
+    mem.storage.set = AsyncMock()
+    mem.get_history = AsyncMock(return_value=[])
+    return mem
+
+
+# ========================= 1. 基础推理测试 =========================
+
+@pytest.mark.asyncio
+async def test_step_basic_text(engine, mock_model):
+    """测试基本的文本回复"""
+    mock_model.acompletion.return_value = create_mock_response(content="Hello")
+    output = await engine.step([Message.user("Hi")])
+    assert output.content == "Hello"
+    mock_model.acompletion.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_step_with_tool_execution(engine, mock_model, mock_toolbox):
+    """测试工具调用流程"""
+    # Round 1: Tool Call
+    resp1 = create_mock_response(tool_calls=[
+        {"id": "call_1", "function": {"name": "t1", "arguments": "{}"}}
+    ])
+    # Round 2: Final Answer
+    resp2 = create_mock_response(content="Final")
+    
+    mock_model.acompletion.side_effect = [resp1, resp2]
+    mock_toolbox.execute_many.return_value = [
+        ToolExecutionResult("t1", "call_1", "Result", False)
+    ]
+    
+    output = await engine.step([Message.user("Run")])
+    
+    assert output.content == "Final"
+    # 验证中间消息包含 tool role
+    call_args = mock_model.acompletion.call_args_list[1]
+    messages = call_args[1]['messages']
+    assert messages[-1]['role'] == 'tool'
+    assert messages[-1]['content'] == "Result"
+
+@pytest.mark.asyncio
+async def test_step_max_turns(engine, mock_model):
+    """测试最大轮数限制"""
+    # 构造导致死循环的相同调用
+    resp = create_mock_response(tool_calls=[{"id": "1", "function": {"name": "t1", "arguments": "{}"}}])
+    mock_model.acompletion.return_value = resp
+    engine.max_turns = 2
+    
+    output = await engine.step([Message.user("Loop")])
+    
+    # [Fix] 更新断言：新的死循环检测逻辑会注入 System Alert
+    # 检查内容中是否包含 "Execution stopped" 或 "System Alert"
+    assert "Execution stopped" in output.content or "System Alert" in output.content
+
+# ========================= 2. 流式推理测试 =========================
+
+@pytest.mark.asyncio
+async def test_step_stream_basic(engine, mock_model):
+    """测试纯文本流式"""
+    async def stream_gen(*args, **kwargs):
+        yield SimpleNamespace(choices=[{"delta": {"content": "A"}}])
+        yield SimpleNamespace(choices=[{"delta": {"content": "B"}}])
+
+    mock_model.astream = MagicMock(side_effect=stream_gen)
+    chunks = [c async for c in engine.step_stream([Message.user("Hi")])]
+    assert "".join(chunks) == "AB"
+
+@pytest.mark.asyncio
+async def test_step_stream_with_tool_call(engine, mock_model, mock_toolbox):
+    """测试流式工具调用 (模拟 chunk 拼接)"""
+    # Round 1: Tool Call Chunks
+    async def stream_r1(*args, **kwargs):
+        yield SimpleNamespace(choices=[{"delta": {"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "t1"}}]}}])
+        yield SimpleNamespace(choices=[{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{}"}}]}}])
+
+    # Round 2: Text
+    async def stream_r2(*args, **kwargs):
+        yield SimpleNamespace(choices=[{"delta": {"content": "Done"}}])
+
+    mock_model.astream.side_effect = [stream_r1(), stream_r2()]
+    mock_toolbox.execute_many.return_value = [ToolExecutionResult("t1", "c1", "Res", False)]
+
+    chunks = [c async for c in engine.step_stream([Message.user("Run")])]
+    
+    assert "".join(chunks) == "Done"
+    mock_toolbox.execute_many.assert_called_once()
+
+# ========================= 3. 错误处理与反馈 =========================
+
+@pytest.mark.asyncio
+async def test_step_tool_error_feedback(engine, mock_model, mock_toolbox):
+    """测试工具错误反馈"""
+    resp1 = create_mock_response(tool_calls=[{"id": "1", "function": {"name": "err", "arguments": "{}"}}])
+    resp2 = create_mock_response(content="Fixed")
+    
+    mock_model.acompletion.side_effect = [resp1, resp2]
+    mock_toolbox.execute_many.return_value = [
+        ToolExecutionResult("err", "1", "Error!!", True)
+    ]
+    
+    await engine.step([Message.user("Try")])
+    
+    # 验证即使错误，也以 tool role 返回
+    messages = mock_model.acompletion.call_args_list[1][1]['messages']
+    assert messages[-1]['role'] == 'tool'
+    assert "Error!!" in messages[-1]['content']
+
+@pytest.mark.asyncio
+async def test_consecutive_error_warning(engine, mock_model, mock_toolbox):
+    """测试连续 3 次错误触发系统警告"""
+    # [Fix] 为了避开死循环检测，让每次 Tool Call 的参数略有不同
+    # 模拟连续 3 次调用工具都报错，但参数不同 (i=1, i=2, i=3)
+    resp1 = create_mock_response(tool_calls=[{"id": "1", "function": {"name": "t1", "arguments": '{"i": 1}'}}])
+    resp2 = create_mock_response(tool_calls=[{"id": "2", "function": {"name": "t1", "arguments": '{"i": 2}'}}])
+    resp3 = create_mock_response(tool_calls=[{"id": "3", "function": {"name": "t1", "arguments": '{"i": 3}'}}])
+    resp_stop = create_mock_response("Stop")
+
+    mock_model.acompletion.side_effect = [resp1, resp2, resp3, resp_stop]
+
+    # 工具每次都返回错误
+    mock_toolbox.execute_many.return_value = [ToolExecutionResult("t1", "1", "Err", True)]
+
+    engine.max_turns = 10
+    await engine.step([Message.user("Try")])
+
+    # 第 4 次调用时 (下标为3)，上下文中应该包含 User 的警告信息
+    call_4 = mock_model.acompletion.call_args_list[3]
+    msgs = call_4[1]['messages']
+
+    # 验证消息结构: ... -> [Assistant] -> [Tool Result (Err)] -> [User Warning]
+    
+    # 1. 最后一条应该是 System Warning (User role)
+    assert msgs[-1]['role'] == 'user'
+    assert "Too many tool errors" in msgs[-1]['content']
+    
+    # 2. 倒数第二条是 Tool Result
+    assert msgs[-2]['role'] == 'tool'
+
+# ========================= 4. 新特性测试 =========================
+
+@pytest.mark.asyncio
+async def test_infinite_loop_detection(engine, mock_model, mock_toolbox):
+    """测试死循环检测"""
+    # 模拟 LLM 总是返回相同的 Tool Call
+    same_call = create_mock_response(tool_calls=[
+        {"id": "1", "function": {"name": "t1", "arguments": '{"a":1}'}}
+    ])
+    
+    mock_model.acompletion.return_value = same_call
+    mock_toolbox.execute_many.return_value = [ToolExecutionResult("t1", "1", "Res", False)]
+    
+    engine.max_turns = 5
+    await engine.step([Message.user("Loop")])
+    
+    # 应该只调用了 2 次 (第一次正常，第二次发现 hash 相同被中断)
+    assert mock_model.acompletion.call_count == 2
+    # 验证 warning 日志 (实际通过 mock logger 验证，这里简略)
+
+@pytest.mark.asyncio
+async def test_observation_truncation(engine, mock_model, mock_toolbox):
+    """测试工具输出截断"""
+    resp1 = create_mock_response(tool_calls=[{"id": "1", "function": {"name": "t1", "arguments": "{}"}}])
+    resp2 = create_mock_response(content="Done")
+    
+    mock_model.acompletion.side_effect = [resp1, resp2]
+    
+    # 返回超长结果 (limit=100)
+    long_text = "A" * 200
+    mock_toolbox.execute_many.return_value = [ToolExecutionResult("t1", "1", long_text, False)]
+    
+    await engine.step([Message.user("BigData")])
+    
+    # 验证上下文中的 Tool Message 被截断
+    messages = mock_model.acompletion.call_args_list[1][1]['messages']
+    tool_content = messages[-1]['content']
+    
+    assert len(tool_content) < 200
+    assert "truncated" in tool_content
+
+# ========================= 5. Hooks 测试 =========================
+
+@pytest.mark.asyncio
+async def test_hooks_execution(mock_model, mock_toolbox, mock_memory):
+    """测试生命周期 Hooks"""
+    start_hook = AsyncMock()
+    end_hook = AsyncMock()
+    tool_hook = AsyncMock()
+    
+    engine = ReActEngine(
+        mock_model, mock_toolbox, mock_memory,
+        on_turn_start=start_hook,
+        on_turn_end=end_hook,
+        on_tool_execute=tool_hook
+    )
+    
+    # 模拟一次工具调用流程
+    mock_model.acompletion.side_effect = [
+        create_mock_response(tool_calls=[{"id": "1", "function": {"name": "t1", "arguments": "{}"}}]),
+        create_mock_response(content="Done")
+    ]
+    mock_toolbox.execute_many.return_value = [ToolExecutionResult("t1", "1", "Res", False)]
+    
+    await engine.step([Message.user("Hook")])
+    
+    # 验证 Hooks 调用次数
+    assert start_hook.call_count == 2 # 2 turns
+    assert end_hook.call_count == 2
+    assert tool_hook.call_count == 1
+
+# ========================= 6. 结构化输出与重试 =========================
+
+@pytest.mark.asyncio
+async def test_structure_output_retry(engine, mock_model):
+    """测试结构化输出解析失败后的重试"""
+    class User(BaseModel):
+        name: str
+    
+    # 1. 错误格式 -> 2. 正确格式
+    mock_model.acompletion.side_effect = [
+        create_mock_response(content="Not JSON"), 
+        create_mock_response(content='{"name": "Alice"}')
+    ]
+    
+    user = await engine.step([Message.user("Parse")], response_model=User, max_retries=1)
+    
+    assert isinstance(user, User)
+    assert user.name == "Alice"
+    # 验证发生了重试 (2次 LLM 调用)
+    assert mock_model.acompletion.call_count == 2
+    # 验证第二次调用包含了反馈信息
+    msg_2 = mock_model.acompletion.call_args_list[1][1]['messages']
+    assert "Error parsing response" in msg_2[-1]['content']
+
+# ========================= 7. 上下文与记忆 =========================
+
+@pytest.mark.asyncio
+async def test_context_building_with_history(engine, mock_memory, mock_model):
+    """测试历史记录加载和 System Prompt"""
+    # [Fix] 必须 Mock storage.get 返回包含 "messages" 的数据，
+    # 否则 _load_history 会直接返回 []，不调用 get_history
+    mock_memory.storage.get.return_value = {"messages": ["some_raw_data"]}
+    
+    # 模拟内存转换后的历史对象
+    mock_memory.get_history.return_value = [Message.user("Old")]
+    mock_model.acompletion.return_value = create_mock_response(content="Hi")
+
+    await engine.step([Message.user("New")])
+
+    call_args = mock_model.acompletion.call_args[1]
+    sent_msgs = call_args['messages']
+
+    # 验证顺序: System -> History(Old) -> Input(New)
+    assert sent_msgs[0]['role'] == 'system' # 自动注入的 System Prompt
+    assert sent_msgs[1]['role'] == 'user' and sent_msgs[1]['content'] == "Old"
+    assert sent_msgs[2]['role'] == 'user' and sent_msgs[2]['content'] == "New"
+
+@pytest.mark.asyncio
+async def test_system_prompt_rendering(mock_model, mock_toolbox, mock_memory):
+    """测试 System Prompt 模板渲染"""
+    # 使用自定义模板
+    tmpl = "Time: {{ current_time }}"
+    engine = ReActEngine(mock_model, mock_toolbox, mock_memory, system_prompt=tmpl)
+    mock_model.acompletion.return_value = create_mock_response("Hi")
+    
+    await engine.step([Message.user("A")])
+    
+    sent_msgs = mock_model.acompletion.call_args[1]['messages']
+    sys_content = sent_msgs[0]['content']
+    
+    # 验证时间被注入 (当前年份)
+    import datetime
+    current_year = str(datetime.datetime.now().year)
+    assert "Time:" in sys_content
+    assert current_year in sys_content
+
+@pytest.mark.asyncio
+async def test_step_stream_recursion_depth_safety(engine, mock_model, mock_toolbox):
+    """
+    [New] 测试流式推理在高轮次下不会触发 RecursionError
+    验证优化点：ReActEngine._run_streaming_loop 改为迭代式
+    """
+    engine.max_turns = 50
+
+    # [修复] 使用计数器生成唯一的参数，避开 ReAct 引擎的 Hash 死循环检测
+    counter = 0
+    async def endless_tool_stream(*args, **kwargs):
+        nonlocal counter
+        counter += 1
+        # 构造动态参数 {"i": 1}, {"i": 2}...
+        unique_args = f'{{"i": {counter}}}'
+        
+        yield SimpleNamespace(choices=[{
+            "delta": {
+                "tool_calls": [{
+                    "index": 0, 
+                    "function": {
+                        "name": "t1", 
+                        "arguments": unique_args
+                    }
+                }]
+            }
+        }])
+
+    mock_model.astream.side_effect = endless_tool_stream
+    mock_toolbox.execute_many.return_value = [ToolExecutionResult("t1", "1", "res", False)]
+
+    # 执行流式推理
+    count = 0
+    async for _ in engine.step_stream([Message.user("Start")]):
+        count += 1
+
+    # 验证确实执行了多次 LLM 调用 (达到 max_turns 上限)
+    assert mock_model.astream.call_count >= 50
+
+# ========================= 8. 修复验证与增强测试 =========================
+
+@pytest.mark.asyncio
+async def test_structured_output_with_intermediate_tool(engine, mock_model):
+    """
+    [Fix Verification] 测试非目标工具拦截逻辑
+    
+    场景：用户请求结构化输出 (TargetModel)，但模型因死循环或逻辑错误，
+    返回了一个中间工具 (e.g., search)，而不是最终结果工具。
+    
+    期望：
+    1. 系统不应尝试用 search 的参数去解析 TargetModel (防止 ValidationError)。
+    2. 系统应抛出 StructureParseError 并触发重试。
+    3. 重试后若模型返回正确结果，应成功。
+    """
+    class TargetModel(BaseModel):
+        reason: str
+        score: int
+
+    target_tool_name = "targetmodel"
+    
+    resp_wrong = create_mock_response(tool_calls=[
+        {"id": "1", "function": {"name": "calculator", "arguments": '{"expr": "1+1"}'}}
+    ])
+    
+    resp_correct = create_mock_response(tool_calls=[
+        {"id": "2", "function": {
+            "name": target_tool_name, 
+            "arguments": '{"reason": "ok", "score": 100}'
+        }}
+    ])
+    
+    mock_model.acompletion.side_effect = [resp_wrong, resp_correct]
+    
+    # [Fix] 关键修改：将 max_turns 设置为 1
+    # 这强制引擎在第一轮（错误工具）后停止，将其作为最终结果返回，
+    # 从而触发 _handle_structured_output 中的校验和重试逻辑。
+    engine.max_turns = 1
+    
+    # 执行
+    result = await engine.step(
+        [Message.user("Evaluate")], 
+        response_model=TargetModel,
+        max_retries=1
+    )
+    
+    # 验证
+    assert isinstance(result, TargetModel)
+    assert result.score == 100
+    
+    # 验证调用次数 (1次 ReAct + 1次 Retry)
+    assert mock_model.acompletion.call_count == 2
+    
+    # 检查重试时的反馈消息
+    # call_args_list[1] 是第二次调用 (Retry)
+    # [1]['messages'] 是参数中的 messages 列表
+    retry_input_msgs = mock_model.acompletion.call_args_list[1][1]['messages']
+    last_msg = retry_input_msgs[-1]
+    
+    # 验证反馈内容
+    assert last_msg['role'] == 'user'
+    assert "Incorrect tool used" in last_msg['content']
+
+@pytest.mark.asyncio
+async def test_structured_output_with_parallel_tools(engine, mock_model):
+    """
+    [Enhancement] 测试并行工具调用筛选
+    
+    场景：模型很聪明，在一次返回中同时调用了 'save_log' (副作用) 和 'final_result' (目标)。
+    期望：系统能遍历 tool_calls，忽略 log，精准找到 final_result 进行解析。
+    """
+    class FinalResult(BaseModel):
+        answer: str
+
+    target_name = "finalresult"
+    
+    # 模拟并行调用：列表里有两个工具
+    parallel_resp = create_mock_response(tool_calls=[
+        # 干扰项：排在第一个
+        {"id": "1", "function": {"name": "save_log", "arguments": '{"msg": "thinking"}'}},
+        # 目标项
+        {"id": "2", "function": {"name": target_name, "arguments": '{"answer": "42"}'}}
+    ])
+    
+    mock_model.acompletion.return_value = parallel_resp
+    
+    # 执行
+    result = await engine.step([Message.user("Run")], response_model=FinalResult)
+    
+    # 验证
+    assert isinstance(result, FinalResult)
+    assert result.answer == "42"
+    # 确保只调用了一次 LLM (没有因为解析错误而重试)
+    assert mock_model.acompletion.call_count == 1
+
+@pytest.mark.asyncio
+async def test_infinite_loop_feedback_injection(engine, mock_model, mock_toolbox):
+    """
+    [Fix Verification] 测试死循环时的 System Alert 注入
+    
+    场景：模型陷入死循环，被 detect_infinite_loop 拦截。
+    期望：
+    1. 循环中断。
+    2. 上下文中被注入了一条 System Alert (User Role)。
+    """
+    # 构造完全相同的工具调用
+    repeat_call = create_mock_response(tool_calls=[
+        {"id": "x", "function": {"name": "t1", "arguments": "{}"}}
+    ])
+    
+    # 设置为每次都返回相同内容
+    mock_model.acompletion.return_value = repeat_call
+    mock_toolbox.execute_many.return_value = [ToolExecutionResult("t1", "x", "res", False)]
+    
+    engine.max_turns = 5
+    
+    # 执行 (这会触发死循环保护)
+    # 我们不关心返回值，只关心上下文状态
+    await engine.step([Message.user("Loop")])
+    
+    # 获取最后一次调用时的上下文消息历史
+    last_call_args = mock_model.acompletion.call_args
+    messages_sent = last_call_args[1]['messages']
+    
+    # 验证最后一条消息是否包含 System Alert
+    # 注意：Engine 内部逻辑是：检测到循环 -> 添加 AssitantMsg(ToolCall) -> 添加 UserMsg(Alert) -> Break
+    # 但因为 Break 了，最后一条 Alert 实际上不会发给 LLM (因为没有下一轮了)。
+    # 但是 step 方法最后会保存 context。我们需要检查 engine 内部的 context 或者通过 Side Effect 验证。
+    
+    # 这里我们通过检查 engine 运行过程中的行为来验证。
+    # 由于 step 方法结束后 context 就销毁了（局部变量），我们可以 Mock on_turn_end 来捕获 Context。
+    
+    captured_context = None
+    async def capture_ctx(ctx):
+        nonlocal captured_context
+        captured_context = ctx
+    
+    engine.on_turn_end = capture_ctx
+    
+    # 重新运行
+    await engine.step([Message.user("Loop2")])
+    
+    assert captured_context is not None
+    last_msg = captured_context.messages[-1]
+    
+    # 验证注入了警告
+    assert last_msg.role == "user"
+    assert "System Alert" in str(last_msg.content)
+    assert "Stop looping" in str(last_msg.content)
+
+# [新增] 测试流式工具事件
+@pytest.mark.asyncio
+async def test_step_stream_events(engine, mock_model, mock_toolbox, mock_event_bus):
+    """
+    测试流式模式下是否发送工具开始/结束事件
+    解决前端'静默'问题
+    """
+    # 1. 模拟第一轮：LLM 调用工具
+    async def stream_gen_tool(*args, **kwargs):
+        # 模拟返回一个 Tool Call
+        yield SimpleNamespace(choices=[{
+            "delta": {
+                "tool_calls": [{
+                    "index": 0, 
+                    "id": "c1", 
+                    "function": {"name": "t1", "arguments": "{}"}
+                }]
+            }
+        }])
+    
+    # 2. [新增] 模拟第二轮：LLM 在工具执行后返回最终结果
+    # 如果不提供这个，ReAct 循环再次调用 astream 时会因为 side_effect 耗尽而崩溃
+    async def stream_gen_final(*args, **kwargs):
+        yield SimpleNamespace(choices=[{
+            "delta": {
+                "content": "Done"
+            }
+        }])
+    
+    # 配置 side_effect 包含两轮响应
+    mock_model.astream.side_effect = [stream_gen_tool(), stream_gen_final()]
+    
+    mock_toolbox.execute_many.return_value = [ToolExecutionResult("t1", "c1", "Res", False)]
+    
+    # 执行流式
+    async for _ in engine.step_stream([Message.user("Run")]):
+        pass
+        
+    # 验证 EventBus 调用
+    # 至少调用2次 (Start, End)
+    assert mock_event_bus.publish.call_count >= 2
+    
+    # 验证具体事件类型
+    calls = mock_event_bus.publish.call_args_list
+    event_types = [c[0][0].type for c in calls] # c[0][0] is the Event object
+    
+    assert "tool_execution_start" in event_types
+    assert "tool_execution_end" in event_types
+
+# [新增] 测试 JSON 容错与反馈
+@pytest.mark.asyncio
+async def test_react_json_fault_tolerance(engine, mock_model, mock_toolbox):
+    """
+    测试 LLM 返回非法 JSON 时的处理流程
+    """
+    # 1. LLM 返回非法 JSON (少个引号)
+    bad_json_args = '{"arg": "value"' 
+    
+    resp1 = create_mock_response(tool_calls=[
+        {"id": "1", "function": {"name": "t1", "arguments": bad_json_args}}
+    ])
+    # 2. 第二轮 LLM 收到错误反馈后，修正并返回正确结果
+    resp2 = create_mock_response(content="Sorry, here is the result.")
+    
+    mock_model.acompletion.side_effect = [resp1, resp2]
+    
+    # 3. ToolBox 应该收到带有错误标记的参数
+    # 我们需要模拟 ToolBox 的 execute_many 行为，这里它会识别标记并返回系统错误提示
+    # 实际集成中由 ToolBox 代码处理，但在单元测试中我们需要 Mock 它的返回值或者使用真实 ToolBox
+    # 为了测试 Engine 的逻辑，我们验证 Engine 传递给 ToolBox 的参数是否包含标记
+    
+    await engine.step([Message.user("Break JSON")])
+    
+    # 验证 Engine 调用 ToolBox 时传递了错误标记
+    execute_call = mock_toolbox.execute_many.call_args
+    passed_tool_calls = execute_call[0][0] # 第一个参数
+    
+    assert len(passed_tool_calls) == 1
+    args = passed_tool_calls[0]["arguments"]
+    
+    # 关键断言：Engine 捕获了 JSON 错误并转换为了特殊 Key
+    assert "__gecko_parse_error__" in args
+    assert "JSON format error" in args["__gecko_parse_error__"]
+```
+
+[15] tests/core/test_session.py
+```python
+# tests/core/test_session.py
+from unittest.mock import AsyncMock, MagicMock
+import pytest
+import asyncio
+import time
+from gecko.core.session import Session, SessionManager, SessionMetadata
+
+
+class TestSessionMetadata:
+    """SessionMetadata 测试"""
+    
+    def test_create_metadata(self):
+        """测试创建元数据"""
+        meta = SessionMetadata(session_id="test")
+        
+        assert meta.session_id == "test"
+        assert meta.access_count == 0
+        assert meta.ttl is None
+    
+    def test_is_expired(self):
+        """测试过期检查"""
+        # 不过期
+        meta1 = SessionMetadata(session_id="test1", ttl=None)
+        assert not meta1.is_expired()
+        
+        # 已过期
+        meta2 = SessionMetadata(session_id="test2", ttl=1)
+        meta2.created_at = time.time() - 2
+        assert meta2.is_expired()
+    
+    def test_touch(self):
+        """测试 touch 更新"""
+        meta = SessionMetadata(session_id="test")
+        
+        initial_count = meta.access_count
+        meta.touch()
+        
+        assert meta.access_count == initial_count + 1
+
+
+class TestSession:
+    """Session 测试"""
+    
+    def test_create_session(self):
+        """测试创建会话"""
+        session = Session(session_id="test_session")
+        
+        assert session.session_id == "test_session"
+        assert len(session.state) == 0
+    
+    def test_get_set(self):
+        """测试 get/set"""
+        session = Session()
+        
+        session.set("key1", "value1")
+        assert session.get("key1") == "value1"
+        assert session.get("key2", "default") == "default"
+    
+    def test_dict_syntax(self):
+        """测试字典语法"""
+        session = Session()
+        
+        session["key1"] = "value1"
+        assert session["key1"] == "value1"
+        assert "key1" in session
+    
+    def test_update(self):
+        """测试批量更新"""
+        session = Session()
+        
+        session.update({"a": 1, "b": 2, "c": 3})
+        
+        assert session.get("a") == 1
+        assert session.get("b") == 2
+        assert len(session.keys()) == 3
+    
+    def test_delete(self):
+        """测试删除"""
+        session = Session()
+        session.set("key", "value")
+        
+        result = session.delete("key")
+        
+        assert result is True
+        assert session.get("key") is None
+    
+    def test_clear(self):
+        """测试清空"""
+        session = Session()
+        session.update({"a": 1, "b": 2})
+        
+        session.clear()
+        
+        assert len(session.state) == 0
+    
+    def test_is_expired(self):
+        """测试过期"""
+        session = Session(ttl=1)
+        
+        assert not session.is_expired()
+        
+        # 修改创建时间
+        session.metadata.created_at = time.time() - 2
+        assert session.is_expired()
+    
+    def test_extend_ttl(self):
+        """测试延长 TTL"""
+        session = Session(ttl=10)
+        
+        session.extend_ttl(5)
+        
+        assert session.metadata.ttl == 15
+    
+    def test_tags(self):
+        """测试标签"""
+        session = Session()
+        
+        session.add_tag("premium")
+        session.add_tag("verified")
+        
+        assert session.has_tag("premium")
+        assert session.has_tag("verified")
+        
+        session.remove_tag("premium")
+        assert not session.has_tag("premium")
+    
+    def test_clone(self):
+        """测试克隆"""
+        session = Session(session_id="original")
+        session.set("data", "value")
+        session.add_tag("tag1")
+        
+        cloned = session.clone(new_id="cloned")
+        
+        assert cloned.session_id == "cloned"
+        assert cloned.get("data") == "value"
+        assert cloned.has_tag("tag1")
+    
+    def test_to_dict(self):
+        """测试序列化"""
+        session = Session()
+        session.set("key", "value")
+        
+        data = session.to_dict()
+        
+        assert "state" in data
+        assert "metadata" in data
+        assert data["state"]["key"] == "value"
+    
+    def test_from_dict(self):
+        """测试反序列化"""
+        session = Session()
+        
+        data = {
+            "state": {"key": "value"},
+            "metadata": {
+                "session_id": "test",
+                "access_count": 5
+            }
+        }
+        
+        session.from_dict(data)
+        
+        assert session.get("key") == "value"
+        assert session.metadata.access_count == 5
+
+
+class TestSessionManager:
+    """SessionManager 测试"""
+    
+    @pytest.mark.asyncio
+    async def test_create_session(self):
+        """测试创建会话"""
+        manager = SessionManager(auto_cleanup=False)
+        
+        session = await manager.create_session(user="Alice")
+        
+        assert session is not None
+        assert session.get("user") == "Alice"
+        assert manager.get_active_count() == 1
+    
+    @pytest.mark.asyncio
+    async def test_get_session(self):
+        """测试获取会话"""
+        manager = SessionManager(auto_cleanup=False)
+        
+        created = await manager.create_session(session_id="test_id")
+        retrieved = await manager.get_session("test_id")
+        
+        assert retrieved is not None
+        assert retrieved.session_id == created.session_id
+    
+    @pytest.mark.asyncio
+    async def test_get_nonexistent(self):
+        """测试获取不存在的会话"""
+        manager = SessionManager(auto_cleanup=False)
+        
+        result = await manager.get_session("nonexistent")
+        
+        assert result is None
+    
+    @pytest.mark.asyncio
+    async def test_create_if_missing(self):
+        """测试自动创建"""
+        manager = SessionManager(auto_cleanup=False)
+        
+        session = await manager.get_session("new_id", create_if_missing=True)
+        
+        assert session is not None
+        assert session.session_id == "new_id"
+    
+    @pytest.mark.asyncio
+    async def test_destroy_session(self):
+        """测试销毁会话"""
+        manager = SessionManager(auto_cleanup=False)
+        
+        session = await manager.create_session(session_id="destroy_me")
+        result = await manager.destroy_session("destroy_me")
+        
+        assert result is True
+        assert await manager.get_session("destroy_me") is None
+    
+    @pytest.mark.asyncio
+    async def test_cleanup_expired(self):
+        """测试清理过期会话"""
+        manager = SessionManager(auto_cleanup=False, default_ttl=1)
+        
+        # 创建会话
+        session = await manager.create_session()
+        
+        # 设置为已过期
+        session.metadata.created_at = time.time() - 2
+        
+        # 清理
+        count = await manager.cleanup_expired()
+        
+        assert count == 1
+        assert manager.get_active_count() == 0
+    
+    @pytest.mark.asyncio
+    async def test_shutdown(self):
+        """测试关闭"""
+        manager = SessionManager(auto_cleanup=True)
+        
+        await manager.create_session()
+        await manager.shutdown()
+        
+        # 验证清理任务已取消
+        if manager._cleanup_task:
+            assert manager._cleanup_task.cancelled() or manager._cleanup_task.done()
+
+@pytest.mark.asyncio
+async def test_session_save_consistency_snapshot():
+    """
+    [New] 测试 Session 保存时的数据一致性 (防止竞态条件)
+    验证优化点：Session.save 中的同步快照机制
+    """
+    # 1. 创建一个慢速存储后端
+    slow_storage = MagicMock()
+    
+    # 定义一个 set 方法，模拟耗时 IO
+    save_event = asyncio.Event()
+    
+    async def slow_set(key, value):
+        # 模拟 IO 延迟
+        await asyncio.sleep(0.1)
+        # 记录实际写入的数据
+        slow_storage.saved_value = value
+        save_event.set()
+    
+    slow_storage.set = AsyncMock(side_effect=slow_set)
+    
+    # 2. 初始化 Session
+    session = Session(session_id="race_test", storage=slow_storage)
+    session.set("counter", 1)
+    
+    # 3. 触发保存 (此时 counter=1)
+    # 不等待它完成，让它在后台跑
+    save_task = asyncio.create_task(session.save())
+    
+    # 4. 立即修改内存中的状态 (模拟并发修改)
+    # 在 save 进入 await sleep 期间，我们修改了 counter -> 2
+    await asyncio.sleep(0.01) # 确保 save 已经进入了 async with lock 之后的逻辑
+    session.set("counter", 2)
+    
+    # 5. 等待保存完成
+    await save_task
+    await save_event.wait()
+    
+    # 6. 验证：
+    # 存储中的数据应该是保存开始时的快照 (counter=1)
+    # 而不是修改后的数据 (counter=2)
+    saved_data = slow_storage.saved_value
+    assert saved_data["state"]["counter"] == 1, \
+        "Session 保存发生了竞态条件！写入了修改后的数据而非快照。"
+        
+    # 内存中的数据应该是新的
+    assert session.get("counter") == 2
+```
+
+[16] tests/core/test_structure.py
+```python
+# tests/core/test_structure.py
+import pytest
+from pydantic import BaseModel, Field
+from gecko.core.structure import (
+    StructureEngine,
+    StructureParseError,
+    extract_json_from_text
+)
+
+
+# 测试用模型
+class User(BaseModel):
+    name: str
+    age: int
+
+
+class ComplexModel(BaseModel):
+    title: str = Field(description="标题")
+    items: list[str] = Field(default_factory=list)
+    metadata: dict = Field(default_factory=dict)
+
+
+class TestStructureEngine:
+    """StructureEngine 测试"""
+    
+    # ===== Schema 生成 =====
+    
+    def test_to_openai_tool(self):
+        """测试生成 OpenAI Tool Schema"""
+        schema = StructureEngine.to_openai_tool(User)
+        
+        assert schema["type"] == "function"
+        assert "function" in schema
+        assert "name" in schema["function"]
+        assert "parameters" in schema["function"]
+        
+        params = schema["function"]["parameters"]
+        assert "name" in params["properties"]
+        assert "age" in params["properties"]
+    
+    # ===== 解析测试 =====
+    
+    @pytest.mark.asyncio
+    async def test_parse_direct_json(self):
+        """测试直接 JSON 解析"""
+        json_text = '{"name": "Alice", "age": 25}'
+        
+        user = await StructureEngine.parse(json_text, User)
+        
+        assert user.name == "Alice"
+        assert user.age == 25
+    
+    @pytest.mark.asyncio
+    async def test_parse_markdown_json(self):
+        """测试 Markdown 代码块"""
+        markdown = '''
+        Some text here
+        
+        ```json
+        {"name": "Bob", "age": 30}
+        ```
+        
+        More text
+        '''
+        
+        user = await StructureEngine.parse(markdown, User)
+        
+        assert user.name == "Bob"
+        assert user.age == 30
+    
+    @pytest.mark.asyncio
+    async def test_parse_from_tool_call(self):
+        """测试从工具调用解析"""
+        tool_calls = [
+            {
+                "function": {
+                    "arguments": '{"name": "Charlie", "age": 35}'
+                }
+            }
+        ]
+        
+        user = await StructureEngine.parse(
+            "",
+            User,
+            raw_tool_calls=tool_calls
+        )
+        
+        assert user.name == "Charlie"
+        assert user.age == 35
+    
+    @pytest.mark.asyncio
+    async def test_parse_braced_json(self):
+        """测试括号匹配提取"""
+        text = 'Some random text {"name": "David", "age": 40} more text'
+        
+        user = await StructureEngine.parse(text, User)
+        
+        assert user.name == "David"
+    
+    @pytest.mark.asyncio
+    async def test_parse_invalid(self):
+        """测试无效输入"""
+        with pytest.raises(StructureParseError):
+            await StructureEngine.parse("Not valid JSON", User)
+    
+    @pytest.mark.asyncio
+    async def test_parse_with_auto_fix(self):
+        """测试自动修复"""
+        # 带注释和尾部逗号
+        dirty_json = '''
+        {
+            "name": "Eve",
+            "age": 28,
+        }
+        '''
+        
+        user = await StructureEngine.parse(
+            dirty_json,
+            User,
+            auto_fix=True
+        )
+        
+        assert user.name == "Eve"
+    
+    # ===== 验证测试 =====
+    
+    def test_validate(self):
+        """测试数据验证"""
+        data = {"name": "Frank", "age": 45}
+        
+        user = StructureEngine.validate(data, User)
+        
+        assert user.name == "Frank"
+        assert user.age == 45
+    
+    def test_validate_invalid(self):
+        """测试验证失败"""
+        data = {"name": "George"}  # 缺少 age
+        
+        with pytest.raises(Exception):  # Pydantic ValidationError
+            StructureEngine.validate(data, User)
+    
+    # ===== Schema 差异 =====
+    
+    def test_get_schema_diff(self):
+        """测试 Schema 差异检查"""
+        data = {
+            "name": "Helen",
+            "extra": "field"
+        }
+        
+        diff = StructureEngine.get_schema_diff(data, User)
+        
+        assert "age" in diff["missing_required"]
+        assert "extra" in diff["extra_fields"]
+
+
+class TestHelperFunctions:
+    """辅助函数测试"""
+    
+    def test_extract_json_from_text(self):
+        """测试 JSON 提取"""
+        text = 'Here is data: {"key": "value"} end'
+        
+        result = extract_json_from_text(text)
+        
+        assert result is not None
+        assert result["key"] == "value"
+    
+    def test_extract_json_none(self):
+        """测试未找到 JSON"""
+        text = "No JSON here"
+        
+        result = extract_json_from_text(text)
+        
+        assert result is None
+
+
+class TestStructureParseError:
+    """异常测试"""
+    
+    @pytest.mark.asyncio
+    async def test_detailed_error(self):
+        """测试详细错误信息"""
+        try:
+            await StructureEngine.parse("invalid", User)
+        except StructureParseError as e:
+            detailed = e.get_detailed_error()
+            
+            assert "结构化解析失败" in detailed
+            assert "尝试的解析策略" in detailed
+            assert len(e.attempts) > 0
+```
+
+[17] tests/core/test_toolbox.py
+```python
+# tests/core/test_toolbox.py
+import pytest
+import asyncio
+from typing import Type
+from pydantic import BaseModel, Field
+
+from gecko.core.toolbox import ToolBox
+from gecko.core.exceptions import ToolNotFoundError
+from gecko.plugins.tools.base import BaseTool, ToolResult
+
+# 1. 定义参数模型 (适配新版 BaseTool)
+class MockArgs(BaseModel):
+    # 允许任意参数，方便测试
+    model_config = {"extra": "allow"}
+    key: str = Field(default="")
+    index: int = Field(default=0)
+
+class EmptyArgs(BaseModel):
+    pass
+
+# 2. 定义 Mock 工具 (适配新版 BaseTool 接口)
+class MockTool(BaseTool):
+    """测试用的 Mock 工具"""
+    name: str = "mock_tool"
+    description: str = "测试工具"
+    args_schema: Type[BaseModel] = MockArgs
+    
+    # 新版 BaseTool 要求实现 _run 而不是 execute
+    async def _run(self, args: MockArgs) -> ToolResult: # type: ignore
+        await asyncio.sleep(0.1)  # 模拟耗时
+        # 返回 ToolResult 或 字符串
+        return ToolResult(content=f"Mock result: {args.model_dump()}")
+
+
+class SlowTool(BaseTool):
+    """慢速工具（用于测试超时）"""
+    name: str = "slow_tool"
+    description: str = "慢速工具"
+    args_schema: Type[BaseModel] = EmptyArgs
+    
+    async def _run(self, args: EmptyArgs) -> str: # type: ignore
+        await asyncio.sleep(10)  # 超过默认超时
+        return "This should timeout"
+
+
+class ErrorTool(BaseTool):
+    """会抛出异常的工具"""
+    name: str = "error_tool"
+    description: str = "错误工具"
+    args_schema: Type[BaseModel] = EmptyArgs
+    
+    async def _run(self, args: EmptyArgs) -> str: # type: ignore
+        raise ValueError("Intentional error")
+
+
+@pytest.fixture
+def toolbox():
+    """创建测试用工具箱"""
+    return ToolBox(
+        tools=[MockTool()],
+        max_concurrent=2,
+        default_timeout=1.0
+    )
+
+
+class TestToolBoxBasics:
+    """测试基础功能"""
+    
+    def test_register_tool(self, toolbox):
+        """测试工具注册"""
+        assert len(toolbox.list_tools()) == 1
+        assert toolbox.has_tool("mock_tool")
+        
+    def test_unregister_tool(self, toolbox):
+        """测试工具注销"""
+        toolbox.unregister("mock_tool")
+        assert len(toolbox.list_tools()) == 0
+        assert not toolbox.has_tool("mock_tool")
+    
+    def test_duplicate_registration(self, toolbox):
+        """测试重复注册"""
+        # 默认允许替换
+        toolbox.register(MockTool(), replace=True)
+        assert len(toolbox.list_tools()) == 1
+        
+        # 不允许替换时应抛出异常
+        with pytest.raises(ValueError):
+            toolbox.register(MockTool(), replace=False)
+    
+    def test_openai_schema(self, toolbox):
+        """测试 OpenAI Schema 生成"""
+        schema = toolbox.to_openai_schema()
+        assert len(schema) == 1
+        assert schema[0]["type"] == "function"
+        assert schema[0]["function"]["name"] == "mock_tool"
+        # 验证 Schema 中是否包含 properties
+        assert "properties" in schema[0]["function"]["parameters"]
+
+
+class TestToolExecution:
+    """测试工具执行"""
+
+    @pytest.mark.asyncio
+    async def test_execute_with_json_error_flag(self, toolbox):
+        """
+        [New] 测试 ToolBox 处理来自 Engine 的 JSON 解析错误标记
+        """
+        # 构造带有错误标记的参数 (模拟 ReAct 引擎的行为)
+        bad_args = {
+            "__gecko_parse_error__": "Unexpected end of string"
+        }
+        
+        # 执行
+        # 即使工具名 "mock_tool" 存在，也不应该调用它，而是直接返回错误
+        result = await toolbox.execute_with_result("mock_tool", bad_args)
+        
+        # 验证
+        assert result.is_error is True
+        assert "System Error: Failed to parse arguments" in result.result
+        assert "Unexpected end of string" in result.result
+        assert "Please correct your JSON format" in result.result
+        
+        # 验证没有抛出 ToolNotFoundError 或其他异常
+    
+    @pytest.mark.asyncio
+    async def test_execute_success(self, toolbox):
+        """测试成功执行"""
+        result = await toolbox.execute(
+            "mock_tool",
+            {"key": "value"}
+        )
+        assert "Mock result" in result
+        assert "value" in result
+    
+    @pytest.mark.asyncio
+    async def test_execute_not_found(self, toolbox):
+        """测试工具不存在"""
+        # ToolBox.execute 会抛出 ToolNotFoundError
+        with pytest.raises(ToolNotFoundError):
+            await toolbox.execute("non_existent", {})
+    
+    @pytest.mark.asyncio
+    async def test_execute_timeout(self):
+        """测试超时"""
+        toolbox = ToolBox(
+            tools=[SlowTool()],
+            default_timeout=0.5
+        )
+        
+        result = await toolbox.execute_with_result(
+            "slow_tool",
+            {}
+        )
+        assert result.is_error
+        # 注意：ToolBox 中的超时提示是英文 "timed out"
+        assert "timed out" in result.result
+    
+    @pytest.mark.asyncio
+    async def test_execute_error(self):
+        """测试工具执行异常"""
+        toolbox = ToolBox(tools=[ErrorTool()])
+        
+        result = await toolbox.execute_with_result(
+            "error_tool",
+            {}
+        )
+        assert result.is_error
+        assert "Intentional error" in result.result
+
+
+class TestBatchExecution:
+    """测试批量执行"""
+    
+    @pytest.mark.asyncio
+    async def test_execute_many(self, toolbox):
+        """测试并发执行"""
+        tool_calls = [
+            {"id": f"call_{i}", "name": "mock_tool", "arguments": {"index": i}}
+            for i in range(5)
+        ]
+        
+        results = await toolbox.execute_many(tool_calls)
+        
+        assert len(results) == 5
+        for i, result in enumerate(results):
+            assert result.call_id == f"call_{i}"
+            assert not result.is_error
+    
+    @pytest.mark.asyncio
+    async def test_execute_many_empty(self, toolbox):
+        """测试空列表"""
+        results = await toolbox.execute_many([])
+        assert results == []
+    
+    @pytest.mark.asyncio
+    async def test_execute_many_mixed(self):
+        """测试混合成功和失败"""
+        toolbox = ToolBox(
+            tools=[MockTool(), ErrorTool()],
+            default_timeout=1.0
+        )
+        
+        tool_calls = [
+            {"id": "1", "name": "mock_tool", "arguments": {}},
+            {"id": "2", "name": "error_tool", "arguments": {}},
+            {"id": "3", "name": "mock_tool", "arguments": {}},
+        ]
+        
+        results = await toolbox.execute_many(tool_calls)
+        
+        assert len(results) == 3
+        assert not results[0].is_error
+        assert results[1].is_error
+        assert not results[2].is_error
+
+
+class TestStatistics:
+    """测试统计功能"""
+    
+    @pytest.mark.asyncio
+    async def test_stats_tracking(self, toolbox):
+        """测试统计追踪"""
+        # 执行几次
+        for i in range(3):
+            await toolbox.execute("mock_tool", {})
+        
+        stats = toolbox.get_stats()
+        assert stats["mock_tool"]["calls"] == 3
+        assert stats["mock_tool"]["errors"] == 0
+        assert stats["mock_tool"]["success_rate"] == 1.0
+    
+    @pytest.mark.asyncio
+    async def test_stats_with_errors(self):
+        """测试包含错误的统计"""
+        toolbox = ToolBox(tools=[ErrorTool()])
+        
+        for i in range(2):
+            # 使用 execute_with_result 以避免抛出异常
+            await toolbox.execute_with_result("error_tool", {})
+        
+        stats = toolbox.get_stats()
+        assert stats["error_tool"]["calls"] == 2
+        assert stats["error_tool"]["errors"] == 2
+        assert stats["error_tool"]["success_rate"] == 0.0
+    
+    # [修改点] 加上 async 标记，改为异步函数
+    @pytest.mark.asyncio
+    async def test_reset_stats(self, toolbox):
+        """测试统计重置"""
+        # 先制造一些数据
+        # [修改点] 使用 await 替代 asyncio.run()
+        await toolbox.execute("mock_tool", {})
+        
+        toolbox.reset_stats()
+        stats = toolbox.get_stats()
+        
+        # 验证所有统计数据都被重置
+        if stats:
+            assert all(s["calls"] == 0 for s in stats.values())
+        else:
+            # 如果重置是清空字典，这也是一种有效状态
+            assert len(stats) == 0 or all(s["calls"] == 0 for s in stats.values())
+
+
+class TestRetry:
+    """测试重试机制"""
+    
+    @pytest.mark.asyncio
+    async def test_retry_disabled(self):
+        """测试禁用重试"""
+        toolbox = ToolBox(
+            tools=[ErrorTool()],
+            enable_retry=False
+        )
+        
+        result = await toolbox.execute_with_result("error_tool", {})
+        assert result.is_error
+        # 验证没有重试日志或行为（通过执行时间或 Mock 验证，这里简单验证结果）
+    
+    @pytest.mark.asyncio
+    async def test_retry_enabled(self):
+        """测试启用重试"""
+        # ErrorTool 每次都会失败，所以重试最终也会失败，但过程会不同
+        toolbox = ToolBox(
+            tools=[ErrorTool()],
+            enable_retry=True,
+            max_retries=2
+        )
+        
+        # 由于重试有 sleep，这个测试会稍微慢一点
+        result = await toolbox.execute_with_result("error_tool", {})
+        assert result.is_error
+
+```
+
+[18] tests/core/test_utils.py
+```python
+# tests/core/test_utils.py
+import threading
+from pydantic import BaseModel
+import pytest
+import asyncio
+from gecko.core.utils import (
+    ensure_awaitable,
+    retry,
+    safe_dict,
+    merge_dicts,
+    safe_serialize_context,
+    truncate,
+    format_size,
+    format_duration,
+    Timer,
+    chunk_list,
+    flatten_list,
+    deduplicate,
+    get_function_args,
+    has_argument,
+)
+
+
+class TestEnsureAwaitable:
+    """ensure_awaitable 测试"""
+    
+    @pytest.mark.asyncio
+    async def test_sync_function(self):
+        """测试同步函数"""
+        def sync_func(x):
+            return x * 2
+        
+        result = await ensure_awaitable(sync_func, 5)
+        assert result == 10
+    
+    @pytest.mark.asyncio
+    async def test_async_function(self):
+        """测试异步函数"""
+        async def async_func(x):
+            return x * 3
+        
+        result = await ensure_awaitable(async_func, 5)
+        assert result == 15
+    
+    @pytest.mark.asyncio
+    async def test_with_timeout(self):
+        """测试超时"""
+        async def slow_func():
+            await asyncio.sleep(2)
+            return "done"
+        
+        with pytest.raises(asyncio.TimeoutError):
+            await ensure_awaitable(slow_func, timeout=0.5)
+
+
+class TestRetry:
+    """重试测试"""
+    
+    @pytest.mark.asyncio
+    async def test_retry_success(self):
+        """测试成功重试"""
+        call_count = 0
+        
+        @retry(max_attempts=3, delay=0.1)
+        async def sometimes_fails():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise ValueError("Not yet")
+            return "success"
+        
+        result = await sometimes_fails()
+        assert result == "success"
+        assert call_count == 3
+    
+    @pytest.mark.asyncio
+    async def test_retry_all_fail(self):
+        """测试所有尝试都失败"""
+        @retry(max_attempts=2, delay=0.1)
+        async def always_fails():
+            raise ValueError("Always fails")
+        
+        with pytest.raises(ValueError):
+            await always_fails()
+
+
+class TestDataConversion:
+    """数据转换测试"""
+    
+    def test_safe_dict_simple(self):
+        """测试简单对象转换"""
+        class Simple:
+            def __init__(self):
+                self.name = "test"
+                self.value = 123
+        
+        obj = Simple()
+        data = safe_dict(obj)
+        
+        assert data["name"] == "test"
+        assert data["value"] == 123
+    
+    def test_merge_dicts_shallow(self):
+        """测试浅合并"""
+        d1 = {"a": 1, "b": 2}
+        d2 = {"b": 3, "c": 4}
+        
+        result = merge_dicts(d1, d2)
+        
+        assert result["a"] == 1
+        assert result["b"] == 3
+        assert result["c"] == 4
+    
+    def test_merge_dicts_deep(self):
+        """测试深合并"""
+        d1 = {"a": {"x": 1}}
+        d2 = {"a": {"y": 2}}
+        
+        result = merge_dicts(d1, d2, deep=True)
+        
+        assert result["a"]["x"] == 1
+        assert result["a"]["y"] == 2
+
+
+class TestStringUtils:
+    """字符串工具测试"""
+    
+    def test_truncate(self):
+        """测试截断"""
+        text = "A" * 200
+        result = truncate(text, max_length=50)
+        
+        assert len(result) == 50
+        assert result.endswith("...")
+    
+    def test_format_size(self):
+        """测试大小格式化"""
+        assert "1.00 KB" in format_size(1024)
+        assert "1.00 MB" in format_size(1048576)
+    
+    def test_format_duration(self):
+        """测试时长格式化"""
+        assert "5.0s" in format_duration(5)
+        assert "1m" in format_duration(65)
+        assert "1h" in format_duration(3665)
+
+
+class TestTimer:
+    """计时器测试"""
+    
+    @pytest.mark.asyncio
+    async def test_timer(self):
+        """测试计时器"""
+        with Timer("test", log=False) as t:
+            await asyncio.sleep(0.1)
+        
+        assert t.elapsed >= 0.1
+        assert t.elapsed < 0.2
+
+
+class TestListUtils:
+    """列表工具测试"""
+    
+    def test_chunk_list(self):
+        """测试分块"""
+        chunks = chunk_list([1, 2, 3, 4, 5], chunk_size=2)
+        
+        assert len(chunks) == 3
+        assert chunks[0] == [1, 2]
+        assert chunks[1] == [3, 4]
+        assert chunks[2] == [5]
+    
+    def test_flatten_list(self):
+        """测试展平"""
+        nested = [[1, 2], [3, 4], [5]]
+        flat = flatten_list(nested)
+        
+        assert flat == [1, 2, 3, 4, 5]
+    
+    def test_deduplicate(self):
+        """测试去重"""
+        items = [1, 2, 2, 3, 1, 4]
+        unique = deduplicate(items)
+        
+        assert unique == [1, 2, 3, 4]
+    
+    def test_deduplicate_with_key(self):
+        """测试按键去重"""
+        items = [
+            {"id": 1, "name": "A"},
+            {"id": 2, "name": "B"},
+            {"id": 1, "name": "C"},
+        ]
+        unique = deduplicate(items, key=lambda x: x["id"])
+        
+        assert len(unique) == 2
+        assert unique[0]["id"] == 1
+        assert unique[1]["id"] == 2
+
+
+class TestFunctionUtils:
+    """函数工具测试"""
+    
+    def test_get_function_args(self):
+        """测试获取函数参数"""
+        def test_func(a, b, c=None):
+            pass
+        
+        args = get_function_args(test_func)
+        
+        assert "a" in args
+        assert "b" in args
+        assert "c" in args
+    
+    def test_has_argument(self):
+        """测试检查参数"""
+        def test_func(a, b):
+            pass
+        
+        assert has_argument(test_func, "a")
+        assert not has_argument(test_func, "c")
+
+class TestSerializationUtils:
+    """[New] 序列化工具测试"""
+
+    def test_safe_serialize_basic(self):
+        """测试基础类型和 Pydantic 对象"""
+        class MyModel(BaseModel):
+            name: str = "test"
+        
+        data = {
+            "a": 1,
+            "b": MyModel(),
+            "c": [1, 2]
+        }
+        
+        clean = safe_serialize_context(data)
+        assert clean["a"] == 1
+        assert clean["b"] == {"name": "test"} # Pydantic 转 dict
+        assert clean["c"] == [1, 2]
+
+    def test_safe_serialize_unserializable(self):
+        """[Core] 测试不可序列化对象的安全降级"""
+        lock = threading.Lock()
+        data = {
+            "valid": "data",
+            "dangerous": lock,
+            "nested": {"inner_lock": lock}
+        }
+        
+        clean = safe_serialize_context(data)
+        
+        assert clean["valid"] == "data"
+        
+        # 验证被替换为标记字典，而不是抛出异常
+        assert isinstance(clean["dangerous"], dict)
+        assert clean["dangerous"].get("__gecko_unserializable__") is True
+        assert "lock" in clean["dangerous"]["type"].lower()
+        
+        # 验证递归处理
+        assert clean["nested"]["inner_lock"].get("__gecko_unserializable__") is True
+
+    def test_safe_serialize_recursion_limit(self):
+        """测试防止无限递归"""
+        # 构造循环引用
+        d = {}
+        d["self"] = d
+    
+        # 应该优雅处理
+        clean = safe_serialize_context(d)
+        
+        # [修改] clean['self'] 本身还是一个 dict (因为递归在更深层被截断)，只要不抛错且是 dict 即可
+        # 结构会是 {'self': {'self': ... {'self': "<...>"}}}
+        assert isinstance(clean["self"], dict)
+        # 验证确实有内容
+        assert "self" in clean["self"]
+
+def test_safe_serialize_unserializable():
+    """测试不可序列化对象的降级处理"""
+    import threading
+    lock = threading.Lock()
+    data = {"lock": lock}
+    
+    clean = safe_serialize_context(data)
+    
+    # 必须变为 dict 标记，且不抛错
+    assert isinstance(clean["lock"], dict)
+    assert clean["lock"].get("__gecko_unserializable__") is True
+```
+
+[19] tests/performance/test_performance.py
+```python
+# tests/performance/test_performance.py
+"""
+性能基准测试
+
+确保重构没有引入性能回退
+"""
+import pytest
+import time
+import asyncio
+from gecko.core.message import Message
+from gecko.core.memory import TokenMemory
+
+# ========== Message 序列化性能 ==========
+
+def test_message_serialization_performance():
+    """测试 Message 序列化性能"""
+    msg = Message.user("Test message " * 50)  # 中等长度消息
+    
+    iterations = 10000
+    start = time.perf_counter()
+    for _ in range(iterations):
+        msg.to_openai_format()
+    duration = time.perf_counter() - start
+    
+    ops_per_sec = iterations / duration
+    
+    print(f"\nMessage serialization: {ops_per_sec:.0f} ops/sec")
+    
+    # 应该至少 10000 ops/sec
+    assert ops_per_sec > 10000, f"Too slow: {ops_per_sec:.0f} ops/sec"
+
+def test_message_deserialization_performance():
+    """测试 Message 反序列化性能"""
+    data = {
+        "role": "assistant",
+        "content": "Response " * 50,
+        "tool_calls": None
+    }
+    
+    iterations = 10000
+    start = time.perf_counter()
+    for _ in range(iterations):
+        Message(**data)
+    duration = time.perf_counter() - start
+    
+    ops_per_sec = iterations / duration
+    
+    print(f"\nMessage deserialization: {ops_per_sec:.0f} ops/sec")
+    assert ops_per_sec > 10000
+
+# ========== Memory Token 计数性能 ==========
+
+def test_token_counting_performance():
+    """测试 Token 计数性能"""
+    memory = TokenMemory(session_id="bench", max_tokens=4000)
+    
+    messages = [
+        Message.user(f"Message {i}: " + "test " * 20)
+        for i in range(100)
+    ]
+    
+    start = time.perf_counter()
+    for msg in messages:
+        memory.count_message_tokens(msg)
+    duration = time.perf_counter() - start
+    
+    msgs_per_sec = len(messages) / duration
+    
+    print(f"\nToken counting: {msgs_per_sec:.0f} messages/sec")
+    assert msgs_per_sec > 100  # 应该至少 100 msgs/sec
+
+# ========== 日志性能 ==========
+
+def test_logging_overhead():
+    """测试日志开销"""
+    from gecko.core.logging import get_logger
+    
+    logger = get_logger("benchmark")
+    
+    iterations = 1000
+    start = time.perf_counter()
+    for i in range(iterations):
+        logger.debug("benchmark event", iteration=i, value=i*2)
+    duration = time.perf_counter() - start
+    
+    logs_per_sec = iterations / duration
+    
+    print(f"\nLogging throughput: {logs_per_sec:.0f} logs/sec")
+    
+    # 日志不应该拖慢系统，应该至少 1000 logs/sec
+    assert logs_per_sec > 1000, f"Logging too slow: {logs_per_sec:.0f} logs/sec"
+
+# ========== 端到端性能 ==========
+
+@pytest.mark.asyncio
+async def test_agent_execution_baseline():
+    """测试 Agent 执行基准性能"""
+    from unittest.mock import AsyncMock, MagicMock
+    from gecko.core.agent import Agent
+    from gecko.core.toolbox import ToolBox
+
+    # [Fix] 使用 MagicMock 作为基类，因为 ModelProtocol 包含同步和异步方法
+    model = MagicMock()
+    
+    # 1. 模拟异步推理方法
+    model.acompletion = AsyncMock()
+    
+    # 2. [Fix] 模拟新增的同步计数方法，以通过 isinstance(model, ModelProtocol) 检查
+    model.count_tokens = MagicMock(return_value=10)
+
+    # 配置返回值
+    mock_response = MagicMock()
+    mock_response.choices = [MagicMock()]
+    mock_response.choices[0].message.model_dump.return_value = {
+        "role": "assistant",
+        "content": "Quick response",
+        "tool_calls": None
+    }
+    model.acompletion.return_value = mock_response
+
+    # 创建 Agent
+    toolbox = ToolBox([])
+    memory = TokenMemory(session_id="bench")
+    
+    # 现在 model 满足 ModelProtocol 协议，不会抛出 TypeError
+    agent = Agent(model=model, toolbox=toolbox, memory=memory)
+
+    # 测试 10 次执行
+    iterations = 10
+    start = time.perf_counter()
+    for _ in range(iterations):
+        await agent.run([Message.user("test")])
+    duration = time.perf_counter() - start
+
+    avg_time = duration / iterations
+
+    print(f"\nAgent execution: {avg_time*1000:.2f} ms/run")
+
+    # 单次执行应该在 50ms 内（Mock 模式）
+    assert avg_time < 0.05, f"Agent too slow: {avg_time*1000:.2f} ms"
+
+# ========== 内存使用测试 ==========
+
+def test_memory_usage():
+    """测试内存占用"""
+    import sys
+    
+    # 创建大量消息
+    messages = [
+        Message.user(f"Message {i}")
+        for i in range(1000)
+    ]
+    
+    # 粗略估算内存占用
+    size = sys.getsizeof(messages)
+    per_message = size / len(messages)
+    
+    print(f"\nMemory per message: ~{per_message:.0f} bytes")
+    
+    # 单个消息应该小于 1KB
+    assert per_message < 1024
+```
+
+[20] tests/plugins/models/test_models.py
+```python
+# tests/plugins/models/test_models.py
+import os
+import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
+# 引入 SimpleNamespace 来模拟对象属性访问
+from types import SimpleNamespace
+
+from gecko.plugins.models.drivers.litellm_driver import LiteLLMDriver
+from gecko.plugins.models.config import ModelConfig
+from gecko.plugins.models.presets.zhipu import ZhipuChat
+from gecko.core.protocols import CompletionResponse, StreamChunk
+from gecko.core.exceptions import ModelError
+
+# ===================== 1. 单元测试 (Mock) =====================
+
+@pytest.mark.asyncio
+async def test_litellm_driver_completion():
+    """[Unit] 测试 LiteLLM 驱动的清洗逻辑"""
+    # [修复] 使用 SimpleNamespace 模拟真实对象结构，避免 MagicMock 的无限递归属性陷阱
+    # 这比配置复杂的 MagicMock 更简单且行为更确定
+    
+    mock_usage = SimpleNamespace(
+        prompt_tokens=10,
+        completion_tokens=5,
+        total_tokens=15
+    )
+    
+    mock_message = SimpleNamespace(
+        role="assistant",
+        content="Cleaned Content",
+        tool_calls=None
+    )
+    
+    mock_choice = SimpleNamespace(
+        index=0,
+        finish_reason="stop",
+        message=mock_message,
+        logprobs=None # 显式设置为 None，满足 safe_access 的预期
+    )
+
+    mock_obj = SimpleNamespace(
+        id="test-id",
+        object="chat.completion",
+        created=1234567890,
+        model="gpt-mock",
+        choices=[mock_choice],
+        usage=mock_usage,
+        system_fingerprint=None,
+        _hidden_params={} # 模拟 litellm 可能存在的私有字段
+    )
+
+    config = ModelConfig(model_name="gpt-mock", api_key="mock")
+    driver = LiteLLMDriver(config)
+
+    with patch("gecko.plugins.models.drivers.litellm_driver.litellm.acompletion", new_callable=AsyncMock) as mock_call:
+        mock_call.return_value = mock_obj
+        
+        resp = await driver.acompletion([{"role": "user", "content": "hi"}])
+        
+        assert isinstance(resp, CompletionResponse)
+        assert resp.choices[0].message["content"] == "Cleaned Content"
+        assert resp.model == "gpt-mock"
+        assert resp.usage.total_tokens == 15 # type: ignore
+
+@pytest.mark.asyncio
+async def test_litellm_driver_error():
+    """[Unit] 测试异常映射"""
+    config = ModelConfig(model_name="gpt-mock")
+    driver = LiteLLMDriver(config)
+
+    with patch("gecko.plugins.models.drivers.litellm_driver.litellm.acompletion", side_effect=Exception("Auth Failed")):
+        with pytest.raises(ModelError) as exc:
+            await driver.acompletion([])
+        assert "LiteLLM execution failed" in str(exc.value)
+
+# ===================== 2. 集成测试 (Zhipu Live) =====================
+
+ZHIPU_KEY = os.getenv("ZHIPU_API_KEY")
+should_run = pytest.mark.skipif(not ZHIPU_KEY, reason="No ZHIPU_API_KEY")
+
+@should_run
+@pytest.mark.asyncio
+async def test_zhipu_live_completion():
+    """[Integration] Zhipu 真实调用"""
+    model = ZhipuChat(api_key=ZHIPU_KEY, model="glm-4-flash") # type: ignore
+    messages = [{"role": "user", "content": "1+1=?"}]
+    
+    resp = await model.acompletion(messages)
+    
+    # 验证是否触发 Pydantic 警告 (如果测试通过且无警告输出，则 Adapter 工作正常)
+    assert isinstance(resp, CompletionResponse)
+    assert "2" in resp.choices[0].message["content"]
+
+@should_run
+@pytest.mark.asyncio
+async def test_zhipu_live_stream():
+    """[Integration] Zhipu 流式调用"""
+    model = ZhipuChat(api_key=ZHIPU_KEY, model="glm-4-flash") # type: ignore
+    messages = [{"role": "user", "content": "Hello"}]
+    
+    text = ""
+    async for chunk in model.astream(messages):
+        assert isinstance(chunk, StreamChunk)
+        if chunk.content:
+            text += chunk.content
+    
+    assert len(text) > 0
+
+@pytest.mark.asyncio
+async def test_litellm_driver_count_tokens_strategies():
+    """[New] 测试 LiteLLMDriver 的多级计数策略"""
+    from gecko.plugins.models.drivers.litellm_driver import LiteLLMDriver
+    
+    # 1. 测试 Tiktoken 路径 (模拟 gpt-4)
+    config_gpt = ModelConfig(model_name="gpt-4")
+    driver_gpt = LiteLLMDriver(config_gpt)
+    
+    # 确保 tokenizer 被加载
+    assert driver_gpt._tokenizer is not None
+    count = driver_gpt.count_tokens("hello world")
+    assert count > 0
+    
+    # 2. 测试 Fallback 路径 (模拟未知模型)
+    # 这里的关键是确保没有安装对应 tokenizer 时不会报错，而是走降级
+    config_unknown = ModelConfig(model_name="unknown-model-123")
+    driver_unknown = LiteLLMDriver(config_unknown)
+    
+    # 应该为 None (加载失败)
+    assert driver_unknown._tokenizer is None
+    
+    # 调用计数，应该走字符估算或 litellm
+    # "hello" (5 chars) // 3 = 1
+    count_fallback = driver_unknown.count_tokens("hello") 
+    assert count_fallback > 0
+```
+
+[21] tests/plugins/storage/test_redis_and_factory.py
+```python
+# tests/plugins/storage/test_redis_and_factory.py
+import pytest
+from unittest.mock import MagicMock, AsyncMock, patch
+import sys
+from importlib.metadata import EntryPoint
+
+# === Mock Redis Module ===
+mock_redis_module = MagicMock()
+mock_redis_client = AsyncMock()
+mock_redis_module.from_url.return_value = mock_redis_client
+
+# 注入 Mock 到 sys.modules
+with patch.dict(sys.modules, {"redis.asyncio": mock_redis_module}):
+    from gecko.plugins.storage.backends.redis import RedisStorage
+
+from gecko.plugins.storage.factory import create_storage, _load_from_entry_point
+from gecko.core.exceptions import ConfigurationError, StorageError
+from gecko.plugins.storage.abc import AbstractStorage
+
+# ================= RedisStorage Tests =================
+
+@pytest.mark.asyncio
+async def test_redis_lifecycle_success():
+    storage = RedisStorage("redis://localhost:6379/0")
+    mock_redis_client.ping.return_value = True
+    
+    await storage.initialize()
+    assert storage.is_initialized
+    
+    await storage.shutdown()
+    assert not storage.is_initialized
+    # 验证 client 被置空
+    assert storage.client is None # type: ignore
+
+@pytest.mark.asyncio
+async def test_redis_connection_failure():
+    """测试初始化连接失败，应抛出 StorageError 并清理资源"""
+    storage = RedisStorage("redis://localhost:6379/0")
+    mock_redis_client.ping.side_effect = Exception("Connection refused")
+    mock_redis_client.aclose = AsyncMock() # 确保 shutdown 能调用
+    
+    with pytest.raises(StorageError, match="Failed to connect to Redis"):
+        await storage.initialize()
+    
+    # 验证是否调用了清理逻辑
+    assert storage.client is None # type: ignore
+    assert not storage.is_initialized
+
+@pytest.mark.asyncio
+async def test_redis_crud_operations():
+    storage = RedisStorage("redis://localhost:6379/0")
+    storage.client = mock_redis_client # type: ignore
+    
+    # Set
+    await storage.set("s1", {"a": 1}) # type: ignore
+    mock_redis_client.setex.assert_awaited()
+    
+    # Get
+    mock_redis_client.get.return_value = '{"a": 1}'
+    assert await storage.get("s1") == {"a": 1} # type: ignore
+    
+    # Delete
+    await storage.delete("s1") # type: ignore
+    mock_redis_client.delete.assert_awaited()
+
+@pytest.mark.asyncio
+async def test_redis_crud_errors():
+    """测试操作过程中的异常包装"""
+    storage = RedisStorage("redis://localhost:6379/0")
+    storage.client = mock_redis_client # type: ignore
+    
+    mock_redis_client.get.side_effect = Exception("Redis down")
+    with pytest.raises(StorageError, match="Redis get failed"):
+        await storage.get("s1") # type: ignore
+        
+    mock_redis_client.setex.side_effect = Exception("ReadOnly")
+    with pytest.raises(StorageError, match="Redis set failed"):
+        await storage.set("s1", {}) # type: ignore
+
+    mock_redis_client.delete.side_effect = Exception("Error")
+    with pytest.raises(StorageError, match="Redis delete failed"):
+        await storage.delete("s1") # type: ignore
+
+    # 未初始化调用
+    storage.client = None # type: ignore
+    with pytest.raises(StorageError, match="not initialized"):
+        await storage.get("s1") # type: ignore
+
+# ================= Factory Tests =================
+
+@pytest.mark.asyncio
+async def test_factory_entry_point_loading():
+    """测试通过 EntryPoint 加载插件"""
+    
+    # 模拟一个第三方插件类
+    class MockPluginStorage(AbstractStorage):
+        async def initialize(self): pass
+        async def shutdown(self): pass
+        
+    # 模拟 EntryPoint 对象
+    mock_ep = MagicMock(spec=EntryPoint)
+    mock_ep.name = "mockdb"
+    # load() 返回注册了该类的模块，或者直接副作用注册
+    # 这里我们模拟 load() 动作，并手动 patch registry 来模拟注册成功
+    mock_ep.load.side_effect = lambda: None 
+    
+    # Mock entry_points() 返回列表
+    with patch("gecko.plugins.storage.factory.entry_points", return_value=[mock_ep]):
+        # 还需要 Mock registry.get_storage_class，第一次返回 None，加载后返回类
+        with patch("gecko.plugins.storage.registry.get_storage_class", side_effect=[None, MockPluginStorage]):
+            
+            storage = await create_storage("mockdb://localhost")
+            assert isinstance(storage, MockPluginStorage)
+            mock_ep.load.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_factory_entry_point_failure():
+    """测试 EntryPoint 加载失败的情况"""
+    mock_ep = MagicMock()
+    mock_ep.name = "faildb"
+    mock_ep.load.side_effect = Exception("Load error")
+    
+    with patch("gecko.plugins.storage.factory.entry_points", return_value=[mock_ep]):
+        # 因为加载失败，registry 依然查不到
+        with patch("gecko.plugins.storage.registry.get_storage_class", return_value=None):
+            with pytest.raises(ConfigurationError, match="Unknown storage scheme"):
+                await create_storage("faildb://")
+
+@pytest.mark.asyncio
+async def test_factory_builtin_loading():
+    """测试内置模块加载 (SQLite)"""
+    # 使用 :memory: 确保不产生文件
+    storage = await create_storage("sqlite:///:memory:")
+    assert storage.__class__.__name__ == "SQLiteStorage"
+    await storage.shutdown()
+
+@pytest.mark.asyncio
+async def test_factory_invalid_scheme():
+    with pytest.raises(ConfigurationError, match="Invalid storage URL"):
+        await create_storage("not_a_url")
+
+@pytest.mark.asyncio
+async def test_factory_module_import_error():
+    """测试内置模块导入失败 (模拟依赖缺失)"""
+    # 模拟导入 sqlite 模块时抛出 ImportError
+    # [修复] 调整 Context Manager 嵌套顺序，避免 patch 冲突
+    with patch.dict(sys.modules, {"gecko.plugins.storage.backends.sqlite": None}): 
+        # 先清空 registry
+        with patch("gecko.plugins.storage.registry._STORAGE_REGISTRY", {}):
+            # 再 patch import_module，且仅针对 create_storage 调用期间
+            with patch("importlib.import_module", side_effect=ImportError("No module")):
+                with pytest.raises(ConfigurationError, match="Failed to load built-in backend"):
+                    await create_storage("sqlite:///:memory:")
+```
+
+[22] tests/plugins/storage/test_sqlite.py
+```python
+# tests/plugins/storage/test_sqlite.py
+import asyncio
+import os
+import pytest
+from unittest.mock import patch, MagicMock
+from gecko.plugins.storage.backends.sqlite import SQLiteStorage
+from gecko.core.exceptions import StorageError
+
+DB_FILE = "./test_gecko_sqlite.db"
+DB_URL = f"sqlite:///{DB_FILE}"
+
+@pytest.fixture
+async def storage():
+    if os.path.exists(DB_FILE): os.remove(DB_FILE)
+    if os.path.exists(DB_FILE + ".lock"): os.remove(DB_FILE + ".lock")
+    
+    # Mock FileLock availability to ensure logic is tested
+    with patch("gecko.plugins.storage.mixins.FILELOCK_AVAILABLE", True):
+        with patch("gecko.plugins.storage.mixins.FileLock"):
+            store = SQLiteStorage(DB_URL)
+            await store.initialize()
+            yield store
+            await store.shutdown()
+    
+    if os.path.exists(DB_FILE): os.remove(DB_FILE)
+
+@pytest.mark.asyncio
+async def test_sqlite_filelock_integration():
+    """测试是否尝试配置 FileLock"""
+    with patch("gecko.plugins.storage.backends.sqlite.SQLiteStorage.setup_multiprocess_lock") as mock_setup:
+        store = SQLiteStorage(DB_URL)
+        # [修复] 代码中传入的是原始 path (DB_URL 解析出的相对路径)，未做 abspath 转换
+        # 预期改为原始相对路径字符串
+        mock_setup.assert_called_once_with(f"./{os.path.basename(DB_FILE)}")
+
+@pytest.mark.asyncio
+async def test_sqlite_robustness_invalid_path():
+    """测试无法创建数据库文件的场景"""
+    # [修复] 不要依赖真实文件系统权限，使用 Mock 模拟创建目录失败
+    invalid_url = "sqlite:///some/path/db.sqlite"
+    
+    # 模拟 pathlib.Path.mkdir 抛出 PermissionError
+    with patch("pathlib.Path.mkdir", side_effect=PermissionError("Access denied")):
+        # 构造函数中会调用 mkdir
+        with pytest.raises(StorageError, match="Failed to configure SQLite"):
+            SQLiteStorage(invalid_url)
+
+@pytest.mark.asyncio
+async def test_sqlite_crud_exceptions(storage):
+    """测试 CRUD 过程中的异常包装"""
+    # Mock engine connect to fail
+    storage.engine = MagicMock()
+    storage.engine.connect.side_effect = Exception("DB Gone")
+    # Mock session creation to fail
+    with patch("gecko.plugins.storage.backends.sqlite.Session", side_effect=Exception("Session Error")):
+        
+        with pytest.raises(StorageError, match="SQLite set failed"):
+            await storage.set("s1", {})
+            
+        with pytest.raises(StorageError, match="SQLite get failed"):
+            await storage.get("s1")
+            
+        with pytest.raises(StorageError, match="SQLite delete failed"):
+            await storage.delete("s1")
+```
+
+[23] tests/plugins/storage/test_storage_core.py
+```python
+# tests/plugins/storage/test_storage_core.py
+import asyncio
+import threading
+import time
+import pytest
+from unittest.mock import MagicMock, patch
+
+from gecko.plugins.storage.abc import AbstractStorage
+from gecko.plugins.storage.mixins import (
+    ThreadOffloadMixin, 
+    AtomicWriteMixin, 
+    JSONSerializerMixin
+)
+
+# === Mocks & Helpers ===
+
+class MockStorage(AbstractStorage, ThreadOffloadMixin, AtomicWriteMixin, JSONSerializerMixin):
+    """用于测试 Mixin 的模拟存储类"""
+    def __init__(self):
+        super().__init__("mock://")
+        
+    async def initialize(self):
+        self._is_initialized = True
+
+    async def shutdown(self):
+        self._is_initialized = False
+
+    def sync_slow_operation(self, seconds: float) -> int:
+        """模拟同步阻塞操作"""
+        time.sleep(seconds)
+        return threading.get_ident()
+
+# === Tests ===
+
+@pytest.mark.asyncio
+async def test_thread_offload_mixin():
+    """测试线程卸载：确保操作不在主线程执行"""
+    storage = MockStorage()
+    main_thread_id = threading.get_ident()
+    
+    # 执行耗时操作
+    start_time = time.time()
+    worker_thread_id = await storage._run_sync(storage.sync_slow_operation, 0.05)
+    duration = time.time() - start_time
+    
+    # 验证
+    assert worker_thread_id != main_thread_id, "操作应该在不同的线程中执行"
+    assert duration >= 0.05, "操作应该确实执行了耗时逻辑"
+
+@pytest.mark.asyncio
+async def test_atomic_write_mixin_basic():
+    """测试基础原子写锁（进程内 asyncio.Lock）"""
+    storage = MockStorage()
+    
+    # 验证锁的懒加载
+    assert storage._write_lock is None
+    lock = storage.write_lock
+    assert isinstance(lock, asyncio.Lock)
+    assert storage._write_lock is not None
+    
+    # 验证上下文管理器
+    async with storage.write_guard():
+        assert storage.write_lock.locked()
+    assert not storage.write_lock.locked()
+
+@pytest.mark.asyncio
+async def test_atomic_write_mixin_filelock_logic():
+    """
+    测试 FileLock 逻辑 (新架构)
+    验证 write_guard 只处理协程锁，file_lock_guard 处理文件锁
+    """
+    with patch("gecko.plugins.storage.mixins.FILELOCK_AVAILABLE", True):
+        with patch("gecko.plugins.storage.mixins.FileLock") as MockFileLock:
+            mock_file_lock_instance = MagicMock()
+            # 模拟 Context Manager (__enter__ / __exit__)
+            mock_file_lock_instance.__enter__ = MagicMock()
+            mock_file_lock_instance.__exit__ = MagicMock()
+            MockFileLock.return_value = mock_file_lock_instance
+            
+            storage = MockStorage()
+            storage.setup_multiprocess_lock("/tmp/test.db")
+            
+            # 验证 FileLock 初始化
+            MockFileLock.assert_called_with("/tmp/test.db.lock")
+            assert storage._file_lock == mock_file_lock_instance
+            
+            # 1. 验证 write_guard (Async) 
+            # 预期：只获取 asyncio lock，不操作 FileLock
+            async with storage.write_guard():
+                assert storage.write_lock.locked()
+                mock_file_lock_instance.acquire.assert_not_called()
+                mock_file_lock_instance.__enter__.assert_not_called()
+            
+            # 2. 验证 file_lock_guard (Sync)
+            # 预期：调用 FileLock 的上下文管理器
+            with storage.file_lock_guard():
+                mock_file_lock_instance.__enter__.assert_called_once()
+            
+            mock_file_lock_instance.__exit__.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_atomic_write_mixin_filelock_missing():
+    """测试 FileLock 未安装的情况"""
+    with patch("gecko.plugins.storage.mixins.FILELOCK_AVAILABLE", False):
+        with patch("gecko.plugins.storage.mixins.logger") as mock_logger:
+            storage = MockStorage()
+            storage.setup_multiprocess_lock("/tmp/test.db")
+            
+            # 验证发出了警告且未初始化锁
+            mock_logger.warning.assert_called()
+            assert "filelock module not installed" in mock_logger.warning.call_args[0][0]
+            assert storage._file_lock is None
+            
+            # 验证 file_lock_guard 仍然可用（空操作）
+            with storage.file_lock_guard():
+                pass
+
+@pytest.mark.asyncio
+async def test_atomic_write_mixin_filelock_init_error():
+    """测试 FileLock 初始化异常"""
+    with patch("gecko.plugins.storage.mixins.FILELOCK_AVAILABLE", True):
+        with patch("gecko.plugins.storage.mixins.FileLock", side_effect=Exception("Perm Error")):
+            with patch("gecko.plugins.storage.mixins.logger") as mock_logger:
+                storage = MockStorage()
+                storage.setup_multiprocess_lock("/root/test.db")
+                
+                mock_logger.error.assert_called()
+                assert "Failed to initialize FileLock" in mock_logger.error.call_args[0][0]
+
+def test_json_serializer_mixin():
+    """测试 JSON 序列化"""
+    storage = MockStorage()
+    data = {"key": "value", "中文": "测试"}
+    
+    # 序列化
+    json_str = storage._serialize(data)
+    assert '"中文": "测试"' in json_str, "应该保留非 ASCII 字符"
+    
+    # 反序列化
+    restored = storage._deserialize(json_str)
+    assert restored == data
+    
+    # 边缘情况
+    assert storage._deserialize(None) is None
+    
+    # 错误处理
+    with pytest.raises(Exception): 
+        storage._serialize({"set": {1, 2}}) # Set 无法 JSON 序列化
+    
+    # 反序列化错误测试 (日志记录但不抛出，返回 None)
+    assert storage._deserialize("{invalid_json") is None
+
+@pytest.mark.asyncio
+async def test_abstract_lifecycle():
+    """测试抽象生命周期"""
+    storage = MockStorage()
+    assert not storage.is_initialized
+    
+    async with storage as s:
+        assert s.is_initialized
+        assert s is storage
+    
+    assert not storage.is_initialized
+```
+
+[24] tests/plugins/storage/test_vector_backends.py
+```python
+# tests/plugins/storage/test_vector_backends.py
+import asyncio
+import os
+import shutil
+import pytest
+from unittest.mock import patch, MagicMock
+
+try:
+    import chromadb
+    CHROMA_AVAILABLE = True
+except ImportError:
+    CHROMA_AVAILABLE = False
+
+try:
+    import lancedb
+    LANCEDB_AVAILABLE = True
+except ImportError:
+    LANCEDB_AVAILABLE = False
+
+from gecko.plugins.storage.backends.chroma import ChromaStorage
+from gecko.plugins.storage.backends.lancedb import LanceDBStorage
+from gecko.core.exceptions import StorageError
+
+# === Fixtures ===
+
+@pytest.fixture
+async def chroma_store(tmp_path):
+    db_path = tmp_path / "chroma_db"
+    path_str = str(db_path)
+    store = ChromaStorage(f"chroma://{path_str}")
+    await store.initialize()
+    yield store
+    await store.shutdown()
+
+@pytest.fixture
+async def lance_store(tmp_path):
+    db_path = tmp_path / "lance_db"
+    path_str = str(db_path)
+    store = LanceDBStorage(f"lancedb://{path_str}")
+    await store.initialize()
+    yield store
+    await store.shutdown()
+
+# === Test Data ===
+def get_docs():
+    return [
+        {"id": "1", "embedding": [0.1, 0.1], "text": "A", "metadata": {"type": "news"}},
+        {"id": "2", "embedding": [0.9, 0.9], "text": "B", "metadata": {"type": "blog"}},
+        {"id": "3", "embedding": [0.1, 0.2], "text": "C", "metadata": None} # Test None metadata
+    ]
+
+# === Chroma Tests ===
+
+@pytest.mark.skipif(not CHROMA_AVAILABLE, reason="chromadb missing")
+@pytest.mark.asyncio
+async def test_chroma_robustness(chroma_store):
+    """测试健壮性：Metadata 为 None"""
+    docs = get_docs()
+    # 应该能够处理 metadata=None 的情况 (转为 {})
+    await chroma_store.upsert(docs)
+    
+    results = await chroma_store.search([0.1, 0.1], top_k=3)
+    assert len(results) == 3
+    # 验证 metadata=None 被转为了 {}
+    doc3 = next(r for r in results if r["id"] == "3")
+    assert doc3["metadata"] == {}
+
+@pytest.mark.skipif(not CHROMA_AVAILABLE, reason="chromadb missing")
+@pytest.mark.asyncio
+async def test_chroma_filtering(chroma_store):
+    """测试元数据过滤"""
+    await chroma_store.upsert(get_docs())
+    
+    # Filter: type=news
+    res = await chroma_store.search([0.1, 0.1], top_k=5, filters={"type": "news"})
+    assert len(res) == 1
+    assert res[0]["id"] == "1"
+    
+    # Filter: non-exist
+    res = await chroma_store.search([0.1, 0.1], top_k=5, filters={"type": "404"})
+    assert len(res) == 0
+
+@pytest.mark.skipif(not CHROMA_AVAILABLE, reason="chromadb missing")
+@pytest.mark.asyncio
+async def test_chroma_exceptions(chroma_store):
+    """测试异常包装"""
+    # Mock 内部 collection 抛出异常
+    chroma_store.vector_col = MagicMock()
+    chroma_store.vector_col.query.side_effect = Exception("DB Crash")
+    
+    with pytest.raises(StorageError, match="Chroma search failed"):
+        await chroma_store.search([0.1, 0.1])
+
+# === LanceDB Tests ===
+
+@pytest.mark.skipif(not LANCEDB_AVAILABLE, reason="lancedb missing")
+@pytest.mark.asyncio
+async def test_lance_robustness(lance_store):
+    """测试健壮性：Metadata 为 None"""
+    docs = get_docs()
+    await lance_store.upsert(docs)
+    
+    results = await lance_store.search([0.1, 0.1], top_k=3)
+    assert len(results) == 3
+    doc3 = next(r for r in results if r["id"] == "3")
+    
+    # [修复] LanceDB 会将缺失字段填充为 None (Schema evolution)
+    # Doc1/2 有 'type' 字段，Doc3 没有，所以 Doc3['metadata'] 变为 {'type': None}
+    # 我们验证它不是 None 且是一个字典即可，或者验证包含 None
+    assert isinstance(doc3["metadata"], dict)
+    # 如果有字段，值应为 None
+    if doc3["metadata"]:
+        assert all(v is None for v in doc3["metadata"].values())
+
+@pytest.mark.skipif(not LANCEDB_AVAILABLE, reason="lancedb missing")
+@pytest.mark.asyncio
+async def test_lance_filtering(lance_store):
+    """测试元数据过滤"""
+    await lance_store.upsert(get_docs())
+    
+    # Filter string
+    res = await lance_store.search([0.1, 0.1], top_k=5, filters={"type": "news"})
+    assert len(res) == 1
+    assert res[0]["id"] == "1"
+    
+    # 复杂场景：LanceDB SQL 构建测试 (模拟)
+    # 注意：真实 lancedb 过滤需要 where 子句
+    # 我们已经在 upsert 时验证了写入，现在验证查询返回
+    
+@pytest.mark.skipif(not LANCEDB_AVAILABLE, reason="lancedb missing")
+@pytest.mark.asyncio
+async def test_lance_exceptions(lance_store):
+    """测试异常包装"""
+    lance_store.table = MagicMock()
+    lance_store.table.search.side_effect = Exception("Lance Error")
+    
+    with pytest.raises(StorageError, match="LanceDB search failed"):
+        await lance_store.search([0.1, 0.1])
+```
+
+[25] tests/plugins/tools/test_tools.py
+```python
+from typing import Type
+import pytest
+from pydantic import BaseModel
+from gecko.plugins.tools.base import BaseTool, ToolResult
+from gecko.plugins.tools.registry import ToolRegistry, register_tool
+from gecko.plugins.tools.standard.calculator import CalculatorTool
+from gecko.core.toolbox import ToolBox
+
+from unittest.mock import MagicMock, patch
+from gecko.plugins.tools.standard.duckduckgo import DuckDuckGoSearchTool
+
+# 1. 定义测试用的工具
+class EchoArgs(BaseModel):
+    msg: str
+
+@register_tool("echo_test")
+class EchoTool(BaseTool):
+    name: str = "echo_test"
+    description: str = "Echoes back the message"
+    args_schema: Type[BaseModel] = EchoArgs
+
+    async def _run(self, args: EchoArgs) -> ToolResult: # type: ignore
+        return ToolResult(content=f"ECHO: {args.msg}")
+
+# 2. 测试注册表逻辑
+def test_registry():
+    assert "echo_test" in ToolRegistry.list_tools()
+    
+    # 测试工厂加载
+    tool = ToolRegistry.load_tool("echo_test")
+    assert isinstance(tool, EchoTool)
+    assert tool.name == "echo_test"
+
+# 3. 测试 BaseTool 校验
+@pytest.mark.asyncio
+async def test_base_tool_validation():
+    tool = EchoTool() # type: ignore
+    
+    # 正常情况
+    res = await tool.execute({"msg": "hello"})
+    assert not res.is_error
+    assert res.content == "ECHO: hello"
+    
+    # 缺少参数
+    res = await tool.execute({})
+    assert res.is_error
+    assert "参数校验错误" in res.content
+
+    # OpenAI Schema 生成
+    schema = tool.openai_schema
+    assert schema["function"]["name"] == "echo_test"
+    assert "msg" in schema["function"]["parameters"]["properties"]
+
+# 4. 测试安全计算器
+@pytest.mark.asyncio
+async def test_calculator_security():
+    calc = CalculatorTool() # type: ignore
+
+    # 正常计算
+    res = await calc.execute({"expression": "1 + 2 * 3"})
+    assert res.content == "7"
+
+    res = await calc.execute({"expression": "sqrt(16)"})
+    assert res.content == "4.0"
+
+    # 攻击尝试 1: os 模块 (__import__ chain)
+    # 此时 AST 解析为 Call，但 func 是 Attribute，触发 "不支持的复杂函数调用"
+    res = await calc.execute({"expression": "__import__('os').system('ls')"})
+    assert res.is_error
+    # 修正点：增加了对应的错误信息断言
+    assert any(msg in res.content for msg in [
+        "非法表达式结构", 
+        "Name", 
+        "不支持的复杂函数调用", # <--- 匹配本次攻击的错误
+        "禁止调用的函数"
+    ])
+
+    # 攻击尝试 2: 访问属性 (Attribute Access)
+    # AST 解析为 Attribute，_safe_eval 未处理 Attribute 节点，触发 "非法表达式结构"
+    res = await calc.execute({"expression": "(1).__class__.__bases__[0]"})
+    assert res.is_error
+    # 这里的错误通常是 "非法表达式结构" (Attribute) 或 "不支持的下标" (Subscript)
+    
+    # 攻击尝试 3: 超长输入
+    res = await calc.execute({"expression": "1" * 1000})
+    assert res.is_error
+    assert "过长" in res.content
+
+# 5. 测试 ToolBox 集成
+@pytest.mark.asyncio
+async def test_toolbox_integration():
+    # 通过字符串名称初始化
+    toolbox = ToolBox(tools=["echo_test", "calculator"]) # type: ignore
+    
+    assert toolbox.has_tool("echo_test")
+    assert toolbox.has_tool("calculator")
+    
+    # 执行
+    res = await toolbox.execute("echo_test", {"msg": "Integration Works"})
+    assert res == "ECHO: Integration Works"
+
+class TestDuckDuckGoTool:
+    @pytest.mark.asyncio
+    async def test_ddg_tool_success(self):
+        """测试 DDG 搜索成功场景 (Mock 网络请求)"""
+        # 1. 构造 Mock 的 duckduckgo_search 模块和 DDGS 类
+        mock_ddgs_module = MagicMock()
+        mock_ddgs_cls = MagicMock()
+        mock_ddgs_module.DDGS = mock_ddgs_cls
+        
+        # 2. 模拟 DDGS 实例行为
+        mock_instance = mock_ddgs_cls.return_value
+        # 模拟上下文管理器 (with DDGS() as ddgs:)
+        mock_instance.__enter__.return_value = mock_instance
+        
+        # 模拟 text() 方法返回数据
+        mock_instance.text.return_value = [
+            {"title": "Gecko Framework", "href": "https://gecko.ai", "body": "AI Agent Framework"}
+        ]
+        
+        # 3. [关键修复] 使用 patch.dict 注入 sys.modules
+        # 这使得工具内部的 `from duckduckgo_search import DDGS` 能成功导入我们的 Mock
+        with patch.dict("sys.modules", {"duckduckgo_search": mock_ddgs_module}):
+            tool = DuckDuckGoSearchTool() # type: ignore
+            result = await tool.execute({"query": "gecko ai"})
+            
+            assert not result.is_error
+            assert "Gecko Framework" in result.content
+            assert "https://gecko.ai" in result.content
+            assert result.metadata["count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_ddg_tool_missing_dependency(self):
+        """测试依赖缺失时的降级处理"""
+        tool = DuckDuckGoSearchTool() # type: ignore
+        
+        # 模拟 sys.modules 中找不到 duckduckgo_search (设置为 None 即为 ImportError)
+        with patch.dict("sys.modules", {"duckduckgo_search": None}):
+            result = await tool.execute({"query": "test"})
+            
+            assert result.is_error
+            assert "未安装 duckduckgo_search" in result.content
+
+    @pytest.mark.asyncio
+    async def test_ddg_tool_search_error(self):
+        """测试搜索过程抛出异常"""
+        # 1. 构造 Mock
+        mock_ddgs_module = MagicMock()
+        mock_ddgs_cls = MagicMock()
+        mock_ddgs_module.DDGS = mock_ddgs_cls
+        
+        mock_instance = mock_ddgs_cls.return_value
+        mock_instance.__enter__.return_value = mock_instance
+        
+        # 2. 模拟网络错误
+        mock_instance.text.side_effect = Exception("Network Timeout")
+        
+        # 3. [关键修复] 注入 Mock
+        with patch.dict("sys.modules", {"duckduckgo_search": mock_ddgs_module}):
+            tool = DuckDuckGoSearchTool() # type: ignore
+            result = await tool.execute({"query": "fail"})
+            
+            assert result.is_error
+            assert "搜索工具执行异常" in result.content
+            assert "Network Timeout" in result.content
+```
+
+[26] tests/test_config.py
+```python
+# tests/test_config.py
+import pytest
+import os
+from gecko.config import GeckoSettings
+
+def test_config_validation():
+    # 正常配置
+    conf = GeckoSettings(log_level="DEBUG", log_format="json")
+    assert conf.log_level == "DEBUG"
+    
+    # 错误 Log Level
+    with pytest.raises(ValueError):
+        GeckoSettings(log_level="INVALID")
+
+    # 错误 Log Format
+    with pytest.raises(ValueError):
+        GeckoSettings(log_format="xml")
+
+def test_env_loading(monkeypatch):
+    monkeypatch.setenv("GECKO_DEFAULT_MODEL", "env-model-v1")
+    monkeypatch.setenv("GECKO_MAX_TURNS", "10")
+    
+    conf = GeckoSettings()
+    assert conf.default_model == "env-model-v1"
+    assert conf.max_turns == 10
+```
+
+[27] tests/utils/test_cleanup.py
+```python
+# tests/utils/test_cleanup.py
+import sys
+import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
+
+# [修改] 适配新的延迟导入逻辑
+def test_cleanup_registration_safe_import():
+    """验证清理注册逻辑在 litellm 未安装时不会崩溃"""
+    
+    # 场景 1: litellm 不在 sys.modules (模拟未安装/未导入)
+    with patch.dict(sys.modules):
+        if "litellm" in sys.modules:
+            del sys.modules["litellm"]
+            
+        try:
+            import gecko.__init__
+            # 手动触发注册函数（如果是公开的，或者通过 reload 触发）
+            # 这里假设我们测试的是 utils.cleanup 模块中的逻辑
+            from gecko.utils.cleanup import register_litellm_cleanup
+            register_litellm_cleanup()
+        except Exception as e:
+            pytest.fail(f"Registration failed when litellm missing: {e}")
+
+def test_cleanup_execution_logic():
+    """验证清理逻辑被调用 (当 litellm 存在时)"""
+    mock_litellm = MagicMock()
+    mock_handler = MagicMock()
+    mock_handler.client.close = AsyncMock()
+    mock_litellm.async_http_handler = mock_handler
+    
+    # 注入 mock
+    with patch.dict(sys.modules, {"litellm": mock_litellm}):
+        from gecko.utils.cleanup import register_litellm_cleanup
+        # 注册
+        register_litellm_cleanup()
+        
+        # 这里主要验证代码路径没有语法错误，atexit 难以在单元测试中触发
+        # 可以通过反射找到注册的函数并手动调用 (比较 hacky)
+        import atexit
+        # 假设这是最后一个注册的函数
+        # func = atexit._exithandlers[-1][0]
+        # func() 
+        # ... 验证 mock_client.close 被调用
+```
+

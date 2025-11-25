@@ -3,6 +3,7 @@ import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 from gecko.core.agent import Agent, AgentRunEvent
+from gecko.core.events.bus import EventBus
 from gecko.core.message import Message
 from gecko.core.engine.react import ReActEngine
 
@@ -67,3 +68,26 @@ async def test_agent_events(mock_llm, toolbox, memory, event_bus):
     event_types = [e.type for e in received_events]
     assert "run_started" in event_types
     assert "run_completed" in event_types
+
+@pytest.mark.asyncio
+async def test_agent_event_bus_wiring(mock_llm, toolbox, memory):
+    """
+    [New] 验证 Agent 的 EventBus 是否正确连接到了 Engine
+    这是修复 ReActEngine 缺少 event_bus 属性的关键验证
+    """
+    bus = EventBus()
+    agent = Agent(
+        model=mock_llm, 
+        toolbox=toolbox, 
+        memory=memory, 
+        event_bus=bus
+    )
+    
+    # 验证 Engine 拥有 event_bus 属性且是同一个实例
+    assert hasattr(agent.engine, "event_bus")
+    assert agent.engine.event_bus is bus
+    
+    # 验证如果不传，Agent 会自动创建
+    agent_default = Agent(model=mock_llm, toolbox=toolbox, memory=memory)
+    assert agent_default.engine.event_bus is not None
+    assert isinstance(agent_default.engine.event_bus, EventBus)

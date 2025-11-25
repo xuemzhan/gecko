@@ -19,6 +19,7 @@ Token Memory - 上下文记忆管理器
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from collections import OrderedDict
@@ -450,6 +451,8 @@ class SummaryTokenMemory(TokenMemory):
         )
         # 内存中维护当前的摘要
         self.current_summary: str = ""
+        # [新增] 并发锁，防止同时触发多个摘要请求
+        self._summary_lock = asyncio.Lock()
 
     async def get_history(
         self,
@@ -543,24 +546,32 @@ class SummaryTokenMemory(TokenMemory):
         if not messages:
             return
 
-        # 将消息转为文本
-        history_text = "\n".join([f"{m.role}: {m.get_text_content()}" for m in messages])
-        
-        # 如果已有摘要，将其合并进去
-        if self.current_summary:
-            history_text = f"Previous Summary: {self.current_summary}\n\nNew Conversation:\n{history_text}"
+        # [优化] 使用锁保护摘要更新过程
+        # 如果当前已有摘要正在生成，是否等待？
+        # 策略：等待。确保本次 get_history 拿到的摘要是最新的。
+        async with self._summary_lock:
+            
+            # [重要] 双重检查 (Double-Check Locking)
+            # 因为在等待锁的过程中，可能前一个任务已经把这些 messages 摘要过了
+            # 实际上这需要更复杂的状态追踪来完美实现（比如追踪 message index）。
+            # 这里做一个简化的优化：如果 messages 为空（虽在外面判过，但防御性编程）直接返回
+            if not messages:
+                return
 
-        # 构造 Prompt
-        prompt = self.summary_template.format(history=history_text)
-        
-        try:
-            # 调用模型生成摘要
-            # 注意：这里是一个简单的阻塞调用，生产环境可能需要后台异步更新
-            response = await self.model.acompletion([{"role": "user", "content": prompt}])
-            new_summary = response.choices[0].message["content"]
-            if new_summary:
-                self.current_summary = new_summary
-                logger.info("Conversation summary updated", summary_len=len(new_summary))
-        except Exception as e:
-            logger.error("Failed to update summary", error=str(e))
-            # 失败时保持原有摘要，或者不做处理
+            # 将消息转为文本
+            history_text = "\n".join([f"{m.role}: {m.get_text_content()}" for m in messages])
+            
+            if self.current_summary:
+                history_text = f"Previous Summary: {self.current_summary}\n\nNew Conversation:\n{history_text}"
+
+            prompt = self.summary_template.format(history=history_text)
+            
+            try:
+                # 调用模型生成摘要
+                response = await self.model.acompletion([{"role": "user", "content": prompt}])
+                new_summary = response.choices[0].message["content"]
+                if new_summary:
+                    self.current_summary = new_summary
+                    logger.info("Conversation summary updated", summary_len=len(new_summary))
+            except Exception as e:
+                logger.error("Failed to update summary", error=str(e))

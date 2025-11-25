@@ -37,6 +37,7 @@ from typing import (
 from pydantic import BaseModel
 
 from gecko.core.engine.base import CognitiveEngine
+from gecko.core.events.bus import EventBus
 from gecko.core.exceptions import AgentError, ModelError
 from gecko.core.logging import get_logger
 from gecko.core.memory import TokenMemory
@@ -46,6 +47,7 @@ from gecko.core.prompt import PromptTemplate
 from gecko.core.structure import StructureEngine, StructureParseError
 from gecko.core.toolbox import ToolBox
 from gecko.core.utils import ensure_awaitable
+from gecko.core.events import AgentRunEvent 
 
 logger = get_logger(__name__)
 
@@ -101,6 +103,7 @@ class ReActEngine(CognitiveEngine):
         model: Any,
         toolbox: ToolBox,
         memory: TokenMemory,
+        event_bus: Optional[EventBus] = None,
         max_turns: int = 5,
         max_observation_length: int = 2000,
         system_prompt: Union[str, PromptTemplate, None] = None,
@@ -123,7 +126,14 @@ class ReActEngine(CognitiveEngine):
             on_turn_end: 每一轮结束时的钩子
             on_tool_execute: 工具执行前的钩子
         """
-        super().__init__(model, toolbox, memory, **kwargs)
+        # 将 event_bus 传递给基类
+        super().__init__(
+            model=model, 
+            toolbox=toolbox, 
+            memory=memory, 
+            event_bus=event_bus,
+            **kwargs
+        )
         self.max_turns = max_turns
         self.max_observation_length = max_observation_length
         
@@ -443,7 +453,7 @@ class ReActEngine(CognitiveEngine):
     
     def _normalize_tool_call(self, tool_call: Dict[str, Any]) -> Dict[str, Any]:
         """
-        [New Helper] 规范化工具调用数据结构 (Adapter Pattern)
+        规范化工具调用数据结构 (Adapter Pattern)
         
         目标：将 LLM 的原始输出统一转换为 ToolBox.execute_many 所需的扁平格式。
         兼容：
@@ -468,10 +478,13 @@ class ReActEngine(CognitiveEngine):
             try:
                 # 处理常见的 JSON 格式问题 (如包含换行符)
                 parsed_args = json.loads(raw_args)
-            except json.JSONDecodeError:
-                logger.warning(f"Failed to parse tool arguments for '{name}': {raw_args}")
-                # 解析失败返回空字典，让 ToolBox 抛出参数校验错误，而不是在这里崩溃
-                parsed_args = {} 
+            except json.JSONDecodeError as e:
+                # [修改] 不要返回空字典，而是返回带有错误标记的字典
+                # 这允许 ToolBox 识别出是"格式错误"而不是"参数缺失"，并反馈给 LLM
+                logger.warning(f"JSON decode failed for tool {name}: {e}")
+                parsed_args = {
+                    "__gecko_parse_error__": f"JSON format error: {str(e)}. Raw content: {raw_args}"
+                }
         else:
             parsed_args = raw_args if isinstance(raw_args, dict) else {}
 
@@ -488,15 +501,33 @@ class ReActEngine(CognitiveEngine):
         """
         批量执行工具
         
-        改进：使用 _normalize_tool_call 解耦数据清洗逻辑
+        使用 _normalize_tool_call 解耦数据清洗逻辑
+        增加 EventBus 事件通知，改善流式输出时的用户体验
         """
         # 1. 数据规范化 (Normalization)
         flat_tool_calls = [self._normalize_tool_call(tc) for tc in tool_calls]
 
+        # 发送工具执行开始事件 (Out-of-band Signal)
+        # 前端收到此事件后可以显示 "正在调用工具: Calculator..." 等加载状态
+        if hasattr(self, "event_bus") and self.event_bus:
+            # 仅发送元数据，避免泄露敏感参数
+            tool_meta = [{"name": tc["name"], "id": tc["id"]} for tc in flat_tool_calls]
+            await self.event_bus.publish(AgentRunEvent(
+                type="tool_execution_start",
+                data={"tools": tool_meta}
+            ))
+
         # 2. 批量执行 (Execution)
         results = await self.toolbox.execute_many(flat_tool_calls)
 
-        # 3. 处理结果与副作用 (Side Effects)
+        # [新增] 3. 发送工具执行结束事件
+        if hasattr(self, "event_bus") and self.event_bus:
+            await self.event_bus.publish(AgentRunEvent(
+                type="tool_execution_end",
+                data={"result_count": len(results)}
+            ))
+
+        # 4. 处理结果与副作用 (Side Effects)
         for res in results:
             if self.on_tool_execute:
                 await ensure_awaitable(self.on_tool_execute, res.tool_name, {})

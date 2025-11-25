@@ -310,30 +310,69 @@ async def test_execute_not_validated(simple_workflow):
 
 @pytest.mark.asyncio
 async def test_persistence(simple_workflow, mock_storage):
-    """测试状态持久化调用"""
+    """测试状态持久化调用 (Two-Phase Commit)"""
     simple_workflow.storage = mock_storage
+    # 确保策略允许中间保存
+    simple_workflow.checkpoint_strategy = CheckpointStrategy.ALWAYS
     
     simple_workflow.add_node("A", lambda: "output_a")
     simple_workflow.set_entry_point("A")
     
     await simple_workflow.execute("input", session_id="sess_123")
     
-    # 验证 storage.set 被调用
-    assert mock_storage.set.called
-    call_args = mock_storage.set.call_args[0]
-    key, data = call_args
+    # 验证 storage.set 被调用次数
+    # 预期至少调用 2 次：
+    # 1. Node A Start -> Pre-Commit (Status: RUNNING)
+    # 2. Node A End   -> Commit (Status: SUCCESS, via _execute_loop)
+    assert mock_storage.set.call_count >= 2
     
-    assert key == "workflow:sess_123"
-    assert data["step"] == 1
+    # 获取第一次调用 (Pre-Commit)
+    call_args_1 = mock_storage.set.call_args_list[0]
+    _, data_1 = call_args_1[0] # key, value
     
-    # [Fix] 只有 A 一个节点，执行完后：
-    # 旧逻辑: last_node 是下一个节点 (None)
-    # 新逻辑: last_node 是刚刚完成的节点 ("A")，这样 Resume 时才知道 A 已完成
-    assert data["last_node"] == "A"
+    # 验证 Phase 1: 记录正在执行
+    executions_1 = data_1["context"]["executions"]
+    assert len(executions_1) == 1
+    assert executions_1[0]["node_name"] == "A"
+    assert executions_1[0]["status"] == "running" # 关键验证点
     
-    # 历史记录检查保持不变
-    assert data["context"]["input"] == "input"
-    assert data["context"]["history"]["A"] == "output_a"
+    # 获取最后一次调用 (Final Commit)
+    call_args_last = mock_storage.set.call_args_list[-1]
+    _, data_last = call_args_last[0]
+    
+    # 验证 Phase 2: 记录执行完成
+    executions_last = data_last["context"]["executions"]
+    assert executions_last[0]["status"] == "success"
+    assert data_last["last_node"] == "A"
+
+# [新增] 验证两阶段提交的异常回滚/记录逻辑
+@pytest.mark.asyncio
+async def test_two_phase_commit_on_failure(simple_workflow, mock_storage):
+    """测试节点失败时的状态记录"""
+    simple_workflow.storage = mock_storage
+    
+    def failing_node():
+        raise ValueError("Crash!")
+        
+    simple_workflow.add_node("FailNode", failing_node)
+    simple_workflow.set_entry_point("FailNode")
+    
+    # 执行并捕获异常
+    with pytest.raises(WorkflowError):
+        await simple_workflow.execute("start", session_id="sess_fail")
+        
+    # 验证调用
+    # 1. Pre-Commit (Running)
+    # 2. Failure Commit (Failed)
+    assert mock_storage.set.call_count >= 2
+    
+    # 检查最后一次保存的状态
+    _, data_last = mock_storage.set.call_args_list[-1][0]
+    last_exec = data_last["context"]["executions"][-1]
+    
+    assert last_exec["node_name"] == "FailNode"
+    assert last_exec["status"] == "failed"
+    assert "Crash!" in last_exec["error"]
 
 @pytest.mark.asyncio
 async def test_persistence_failure_safe(simple_workflow, mock_storage):
@@ -489,7 +528,7 @@ def test_next_with_state_update():
 
 @pytest.mark.asyncio
 async def test_checkpoint_strategy(simple_workflow, mock_storage):
-    """[New] 测试持久化策略"""
+    """[Updated] 测试持久化策略 (适配两阶段提交)"""
     simple_workflow.storage = mock_storage
     simple_workflow.checkpoint_strategy = CheckpointStrategy.FINAL
     
@@ -500,17 +539,22 @@ async def test_checkpoint_strategy(simple_workflow, mock_storage):
     
     await simple_workflow.execute("init", session_id="sess_strat")
     
-    # 策略是 FINAL，只有在结束时强制保存一次
-    # 中间步骤 A->B 时 _persist_state 会被调用但应该 early return
-    # 只有最后 execute 结束前会 force=True 调用一次
-    # 实际上，_execute_loop 内部循环了 2 次 (A, B)，如果策略是 ALWAYS，会保存 2 次
-    # 如果是 FINAL，_execute_loop 内不保存，最后保存 1 次
+    # [修复] 由于引入了 Pre-Commit (force=True)，即使是 FINAL 策略，
+    # 每个节点开始执行时也会强制保存 "RUNNING" 状态以防 Crash。
+    # 流程: 
+    # 1. A Pre-commit (RUNNING) -> Force Save
+    # 2. A Post-commit (SUCCESS) -> Skipped (Strategy=FINAL)
+    # 3. B Pre-commit (RUNNING) -> Force Save
+    # 4. B Post-commit (SUCCESS) -> Skipped (Strategy=FINAL)
+    # 5. Workflow End -> Force Save
+    # 预期调用次数: 3 次
+    assert mock_storage.set.call_count == 3
     
-    assert mock_storage.set.call_count == 1
+    # 验证最后一次保存的状态 (Workflow 完成状态)
+    key, data = mock_storage.set.call_args_list[-1][0]
     
-    # 验证最后保存的状态
-    key, data = mock_storage.set.call_args[0]
-    assert data["last_node"] is None # 执行完了，没有 next
+    # 此时 B 已经执行完
+    assert data["last_node"] is None 
     assert data["context"]["history"]["B"] == "b"
 
 @pytest.mark.asyncio
@@ -611,7 +655,7 @@ async def test_workflow_context_next_pointer_logic():
 @pytest.mark.asyncio
 async def test_next_instruction_persistence(simple_workflow, mock_storage):
     """
-    [New] 测试 Next 指令触发立即持久化，并包含 next_pointer
+    测试 Next 指令触发立即持久化，并包含 next_pointer
     验证优化点：Workflow._execute_loop 中的原子持久化
     """
     simple_workflow.storage = mock_storage
@@ -630,27 +674,22 @@ async def test_next_instruction_persistence(simple_workflow, mock_storage):
     # 执行
     await simple_workflow.execute("start", session_id="sess_next_persist")
     
-    # 验证 storage.set 调用
-    # 我们期望在 Node A 执行完返回 Next 后，立即调用了一次 set
-    # 检查调用参数中是否包含 next_pointer
-    
-    # 找到 Node A 完成时的那次保存
     calls = mock_storage.set.call_args_list
-    found_pointer = False
+    found_correct_snapshot = False
     
     for call_args in calls:
-        _, data = call_args[0] # key, value
+        _, data = call_args[0]
         context_data = data.get("context", {})
         
-        # 检查是否记录了 next_pointer
-        if context_data.get("next_pointer"):
-            pointer = context_data["next_pointer"]
-            if pointer["target_node"] == "B" and pointer["input"] == "jump_data":
-                found_pointer = True
-                # 验证此时 last_node 应该是 A (即便 A 返回的是 Next)
-                assert data["last_node"] == "A"
+        # [修复] 我们要找的是 A 执行完、B 执行前的那次快照
+        # 特征：last_node="A", next_pointer -> B
+        if data.get("last_node") == "A":
+            pointer = context_data.get("next_pointer")
+            if pointer and pointer["target_node"] == "B":
+                found_correct_snapshot = True
+                break
                 
-    assert found_pointer, "持久化数据中未找到 next_pointer，断点恢复将失败"
+    assert found_correct_snapshot, "未找到 A->B 跳转时的正确持久化快照"
 
 @pytest.mark.asyncio
 async def test_resume_from_next_pointer(simple_workflow, mock_storage):

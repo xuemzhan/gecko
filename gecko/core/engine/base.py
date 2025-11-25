@@ -28,6 +28,7 @@ from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Type, Typ
 
 from pydantic import BaseModel
 
+from gecko.core.events.bus import EventBus
 from gecko.core.exceptions import AgentError, ModelError
 from gecko.core.logging import get_logger
 from gecko.core.memory import TokenMemory
@@ -127,6 +128,7 @@ class CognitiveEngine(ABC):
         model: ModelProtocol,
         toolbox: ToolBox,
         memory: TokenMemory,
+        event_bus: Optional[EventBus] = None,
         max_iterations: int = 10,
         enable_stats: bool = True,
         **kwargs
@@ -153,6 +155,7 @@ class CognitiveEngine(ABC):
         
         self.model = model
         self.toolbox = toolbox
+        self.event_bus = event_bus
         self.memory = memory
         self.max_iterations = max_iterations
         self.enable_stats = enable_stats

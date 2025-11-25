@@ -240,6 +240,13 @@ class ToolBox:
         返回:
             结果字符串
         """
+        # [新增] 检查是否存在解析层传递下来的错误标记
+        if "__gecko_parse_error__" in arguments:
+            # 直接返回错误信息作为 Tool Output
+            # 这比抛出异常更有效，因为 LLM 可以读取这个 Output 并尝试自我修正
+            return f"System Error: Failed to parse arguments. {arguments['__gecko_parse_error__']} \
+                Please correct your JSON format."
+
         result = await self.execute_with_result(name, arguments, timeout, call_id)
         if result.is_error:
             raise ToolError(
@@ -260,6 +267,19 @@ class ToolBox:
         
         包含：超时控制、重试逻辑、统计记录
         """
+        # [新增] 同样的检查逻辑，确保 execute_many 也能受益
+        if "__gecko_parse_error__" in arguments:
+            error_msg = f"System Error: Failed to parse arguments. {arguments['__gecko_parse_error__']} \
+                Please correct your JSON format."
+            self._update_stats(name, 0.0, is_error=True)
+            return ToolExecutionResult(
+                tool_name=name,
+                call_id=call_id,
+                result=error_msg,
+                is_error=True,
+                duration=0.0
+            )
+        
         tool = self.get(name)
         if not tool:
             self._update_stats(name, 0, is_error=True)

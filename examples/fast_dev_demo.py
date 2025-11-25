@@ -1,30 +1,45 @@
 # examples/fast_dev_demo.py
 import asyncio
+import os
 from gecko.core.builder import AgentBuilder
 from gecko.core.message import Message
-from gecko.plugins.models.zhipu import glm_4_5_air
-from gecko.plugins.storage.sqlite import SQLiteSessionStorage # [新增] 显式引入存储后端
+# [Fix] Import ZhipuChat
+from gecko.plugins.models.presets.zhipu import ZhipuChat
+from gecko.plugins.storage.backends.sqlite import SQLiteStorage
 
 async def main():
-    # [修改] 初始化存储实例 (不再只传 URL 字符串)
-    storage = SQLiteSessionStorage("sqlite://./dev_sessions.db")
+    api_key = os.getenv("ZHIPU_API_KEY")
+    
+    # [Fix] 创建 Storage 实例
+    storage = SQLiteStorage("sqlite://./dev_sessions.db")
+    await storage.initialize() # 确保存储初始化
 
-    agent = (AgentBuilder()
-             .with_model(glm_4_5_air(temperature=0.3))
-             .with_session_id("user_123")              # [新增] 指定会话 ID
-             .with_storage(storage)                    # [修改] 注入存储实例
-             # .with_tools([KnowledgeTool(...)])       # [说明] Vector RAG 现在建议作为 Tool 注入
-             .build())
+    try:
+        # [Fix] 创建 Model 实例
+        model = ZhipuChat(api_key=api_key or "mock_key", model="glm-4-flash")
 
-    # 第一次运行：记住名字
-    print("--- Round 1 ---")
-    output1 = await agent.run([Message(role="user", content="我叫张三，以后叫我老张")])
-    print("AI:", output1.content)
+        agent = (AgentBuilder()
+                 .with_model(model)
+                 .with_session_id("user_123")
+                 .with_storage(storage)
+                 .build())
 
-    # 第二次运行：验证记忆恢复 (TokenMemory 会自动从 SQLite 加载历史)
-    print("\n--- Round 2 ---")
-    output2 = await agent.run([Message(role="user", content="我叫什么名字？")])
-    print("AI:", output2.content)
+        # 第一次运行：记住名字
+        print("--- Round 1 ---")
+        output1 = await agent.run([Message(role="user", content="我叫张三，以后叫我老张")])
+        print("AI:", output1.content) # type: ignore
+
+        # 第二次运行：验证记忆恢复
+        print("\n--- Round 2 ---")
+        output2 = await agent.run([Message(role="user", content="我叫什么名字？")])
+        print("AI:", output2.content) # type: ignore
+        
+    finally:
+        await storage.shutdown()
+        # 清理临时文件
+        if os.path.exists("dev_sessions.db"):
+            try: os.remove("dev_sessions.db")
+            except: pass
 
 if __name__ == "__main__":
     asyncio.run(main())
