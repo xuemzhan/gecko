@@ -81,12 +81,22 @@ class EventBus:
             return
 
         # 2. 获取订阅者
-        handlers = self._subscribers.get(event.type, []) + self._subscribers.get("*", [])
-        if not handlers:
+        type_handlers = self._subscribers.get(event.type, [])
+        wildcard_handlers = self._subscribers.get("*", [])
+        
+        if not type_handlers and not wildcard_handlers:
             return
+        
+        # 3. 修复: 使用 id() 进行更健壮的去重
+        # dict.fromkeys() 依赖对象的 __hash__，对于方法和 lambda 可能不可靠
+        seen_ids = set()
+        unique_handlers = []
 
-        # 3. 执行处理（去重）
-        unique_handlers = list(dict.fromkeys(handlers))
+        for h in type_handlers + wildcard_handlers:
+            handler_id = id(h)
+            if handler_id not in seen_ids:
+                seen_ids.add(handler_id)
+                unique_handlers.append(h)
         
         # 创建执行协程
         tasks = [self._execute_handler(h, event) for h in unique_handlers]

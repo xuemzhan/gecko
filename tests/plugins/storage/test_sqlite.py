@@ -5,6 +5,7 @@ import pytest
 from unittest.mock import patch, MagicMock
 from gecko.plugins.storage.backends.sqlite import SQLiteStorage
 from gecko.core.exceptions import StorageError
+from gecko.plugins.storage.factory import create_storage
 
 DB_FILE = "./test_gecko_sqlite.db"
 DB_URL = f"sqlite:///{DB_FILE}"
@@ -62,3 +63,17 @@ async def test_sqlite_crud_exceptions(storage):
             
         with pytest.raises(StorageError, match="SQLite delete failed"):
             await storage.delete("s1")
+
+@pytest.mark.asyncio
+async def test_sqlite_factory_loading():
+    """
+    [New] 验证 SQLite 后端是否正确注册到工厂
+    这能检测 Bug #7 (缺失装饰器)
+    """
+    # 使用内存数据库避免文件 IO
+    storage = await create_storage("sqlite:///:memory:")
+    try:
+        assert storage.__class__.__name__ == "SQLiteStorage"
+        assert storage.is_initialized
+    finally:
+        await storage.shutdown()

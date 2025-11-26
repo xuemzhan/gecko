@@ -431,6 +431,9 @@ class SummaryTokenMemory(TokenMemory):
     
     当历史记录超出 max_tokens 时，不是简单丢弃，而是调用 LLM 对早期历史进行摘要。
     """
+
+    # ✅ 修复: 移除类级别的 Lock 初始化，改为属性
+    _summary_lock: Optional[asyncio.Lock] = None
     
     def __init__(
         self,
@@ -451,8 +454,6 @@ class SummaryTokenMemory(TokenMemory):
         )
         # 内存中维护当前的摘要
         self.current_summary: str = ""
-        # [新增] 并发锁，防止同时触发多个摘要请求
-        self._summary_lock = asyncio.Lock()
 
     async def get_history(
         self,
@@ -541,24 +542,23 @@ class SummaryTokenMemory(TokenMemory):
         
         return final_history
 
+    @property
+    def summary_lock(self) -> asyncio.Lock:
+        """✅ 修复: 懒加载获取摘要锁"""
+        if self._summary_lock is None:
+            self._summary_lock = asyncio.Lock()
+        return self._summary_lock
+    
     async def _update_summary(self, messages: List[Message]):
         """调用 LLM 更新摘要"""
         if not messages:
             return
 
-        # [优化] 使用锁保护摘要更新过程
-        # 如果当前已有摘要正在生成，是否等待？
-        # 策略：等待。确保本次 get_history 拿到的摘要是最新的。
-        async with self._summary_lock:
-            
-            # [重要] 双重检查 (Double-Check Locking)
-            # 因为在等待锁的过程中，可能前一个任务已经把这些 messages 摘要过了
-            # 实际上这需要更复杂的状态追踪来完美实现（比如追踪 message index）。
-            # 这里做一个简化的优化：如果 messages 为空（虽在外面判过，但防御性编程）直接返回
+        # ✅ 修复: 使用属性访问锁
+        async with self.summary_lock:
             if not messages:
                 return
 
-            # 将消息转为文本
             history_text = "\n".join([f"{m.role}: {m.get_text_content()}" for m in messages])
             
             if self.current_summary:
@@ -567,7 +567,6 @@ class SummaryTokenMemory(TokenMemory):
             prompt = self.summary_template.format(history=history_text)
             
             try:
-                # 调用模型生成摘要
                 response = await self.model.acompletion([{"role": "user", "content": prompt}])
                 new_summary = response.choices[0].message["content"]
                 if new_summary:

@@ -427,13 +427,25 @@ class ToolBox:
                 self._error_count[name] += 1
     
     def get_stats(self) -> Dict[str, Dict[str, Any]]:
-        """获取详细统计快照"""
+        """
+        获取详细统计快照
+        
+        修复: 在持有锁时先复制 keys，避免迭代过程中字典变化
+        """
         with self._stats_lock:
+            # ✅ 修复: 先获取 keys 快照
+            tool_names = list(self._tools.keys())
+            
             stats = {}
-            for name in self._tools:
+            for name in tool_names:
+                # ✅ 修复: 防御性检查，工具可能在快照后被移除
+                if name not in self._execution_count:
+                    continue
+                    
                 cnt = self._execution_count[name]
                 err = self._error_count[name]
                 total = self._total_time[name]
+                
                 stats[name] = {
                     "calls": cnt,
                     "errors": err,
@@ -466,17 +478,19 @@ class ToolBox:
     def get_summary(self) -> Dict[str, Any]:
         """
         获取工具箱的全局摘要
-        """
-        stats = self.get_stats()
         
-        total_executions = sum(s["calls"] for s in stats.values())
-        total_errors = sum(s["errors"] for s in stats.values())
-        total_time_sum = sum(
-            self._total_time.get(name, 0.0) for name in stats.keys()
-        )
+        修复: 使用锁保护并快照数据
+        """
+        with self._stats_lock:
+            # ✅ 修复: 在锁内完成所有计算
+            tool_names = list(self._tools.keys())
+            
+            total_executions = sum(self._execution_count.get(n, 0) for n in tool_names)
+            total_errors = sum(self._error_count.get(n, 0) for n in tool_names)
+            total_time_sum = sum(self._total_time.get(n, 0.0) for n in tool_names)
         
         return {
-            "tool_count": len(self._tools),
+            "tool_count": len(tool_names),
             "total_executions": total_executions,
             "total_errors": total_errors,
             "total_time": total_time_sum,

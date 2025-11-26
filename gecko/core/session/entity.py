@@ -27,12 +27,14 @@ class Session:
         ttl: Optional[int] = None,
         event_bus: Optional[EventBus] = None,
         auto_save: bool = False, 
+        auto_save_debounce: float = 0.1,  # 新增: 防抖延迟
     ):
         self.session_id = session_id or self._generate_id()
         self.state: Dict[str, Any] = state or {}
         self.storage = storage
         self.event_bus = event_bus or EventBus()
         self.auto_save = auto_save
+        self.auto_save_debounce = auto_save_debounce  # 新增
         
         # 元数据
         self.metadata = SessionMetadata(
@@ -42,9 +44,10 @@ class Session:
         
         # 并发锁
         self._lock = asyncio.Lock()
-        
         # 标记为已修改
         self._dirty = False
+        self._save_scheduled = False  # ✅ 新增: 保存调度标记
+        self._save_task: Optional[asyncio.Task] = None  # ✅ 新增: 保存任务引用
         
         logger.debug("Session created", session_id=self.session_id)
     
@@ -99,16 +102,45 @@ class Session:
     
     def _try_schedule_auto_save(self):
         """
-        尝试调度自动保存任务
+        修复: 使用防抖机制调度自动保存
         """
         if not self.auto_save or not self.storage:
             return
-
+        
+        # 如果已有保存任务在等待，不重复调度
+        if self._save_scheduled:
+            return
+        
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(self._auto_save_task())
         except RuntimeError:
-            pass
+            # 没有运行中的事件循环
+            return
+        
+        self._save_scheduled = True
+        
+        async def _debounced_save():
+            """防抖保存任务"""
+            try:
+                # 等待防抖延迟
+                await asyncio.sleep(self.auto_save_debounce)
+                
+                # 执行保存
+                if self._dirty:  # 再次检查是否需要保存
+                    await self.save()
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error("Auto-save failed", session_id=self.session_id, error=str(e))
+            finally:
+                self._save_scheduled = False
+                self._save_task = None
+        
+        # 取消之前的任务（如果存在）
+        if self._save_task and not self._save_task.done():
+            self._save_task.cancel()
+        
+        self._save_task = loop.create_task(_debounced_save())
 
     async def _auto_save_task(self):
         """后台自动保存任务"""

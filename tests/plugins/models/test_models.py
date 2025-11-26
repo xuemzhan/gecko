@@ -1,5 +1,6 @@
 # tests/plugins/models/test_models.py
 import os
+import sys
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 # 引入 SimpleNamespace 来模拟对象属性访问
@@ -115,20 +116,21 @@ async def test_litellm_driver_count_tokens_strategies():
     config_gpt = ModelConfig(model_name="gpt-4")
     driver_gpt = LiteLLMDriver(config_gpt)
     
-    # 确保 tokenizer 被加载
+    # 确保 tokenizer 被加载 (环境中有 tiktoken)
     assert driver_gpt._tokenizer is not None
     count = driver_gpt.count_tokens("hello world")
     assert count > 0
     
-    # 2. 测试 Fallback 路径 (模拟未知模型)
-    # 这里的关键是确保没有安装对应 tokenizer 时不会报错，而是走降级
-    config_unknown = ModelConfig(model_name="unknown-model-123")
-    driver_unknown = LiteLLMDriver(config_unknown)
-    
-    # 应该为 None (加载失败)
-    assert driver_unknown._tokenizer is None
-    
-    # 调用计数，应该走字符估算或 litellm
-    # "hello" (5 chars) // 3 = 1
-    count_fallback = driver_unknown.count_tokens("hello") 
-    assert count_fallback > 0
+    # 2. 测试 Fallback 路径 (模拟 Tiktoken 缺失)
+    # ✅ 修复: 模拟 tiktoken 未安装，迫使 _preload_tokenizer 失败，从而 _tokenizer 为 None
+    with patch.dict(sys.modules, {"tiktoken": None}):
+        config_unknown = ModelConfig(model_name="unknown-model-123")
+        driver_unknown = LiteLLMDriver(config_unknown)
+        
+        # 此时应该为 None (加载失败)
+        assert driver_unknown._tokenizer is None
+        
+        # 调用计数，应该走字符估算或 litellm
+        # "hello" (5 chars) // 3 = 1
+        count_fallback = driver_unknown.count_tokens("hello") 
+        assert count_fallback > 0

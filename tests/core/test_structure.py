@@ -1,4 +1,5 @@
 # tests/core/test_structure.py
+from unittest.mock import patch
 import pytest
 from pydantic import BaseModel, Field
 from gecko.core.structure import (
@@ -190,3 +191,34 @@ class TestStructureParseError:
             assert "结构化解析失败" in detailed
             assert "尝试的解析策略" in detailed
             assert len(e.attempts) > 0
+
+@pytest.mark.asyncio
+async def test_extract_json_dos_protection():
+    """
+    [New] 测试对超长文本的截断保护 (防止 ReDoS/DoS)
+    """
+    # 构造超长文本
+    huge_text = '{"a": 1}' + " " * 200000 
+    
+    # 调用并预期日志警告 (通过 Mock logger 验证)
+    with patch("gecko.core.structure.logger") as mock_logger:
+        # 设置 limit 为 1000 以便测试
+        data = StructureEngine._extract_json(
+            huge_text, 
+            dict, # Any model type # type: ignore
+            max_text_length=1000
+        )
+        
+        # 验证触发了警告
+        mock_logger.warning.assert_called()
+    
+        # 获取最近一次调用的参数
+        # call_args[0] 是位置参数元组, call_args[1] 是关键字参数字典
+        call_args = mock_logger.warning.call_args
+        message = call_args[0][0] # 获取日志消息字符串
+        kwargs = call_args[1]     # 获取结构化数据
+        
+        # 验证消息包含关键词
+        assert "truncating" in message
+        # 验证结构化数据包含长度信息 (可选)
+        assert kwargs.get('original_length') > 1000

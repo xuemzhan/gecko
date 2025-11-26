@@ -35,7 +35,7 @@ class Next(BaseModel):
     """
     node: str = Field(..., description="下一个节点的名称")
     input: Optional[Any] = Field(default=None, 
-        iption="传递给下一个节点的输入数据。如果为 None，则保持上下文中的 last_output 不变。"
+        description="传递给下一个节点的输入数据。如果为 None，则保持上下文中的 last_output 不变。"
     ) # type: ignore
     # [New] 允许在跳转时更新 Context.state # type: ignore
     update_state: Dict[str, Any] = Field(

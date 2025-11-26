@@ -632,3 +632,41 @@ async def test_react_json_fault_tolerance(engine, mock_model, mock_toolbox):
     # 关键断言：Engine 捕获了 JSON 错误并转换为了特殊 Key
     assert "__gecko_parse_error__" in args
     assert "JSON format error" in args["__gecko_parse_error__"]
+
+@pytest.mark.asyncio
+async def test_step_stream_infinite_loop_notification(engine, mock_model, mock_toolbox):
+    """
+    [New] 测试流式模式下死循环检测的通知机制
+    """
+    # 模拟死循环工具调用
+    same_call_chunk = SimpleNamespace(choices=[{
+        "delta": {
+            "tool_calls": [{
+                "index": 0, 
+                "function": {"name": "t1", "arguments": '{"a":1}'}
+            }]
+        }
+    }])
+    
+    mock_model.astream.return_value = (c for c in [same_call_chunk]) # 模拟生成器
+    # 必须让 Mock Model 表现出每次都返回一样
+    mock_model.astream.side_effect = None
+    mock_model.astream.return_value = None
+    
+    async def endless_stream(*args, **kwargs):
+        yield same_call_chunk
+
+    mock_model.astream.side_effect = endless_stream
+    mock_toolbox.execute_many.return_value = [ToolExecutionResult("t1", "1", "Res", False)]
+    
+    engine.max_turns = 5
+    
+    collected_output = []
+    async for chunk in engine.step_stream([Message.user("Loop")]):
+        collected_output.append(chunk)
+        
+    full_text = "".join(collected_output)
+    
+    # 验证输出中包含系统注入的警告
+    assert "[System: Execution stopped" in full_text
+    assert "infinite tool loop" in full_text

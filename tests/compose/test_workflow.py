@@ -737,3 +737,53 @@ async def test_resume_from_next_pointer(simple_workflow, mock_storage):
     # 验证内部状态流转
     # 这里比较难直接验证 state["_next_input"]，因为 execute 内部是瞬态的
     # 但可以通过 B 的执行结果间接验证，或者 Mock B 检查参数
+
+
+@pytest.mark.asyncio
+async def test_resume_failure_preserves_pointer(simple_workflow, mock_storage):
+    """
+    [New] 测试断点恢复时，如果第一步执行失败，next_pointer 不应被清除。
+    确保下次还可以再次尝试恢复。
+    """
+    simple_workflow.storage = mock_storage
+    simple_workflow.checkpoint_strategy = CheckpointStrategy.ALWAYS
+
+    # 模拟一个会在恢复时崩溃的节点
+    failing_mock = MagicMock(side_effect=ValueError("Transient Error"))
+    simple_workflow.add_node("B", lambda: failing_mock())
+    simple_workflow.set_entry_point("B") # 简化拓扑
+
+    # 模拟存储状态：这就好比 A -> B (Next)，指针指向 B
+    mock_storage.get.return_value = {
+        "step": 1,
+        "last_node": "A",
+        "context": {
+            "input": "start",
+            "history": {},
+            "state": {},
+            # ✅ [修复点] 添加 metadata，确保 _execute_node_safe 能提取到 session_id
+            "metadata": {"session_id": "sess_retry_test"}, 
+            "next_pointer": { # 指针存在
+                "target_node": "B",
+                "input": "data"
+            },
+            "executions": []
+        }
+    }
+
+    # 1. 执行 Resume，预期抛出 WorkflowError (包装了 ValueError)
+    from gecko.core.exceptions import WorkflowError
+    with pytest.raises(WorkflowError) as excinfo:
+        await simple_workflow.resume("sess_retry_test")
+
+    assert "Transient Error" in str(excinfo.value) or "Transient Error" in str(excinfo.value.__cause__)
+
+    # 2. 验证：Context 中的 next_pointer 应该被保留
+    assert mock_storage.set.called
+    
+    # 获取最后一次保存的 context
+    _, data = mock_storage.set.call_args_list[-1][0]
+    saved_context = data["context"]
+    
+    assert saved_context["next_pointer"] is not None
+    assert saved_context["next_pointer"]["target_node"] == "B"

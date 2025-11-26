@@ -282,6 +282,7 @@ class StructureEngine:
         model_class: Type[T],
         strict: bool = True,
         auto_fix: bool = True,
+        max_text_length: int = 100000,  # 最大文本长度参数
     ) -> T:
         """
         从文本中提取 JSON 并解析为模型
@@ -292,6 +293,14 @@ class StructureEngine:
         3. 暴力括号匹配
         4. 清理并重试
         """
+        if len(text) > max_text_length:
+            logger.warning(
+                "Text too long for JSON extraction, truncating",
+                original_length=len(text),
+                max_length=max_text_length
+            )
+            text = text[:max_text_length]
+        
         text = text.strip()
         attempts = []
         
@@ -299,7 +308,7 @@ class StructureEngine:
         if not text or ('{' not in text and '[' not in text):
             raise StructureParseError(
                 "Content does not contain JSON-like structure (missing '{' or '[')",
-                raw_content=text
+                raw_content=text[:500] if text else ""  # 修复: 限制原始内容长度
             )
 
         # 策略 A: 直接解析 (最快)
@@ -349,7 +358,11 @@ class StructureEngine:
         )
     
     @staticmethod
-    def _extract_braced_json(text: str) -> List[str]:
+    def _extract_braced_json(
+        text: str,
+        max_text_length: int = 100000,  # 新增参数
+        max_candidates: int = 5  # 新增: 最大候选数
+        ) -> List[str]:
         """
         使用栈提取所有 {...} 块
         
@@ -357,9 +370,16 @@ class StructureEngine:
         - 返回所有可能的 JSON 对象，不仅仅是第一个
         - 按长度排序，优先尝试最长的
         """
+        if len(text) > max_text_length:
+            text = text[:max_text_length]
+
         candidates = []
         stack = []
         start = None
+
+        # 修复: 增加循环计数器防止极端情况
+        iteration_limit = min(len(text), max_text_length)
+        iterations = 0
         
         # 简单优化：只在看起来像 JSON 的区域搜索
         search_start = text.find('{')
@@ -376,8 +396,8 @@ class StructureEngine:
                 if not stack and start is not None:
                     candidates.append(text[start:idx + 1])
                     start = None
-                    # 限制最大候选数量，防止DoS
-                    if len(candidates) >= 5:
+                    # 修复: 使用参数化的最大候选数
+                    if len(candidates) >= max_candidates:
                         break
         
         # 按长度降序排序

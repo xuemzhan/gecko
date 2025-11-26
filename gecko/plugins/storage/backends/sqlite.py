@@ -31,6 +31,7 @@ from gecko.plugins.storage.mixins import (
     JSONSerializerMixin,
     ThreadOffloadMixin,
 )
+from gecko.plugins.storage.registry import register_storage
 from gecko.plugins.storage.utils import parse_storage_url
 
 logger = get_logger(__name__)
@@ -42,7 +43,7 @@ class SessionModel(SQLModel, table=True):
     session_id: str = Field(primary_key=True)
     state_json: str = Field(default="{}")
 
-
+@register_storage("sqlite")
 class SQLiteStorage(
     AbstractStorage,
     SessionInterface,

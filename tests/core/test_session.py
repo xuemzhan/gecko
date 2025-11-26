@@ -4,6 +4,7 @@ import pytest
 import asyncio
 import time
 from gecko.core.session import Session, SessionManager, SessionMetadata
+from gecko.plugins.storage.interfaces import SessionInterface
 
 
 class TestSessionMetadata:
@@ -296,3 +297,43 @@ async def test_session_save_consistency_snapshot():
         
     # 内存中的数据应该是新的
     assert session.get("counter") == 2
+
+@pytest.mark.asyncio
+async def test_auto_save_debounce():
+    """
+    [New] 测试自动保存防抖机制
+    """
+    mock_storage = MagicMock(spec=SessionInterface)
+    mock_storage.set = AsyncMock()
+    
+    # 设置较长的防抖时间以便测试
+    session = Session(
+        session_id="debounce_test", 
+        storage=mock_storage, 
+        auto_save=True, 
+        auto_save_debounce=0.05
+    )
+    
+    # 1. 快速连续触发多次修改
+    session.set("k1", "v1")
+    session.set("k2", "v2")
+    session.set("k3", "v3")
+    
+    # 此时 set 不应立即被调用（或者只调度了任务）
+    # 具体的调用次数取决于 event loop 的调度，但在防抖时间内不应完成多次
+    
+    # 2. 等待防抖时间结束
+    await asyncio.sleep(0.1)
+    
+    # 3. 验证 storage.set 只被调用了一次 (最后一次状态的保存)
+    # 注意：根据实现，可能首次没有防抖，或者防抖合并了后续调用。
+    # 这里的实现是 create_task(_debounced_save)，如果已有 task 则取消前一个。
+    # 所以理论上应该只有一次有效的 save 执行。
+    assert mock_storage.set.call_count == 1
+    
+    # 验证保存的是最终状态
+    call_args = mock_storage.set.call_args[0]
+    saved_data = call_args[1] # state dict is usually the 2nd arg or inside deserialization
+    # 注意：这里传递给 set 的是序列化后的数据，或者是 dict，取决于实现。
+    # Session.save 调用的是 storage.set(id, clean_data)
+    assert saved_data["state"]["k3"] == "v3"

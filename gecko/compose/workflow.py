@@ -409,6 +409,8 @@ class Workflow:
     async def resume(self, session_id: str) -> Any:
         """
         从存储中恢复执行
+        
+        修复: 延迟清除 next_pointer，确保首步执行成功后再清除
         """
         if not self.storage:
             raise ValueError("Cannot resume: Storage not configured")
@@ -431,8 +433,9 @@ class Workflow:
         
         # 3. 确定下一步
         next_node = None
+        # ✅ 修复: 使用标记位追踪是否从 next_pointer 恢复，而不是立即清除
+        resumed_from_pointer = False
 
-        # [优化] 优先检查是否存在动态跳转指针
         if context.next_pointer:
             logger.info("Resuming from dynamic Next pointer", target=context.next_pointer.get("target_node"))
             next_node = context.next_pointer.get("target_node")
@@ -441,17 +444,15 @@ class Workflow:
             if context.next_pointer.get("input"):
                 context.state["_next_input"] = context.next_pointer["input"]
             
-            # 消费指针 (已使用，清除以避免重复)
-            context.clear_next_pointer()
+            # ✅ 修复: 标记而不是立即清除，让 _execute_loop 在成功执行后清除
+            resumed_from_pointer = True
 
         elif last_node:
-            # 只有在没有动态指针时，才回退到基于静态图的推导
             next_node = await self._find_next_node(last_node, context)
             if not next_node:
                 logger.info("Workflow already completed (no next node)", session_id=session_id)
                 return context.get_last_output()
         else:
-            # 这是一个全新的会话（或者刚初始化未执行）
             next_node = self._entry_point
         
         # 4. 继续执行循环
@@ -460,7 +461,8 @@ class Workflow:
                 context, 
                 session_id, 
                 start_node=next_node, 
-                start_step=current_step
+                start_step=current_step,
+                clear_pointer_after_first_step=resumed_from_pointer  # ✅ 新增参数
             )
             
             # 最终保存
@@ -473,39 +475,39 @@ class Workflow:
             logger.exception("Resume execution failed")
             raise
 
-    async def _execute_loop(self, 
-                            context: WorkflowContext,  
-                            session_id: Optional[str], 
-                            start_node: Optional[str],
-                            start_step: int):
+    async def _execute_loop(
+        self, 
+        context: WorkflowContext,  
+        session_id: Optional[str], 
+        start_node: Optional[str],
+        start_step: int,
+        clear_pointer_after_first_step: bool = False  # ✅ 新增参数
+    ):
         """核心执行循环"""
         current_node = start_node
         steps = start_step
+        is_first_step = True  # ✅ 追踪是否为首步
 
         while current_node and steps < self.max_steps:
             steps += 1
 
-            # 1. 如果是从 next_pointer 恢复的（Resume 场景），跳过执行，直接流转
-            # 但这里逻辑比较绕，更清晰的是：如果 next_pointer 存在，说明上一步是 Next 指令，
-            # 且已经持久化了，我们应该直接使用 next_pointer 指向的节点作为 current_node。
-            # 这在 resume() 方法中处理更合适，这里保持循环逻辑。
-
             # 执行节点
             logger.debug("Executing step", step=steps, node=current_node)
-            # 执行节点逻辑
             result = await self._execute_node_safe(current_node, context)
 
+            # ✅ 修复: 首步成功后清除 pointer
+            if is_first_step and clear_pointer_after_first_step:
+                context.clear_next_pointer()
+                is_first_step = False
+
             # 准备持久化所需的临时变量
-            # 记录当前节点为“已完成节点”
             persist_node = current_node 
             next_target = None
 
             # 处理流转逻辑
             if isinstance(result, Next):
-                # === 动态跳转处理 ===
                 next_target = result.node
                 
-                # 更新 Input / State
                 if result.input is not None:
                     normalized = self._normalize_result(result.input)
                     context.history["last_output"] = normalized
@@ -514,50 +516,26 @@ class Workflow:
                 if result.update_state:
                     context.state.update(result.update_state)
                     
-                # [关键优化] 记录动态指针，确保持久化时包含此信息
                 context.next_pointer = {
                     "target_node": next_target,
                     "input": context.state.get("_next_input")
                 }
                 
-                # 即使是跳转，也需要在 history 中留痕，证明此节点已执行完毕
-                # 这里记录一个特殊的标识，方便调试
                 context.history[current_node] = f"<Next -> {next_target}>"
 
             else:
-                # === 静态流转处理 ===
                 normalized = self._normalize_result(result)
                 context.history[current_node] = normalized
                 context.history["last_output"] = normalized
                 
-                # 既然走了静态流程，确保清除之前的指针（防御性编程）
                 context.clear_next_pointer()
                 
-                # 基于静态图寻找下一跳
                 next_target = await self._find_next_node(current_node, context)
 
-            # [优化] 立即持久化 (Atomic Checkpoint)
-            # 此时 context 包含了最新的 history 和 next_pointer
-            # 即使下一秒 Crash，resume 时也能通过 next_pointer 找到 next_target
+            # 持久化
             if self.storage and session_id:
                 await self._persist_state(session_id, steps, persist_node, context)
 
-            # [新增] 关键修正：状态推进
-            # 一旦完成了持久化，next_pointer 的使命（防Crash）在当前步已完成。
-            # 进入下一步前，如果那是基于 next_pointer 的跳转，理论上应在内存中清除，
-            # 以免在 B 的 Pre-Commit 中还带着 "A->B" 的指针。
-            # 但是，如果我们在 B 执行前 Crash，Resume 时加载的是 A 执行后的状态（含指针），这是对的。
-            # 如果我们在 B 执行中 Crash，Resume 加载的是 B 的 Pre-Commit 状态。
-            # B 的 Pre-Commit 状态如果包含 "A->B" 指针，Resume 会再次尝试跳转到 B。
-            # 此时 last_node="B", next_pointer={"target":"B"}。
-            # Resume 逻辑：优先 next_pointer -> target="B"。结果一样。
-            
-            # 问题的根源是测试用例的查找逻辑太宽泛了。它只要找到包含 next_pointer 的记录就认为那是 A 的记录。
-            # 实际上 B 的 Pre-Commit 记录也包含了它。
-            
-            # 让我们在测试用例中更精确地定位。
-
-            # 推进到下一个节点
             current_node = next_target
 
         if steps >= self.max_steps:

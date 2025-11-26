@@ -33,16 +33,54 @@ class LiteLLMDriver(BaseChatModel):
         self._preload_tokenizer()
 
     def _preload_tokenizer(self):
-        """预加载 Tokenizer 到内存 (主要针对 OpenAI/Tiktoken 兼容模型)"""
+        """
+        预加载 Tokenizer 到内存
+        
+        修复: 改进模型匹配逻辑，支持更多模型类型
+        """
+        model_lower = self.config.model_name.lower()
+        
         try:
-            # 如果是 GPT 系列或兼容模型，预加载 tiktoken encoding
-            if any(k in self.config.model_name.lower() for k in ["gpt", "text-embedding", "claude"]):
-                # 注意：Claude 其实不完全用 cl100k_base，但这里仅作示例优化
-                # 生产环境可根据 model_name 映射不同的 encoding
-                self._tokenizer = tiktoken.encoding_for_model(self.config.model_name)
-        except Exception:
-            # 加载失败不报错，运行时降级处理
-            pass
+            import tiktoken
+            
+            # 修复: 更精确的模型匹配
+            if any(k in model_lower for k in ["gpt-4", "gpt-3.5", "gpt-4o"]):
+                # OpenAI GPT 系列 - 尝试精确匹配
+                try:
+                    self._tokenizer = tiktoken.encoding_for_model(self.config.model_name)
+                except KeyError:
+                    # 回退到 cl100k_base (GPT-4 默认)
+                    self._tokenizer = tiktoken.get_encoding("cl100k_base")
+                    
+            elif "text-embedding" in model_lower:
+                # OpenAI Embedding 模型
+                self._tokenizer = tiktoken.get_encoding("cl100k_base")
+                
+            elif any(k in model_lower for k in ["claude", "anthropic"]):
+                # 修复: Claude 使用近似编码
+                # 注意: 这不是精确的，但对于 token 计数足够用
+                self._tokenizer = tiktoken.get_encoding("cl100k_base")
+                logger.debug("Using cl100k_base as approximation for Claude")
+                
+            elif any(k in model_lower for k in ["llama", "mistral", "qwen", "yi"]):
+                # 修复: 开源模型使用通用编码
+                self._tokenizer = tiktoken.get_encoding("cl100k_base")
+                logger.debug(f"Using cl100k_base as approximation for {self.config.model_name}")
+                
+            elif any(k in model_lower for k in ["glm", "zhipu", "chatglm"]):
+                # 修复: 智谱模型
+                self._tokenizer = tiktoken.get_encoding("cl100k_base")
+                logger.debug("Using cl100k_base as approximation for GLM")
+                
+            else:
+                # 未知模型，尝试通用编码
+                logger.debug(f"Unknown model {self.config.model_name}, using cl100k_base")
+                self._tokenizer = tiktoken.get_encoding("cl100k_base")
+                
+        except ImportError:
+            logger.debug("tiktoken not available, token counting will use estimation")
+        except Exception as e:
+            logger.debug(f"Tokenizer preload failed: {e}")
 
     # [实现] 高性能、非阻塞的计数方法
     def count_tokens(self, text_or_messages: Union[str, List[Dict[str, Any]]]) -> int:

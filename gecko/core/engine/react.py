@@ -385,14 +385,15 @@ class ReActEngine(CognitiveEngine):
             tool_calls=last_msg.tool_calls or [],
         )
 
-    # [修改方法] 重构流式循环，使用 _process_turn_results
+    
     async def _run_streaming_loop(
         self, context: ExecutionContext, llm_params: Dict[str, Any]
     ) -> AsyncIterator[str]:
         """
         ReAct 流式循环 (递归模式)
+        
+        修复: 在检测到死循环或错误退出时，向用户输出提示信息
         """
-        # 循环控制：只要 turn 未达上限，且 should_continue 为 True，就一直循环
         while context.turn < self.max_turns:
             context.turn += 1
             
@@ -402,30 +403,23 @@ class ReActEngine(CognitiveEngine):
 
             messages_payload = [m.to_openai_format() for m in context.messages]
             
-            # 状态累积器 (每轮开始前重置)
             collected_content = []
             tool_calls_data: List[Dict[str, Any]] = []
 
-            # 1. 消费流 (Inner Loop: Streaming Consumer)
-            # 负责将 LLM 的 Token 实时透传给用户，并累积工具调用信息
             async for chunk in self.model.astream(messages=messages_payload, **llm_params): # type: ignore
                 delta = self._extract_delta(chunk)
 
-                # A. 文本内容：实时 Yield
                 content = delta.get("content")
                 if content:
                     collected_content.append(content)
                     yield content
 
-                # B. 工具调用：后台累积
                 if delta.get("tool_calls"):
                     self._accumulate_tool_chunks(tool_calls_data, delta["tool_calls"])
 
-            # 2. 组装完整消息 (Turn Completion)
             final_text = "".join(collected_content)
             assistant_msg = Message.assistant(content=final_text)
             
-            # 清洗并组装工具调用
             if tool_calls_data:
                 valid_calls = [
                     tc for tc in tool_calls_data 
@@ -434,20 +428,47 @@ class ReActEngine(CognitiveEngine):
                 if valid_calls:
                     assistant_msg.tool_calls = valid_calls
 
-            # 3. 处理回合逻辑 (Decision Making)
-            # 复用基类的 _process_turn_results 方法
-            # 返回 True 表示 "工具已执行完毕，状态已更新，请继续下一轮 LLM 推理"
-            # 返回 False 表示 "任务完成" 或 "检测到死循环/无需工具"，应退出循环
             should_continue = await self._process_turn_results(
                 context, assistant_msg, response_model=None
             )
 
-            # 如果不需要继续，跳出 while 循环，结束流式生成
             if not should_continue:
+                # ✅ 修复: 检查退出原因并通知用户
+                exit_reason = self._get_exit_reason(context, assistant_msg)
+                if exit_reason:
+                    yield f"\n\n[System: {exit_reason}]"
                 break
-            
-            # 如果 should_continue 为 True，while 循环会自动进入下一轮
-            # context.turn 增加，context.messages 已包含工具结果
+
+    def _get_exit_reason(self, context: ExecutionContext, last_message: Message) -> Optional[str]:
+        """
+        ✅ 新增: 确定流式循环退出的原因
+        """
+        # 检查是否因死循环退出
+        if last_message.tool_calls:
+            if context.last_tool_calls_hash is not None:
+                try:
+                    calls_dump = json.dumps(
+                        [
+                            {
+                                "name": tc["function"]["name"],
+                                "args": tc["function"]["arguments"],
+                            }
+                            for tc in last_message.tool_calls
+                        ],
+                        sort_keys=True,
+                    )
+                    current_hash = hash(calls_dump)
+                    if context.last_tool_calls_hash == current_hash:
+                        return "Execution stopped due to detected infinite tool loop."
+                except Exception:
+                    pass
+        
+        # 检查是否因连续错误退出
+        if context.consecutive_tool_error_count >= 3:
+            return "Execution stopped due to repeated tool errors."
+        
+        # 正常结束
+        return None
 
     # ===================== 辅助逻辑 =====================
     

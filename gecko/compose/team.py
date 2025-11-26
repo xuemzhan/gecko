@@ -105,11 +105,16 @@ class Team:
         )
 
         # 2. 初始化容器
-        # 使用 MemberResult 占位，初始状态设为失败，防止未执行的情况
+        # 注释: results[idx] 的写入是索引隔离的，每个 worker 只写自己的索引
+        # 这种模式在 Python 中是并发安全的，因为列表元素的赋值是原子操作
         results: List[Optional[MemberResult]] = [None] * member_count
         
         # 3. 准备并发控制
         semaphore = anyio.Semaphore(self.max_concurrent) if self.max_concurrent > 0 else None
+
+        # 修复: 追踪是否有任务失败（用于日志）
+        failed_indices: List[int] = []
+        failed_lock = anyio.Lock()  # 用于保护 failed_indices 的并发写入
 
         # 4. 定义 Worker
         async def _worker(idx: int, member: Any):
@@ -139,15 +144,30 @@ class Team:
                     error=str(e),
                     is_success=False
                 )
+                # 修复: 安全地记录失败索引
+                async with failed_lock:
+                    failed_indices.append(idx)
             finally:
                 if semaphore:
                     semaphore.release()
 
         # 5. 启动并发任务组
-        async with anyio.create_task_group() as tg:
-            for idx, member in enumerate(self.members):
-                tg.start_soon(_worker, idx, member)
-
+        # 注释: anyio.create_task_group 会等待所有任务完成
+        # 如果任何任务抛出未捕获的异常，会取消其他任务
+        # 但我们在 _worker 中已经捕获了所有异常，所以不会发生取消
+        try:
+            async with anyio.create_task_group() as tg:
+                for idx, member in enumerate(self.members):
+                    tg.start_soon(_worker, idx, member)
+        except ExceptionGroup as eg:
+            # 修复: Python 3.11+ 的 ExceptionGroup 处理
+            logger.error(
+                "Team execution encountered exceptions",
+                team=self.name,
+                exception_count=len(eg.exceptions)
+            )
+            # 异常已在 worker 中处理并记录到 results，这里只记录日志
+            
         # 6. 结果整理
         # 理论上 task_group 结束时所有 results 都已被赋值，这里做一次非空断言过滤
         final_results = [r for r in results if r is not None]
