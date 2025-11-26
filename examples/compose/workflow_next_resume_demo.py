@@ -16,7 +16,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"
 
 from gecko.compose.workflow import Workflow, WorkflowContext, CheckpointStrategy
 from gecko.compose.nodes import step, Next
-from gecko.plugins.storage.backends.sqlite import SQLiteStorage
+# [Fix] 使用 create_storage 替代直接实例化，验证 Bug #7 的注册装饰器修复
+from gecko.plugins.storage.factory import create_storage
 from gecko.core.logging import setup_logging
 from gecko.core.exceptions import WorkflowError
 
@@ -50,18 +51,20 @@ async def next_node(context: WorkflowContext):
     return f"Processed({inp})"
 
 async def main():
-    db_file = "next_resume.db"
+    # [Fix] 使用 explicit relative path (./) to avoid writing to root
+    db_file = "./next_resume.db"
     db_url = f"sqlite:///{db_file}"
     
     if os.path.exists(db_file):
         os.remove(db_file)
 
-    storage = SQLiteStorage(db_url)
-    await storage.initialize()
+    # [Verification] Bug #7: 如果 SQLiteStorage 没加 @register_storage，这里会报错
+    storage = await create_storage(db_url)
 
     wf = Workflow(
         name="NextResumeFlow", 
-        storage=storage,
+        storage=storage, # type: ignore
+        # [Key] 必须为 ALWAYS，确保 Next 指令产生时立即持久化，以便验证 Resume
         checkpoint_strategy=CheckpointStrategy.ALWAYS
     )
     
@@ -101,7 +104,13 @@ async def main():
 
     await storage.shutdown()
     if os.path.exists(db_file):
-        os.remove(db_file)
+        try:
+            os.remove(db_file)
+            if os.path.exists(db_file + ".lock"): os.remove(db_file + ".lock")
+            if os.path.exists(db_file + "-wal"): os.remove(db_file + "-wal")
+            if os.path.exists(db_file + "-shm"): os.remove(db_file + "-shm")
+        except:
+            pass
 
 if __name__ == "__main__":
     asyncio.run(main())

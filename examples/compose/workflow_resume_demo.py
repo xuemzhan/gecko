@@ -1,4 +1,4 @@
-# examples/workflow_resume_demo.py
+# examples/compose/workflow_resume_demo.py
 """
 Workflow 断点恢复示例 (Resumability Demo)
 
@@ -16,7 +16,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"
 
 from gecko.compose.workflow import Workflow, WorkflowContext, CheckpointStrategy
 from gecko.compose.nodes import step, Next
-from gecko.plugins.storage.backends.sqlite import SQLiteStorage
+# [Fix] Use create_storage factory
+from gecko.plugins.storage.factory import create_storage
 from gecko.core.logging import setup_logging
 # [Fix] Import WorkflowError
 from gecko.core.exceptions import WorkflowError
@@ -66,7 +67,8 @@ async def step_c(context: WorkflowContext):
 # ========================= 主流程 =========================
 
 async def main():
-    db_file = "resume_demo.db"
+    # [Fix] Use explicit relative path
+    db_file = "./resume_demo.db"
     db_url = f"sqlite:///{db_file}"
     
     # 清理旧数据确保 Demo 可重复
@@ -79,13 +81,13 @@ async def main():
     print(f"🔌 初始化存储: {db_url}")
     # 1. 初始化存储
     # 断点恢复必须依赖持久化存储
-    storage = SQLiteStorage(db_url)
-    await storage.initialize()
+    # [Fix] Use factory
+    storage = await create_storage(db_url)
 
     # 2. 定义工作流
     wf = Workflow(
         name="ResumableFlow", 
-        storage=storage,
+        storage=storage, # type: ignore
         # [Phase 3 Feature] 策略: ALWAYS (每步保存)，这是 Resume 的前提
         checkpoint_strategy=CheckpointStrategy.ALWAYS
     )
@@ -140,6 +142,7 @@ async def main():
         try:
             os.remove(db_file)
             # SQLite WAL 模式可能会产生额外文件
+            if os.path.exists(db_file + ".lock"): os.remove(db_file + ".lock")
             if os.path.exists(db_file + "-wal"): os.remove(db_file + "-wal")
             if os.path.exists(db_file + "-shm"): os.remove(db_file + "-shm")
         except:
