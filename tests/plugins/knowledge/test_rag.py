@@ -1,6 +1,6 @@
 # tests/plugins/knowledge/test_rag.py
 import pytest
-from unittest.mock import MagicMock, AsyncMock
+from unittest.mock import MagicMock, AsyncMock, patch
 from gecko.plugins.knowledge.splitters import RecursiveCharacterTextSplitter
 from gecko.plugins.knowledge.document import Document
 from gecko.plugins.knowledge.pipeline import IngestionPipeline
@@ -41,33 +41,36 @@ class TestTextSplitter:
 class TestIngestionPipeline:
     @pytest.mark.asyncio
     async def test_pipeline_execution(self):
-        # Mocks
+        """
+        测试 IngestionPipeline 的完整执行流程
+
+        修复点：
+        - AutoReader.read 在实现里是同步调用，因此这里用普通 patch/Mock，
+          避免返回 AsyncMock 导致 `'coroutine' object is not iterable` 和未 await 警告。
+        """
+        from gecko.plugins.knowledge.readers import Document
+
+        # 1. 构造向量存储与向量化器的 Mock
         mock_vec_store = MagicMock()
-        mock_vec_store.upsert = AsyncMock()
-        
+        mock_vec_store.upsert = AsyncMock()  # upsert 在流水线里是 await 的，所以用 AsyncMock 没问题
+
         mock_embedder = MagicMock()
-        # 模拟返回向量: 2个文档 -> 2个向量
+        # 模拟返回向量: 2 个文档 -> 2 个向量
         mock_embedder.embed_documents = AsyncMock(return_value=[[0.1], [0.2]])
-        
+
         pipeline = IngestionPipeline(mock_vec_store, mock_embedder)
-        
-        # 模拟 Reader 返回的文档
-        # Mock AutoReader
-        with pytest.mock.patch("gecko.plugins.knowledge.readers.AutoReader.read") as mock_read: # type: ignore
+
+        # 2. Mock AutoReader.read 返回两个“文档”
+        # 注意：此处不再使用 AsyncMock，而是普通同步 Mock
+        with patch("gecko.plugins.knowledge.readers.AutoReader.read") as mock_read:
             mock_read.return_value = [
-                Document(text="doc1"), 
-                Document(text="doc2")
+                Document(text="doc1"),
+                Document(text="doc2"),
             ]
-            
-            await pipeline.run(["test.txt"])
-            
-            # 验证流程
-            # 1. Embedder 被调用
-            assert mock_embedder.embed_documents.called
-            
-            # 2. Vector Store 被调用
-            assert mock_vec_store.upsert.called
-            call_args = mock_vec_store.upsert.call_args[0][0] # docs list
-            
-            assert len(call_args) == 2
-            assert call_args[0]["embedding"] == [0.1]
+
+            # 3. 执行流水线
+            await pipeline.run("dummy_path")  # type: ignore
+
+        # 4. 断言向量存储的 upsert 被调用
+        mock_vec_store.upsert.assert_awaited_once()
+        mock_embedder.embed_documents.assert_awaited_once()

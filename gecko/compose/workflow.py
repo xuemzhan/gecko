@@ -415,40 +415,90 @@ class Workflow:
     
     def _build_execution_layers(self, start_node: Optional[str]) -> List[Set[str]]:
         """
-        构建执行层级（基于拓扑排序）
-        
-        返回:
-            每个元素是一组可以并行执行的节点
+        构建执行层级（基于拓扑排序 + 显式依赖）
+
+        返回：
+            List[Set[str]]，每个元素是一组可以并行执行的节点（即同一层）
+        设计说明：
+            - 综合使用两类依赖信息：
+              1) 图边关系：add_edge(source, target)
+              2) 显式依赖：set_dependency(node, depends_on=[...])
+            - 限定在从 start_node 可达的子图中进行拓扑排序，
+              避免孤立节点干扰执行层级。
         """
         if not start_node:
             return []
-        
-        # 简化实现：使用 BFS 构建层级
+
+        # ========== 1. 收集所有节点 ==========
+        # self._nodes: 所有注册的节点
+        # self._edges: Dict[src, List[(tgt, condition)]]
+        all_nodes: Set[str] = set(self._nodes.keys())
+
+        # ========== 2. 构建依赖图 ==========
+        # deps[node] = {必须在 node 之前执行的节点集合}
+        deps: Dict[str, Set[str]] = {node: set() for node in all_nodes}
+
+        # 2.1 来自 set_dependency 的显式依赖
+        # 假设 self._node_dependencies: Dict[str, Set[str]]
+        for node, parents in self._node_dependencies.items():
+            # 仅保留在 all_nodes 中的依赖，防止错误配置
+            deps.setdefault(node, set()).update(
+                p for p in parents if p in all_nodes
+            )
+
+        # 2.2 来自边关系的隐式依赖：target 依赖 source
+        for src, targets in self._edges.items():
+            for tgt, _cond in targets:
+                if tgt in all_nodes and src in all_nodes:
+                    deps.setdefault(tgt, set()).add(src)
+
+        # ========== 3. 计算从 start_node 可达的子图 ==========
+        reachable: Set[str] = set()
+
+        def dfs(node: str):
+            if node in reachable:
+                return
+            reachable.add(node)
+            for tgt, _cond in self._edges.get(node, []):
+                if tgt in all_nodes:
+                    dfs(tgt)
+
+        dfs(start_node)
+
+        # 只保留可达子图的依赖
+        deps = {n: (parents & reachable) for n, parents in deps.items() if n in reachable}
+
+        # ========== 4. 分层拓扑排序 ==========
         layers: List[Set[str]] = []
         visited: Set[str] = set()
-        current_layer: Set[str] = {start_node}
-        
-        while current_layer:
+
+        while True:
+            # 当前层：所有 "尚未执行" 且 "其依赖全部在 visited 内" 的节点
+            current_layer = {
+                node
+                for node, parents in deps.items()
+                if node not in visited and parents.issubset(visited)
+            }
+
+            if not current_layer:
+                break
+
             layers.append(current_layer)
             visited.update(current_layer)
-            
-            next_layer: Set[str] = set()
-            for node in current_layer:
-                # 获取后继节点
-                for target, _ in self._edges.get(node, []):
-                    if target not in visited:
-                        # 检查是否在同一并行组
-                        group = self._get_parallel_group(target)
-                        if group:
-                            # 添加整个并行组
-                            next_layer.update(group - visited)
-                        else:
-                            next_layer.add(target)
-            
-            current_layer = next_layer
-        
+
+        # 保护性检查：若还有未 visited 的节点，说明存在环或配置错误
+        # 这里不直接抛错（避免影响整体执行），但会记录出来
+        remaining = reachable - visited
+        if remaining:
+            logger.error(
+                "Workflow topology build detected unresolved nodes (possible cycle or bad dependency)",
+                remaining_nodes=list(remaining),
+            )
+            # 可以视情况 raise WorkflowError
+
         return layers
-    
+
+
     # ==================== 增强的执行方法 ====================
     
     async def execute_parallel(
@@ -924,85 +974,105 @@ class Workflow:
     async def _run_any_node(self, node_callable: Callable, context: WorkflowContext) -> Any:
         """
         通用节点执行器 (Duck Typing & Smart Binding)
-        
+
         支持:
         1. Agent/Team (具备 run 方法的对象)
         2. 普通函数 (自动注入 context/input/none)
-        
-        修复：智能处理参数绑定，支持同时需要 Input 和 Context 的场景
+
+        修复点：
+        - Input 获取不再使用 `or`，避免 0/False/"" 被吞掉
+        - 与 `_run_intelligent_object` 的行为保持一致
         """
         # 1. 智能体对象 (Agent or Team)
-        if hasattr(node_callable, "run") and callable(node_callable.run): # type: ignore
+        if hasattr(node_callable, "run") and callable(node_callable.run):  # type: ignore
             return await self._run_intelligent_object(node_callable, context)
-        
+
         # 2. 普通可调用对象
         if callable(node_callable):
+            import inspect
+
             sig = inspect.signature(node_callable)
             params = sig.parameters
-            kwargs = {}
-            args = []
-            
-            # 获取当前输入数据
-            current_input = context.state.pop("_next_input", None) or context.get_last_output()
-            
+            kwargs: dict[str, Any] = {}
+            args: list[Any] = []
+
+            # ====== 修复：当前输入获取逻辑 ======
+            # 语义：
+            # - 若 state 中存在 _next_input（Next 显式传入），优先使用，并消费掉
+            # - 否则使用 context.get_last_output() 作为当前输入
+            if "_next_input" in context.state:
+                current_input = context.state.pop("_next_input")
+            else:
+                current_input = context.get_last_output()
+            # ====================================
+
             # A. 注入 Context
             if "context" in params:
                 kwargs["context"] = context
             elif "workflow_context" in params:
                 kwargs["workflow_context"] = context
-                
-            # B. 注入 Input (Input Injection)
-            # 找到除 context, self 之外的参数，通常是第一个位置参数或特定的参数名
-            # 这里采取简单策略：如果有剩余参数位置，则将 Input 作为第一个位置参数传入
-            
-            # 过滤掉已处理的 context 参数
+
+            # B. 注入 Input（Input Injection）
+            #    - 找到除 context/self 之外的参数；
+            #    - 若存在，则将 current_input 作为第一个位置参数传入
             remaining_params = [
-                name for name, p in params.items() 
+                name
+                for name, p in params.items()
                 if name not in ("context", "workflow_context", "self")
-                and p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
             ]
-            
+
             if remaining_params:
-                # 如果有剩余参数，假设第一个是用来接收 input 的
+                # 若还有“未绑定的参数”，认为第一个参数用来接收 input
                 args.append(current_input)
             elif not kwargs:
-                # 如果既不需要 Context 也没有其他参数（无参函数），直接调用
+                # 如果既不需要 Context 也没有其他参数（无参函数），直接调用即可
+                # 此时 current_input 将不会被使用
                 pass
-                
-            # 执行
+
+            # 执行节点函数，ensure_awaitable 负责兼容同步/异步函数
             return await ensure_awaitable(node_callable, *args, **kwargs)
-            
+
         raise WorkflowError(f"Node '{node_callable}' is not callable")
 
     async def _run_intelligent_object(self, obj: Any, context: WorkflowContext) -> Any:
         """
         执行 Agent/Team 对象
-        
-        优化: 智能处理数据流转 (Data Handover)
-        优化: [Refactored Phase 1] 移除数据流转的魔法清洗逻辑
+
+        优化:
+        - 智能处理数据流转 (Data Handover)
+        - [Refactored Phase 1] 移除数据流转的“魔法清洗”逻辑，
+          由上游节点/Agent 自己决定输入输出结构
         """
-        # 1. 获取输入 (优先使用 Next 传递的，否则用上一步输出)
-        raw_input = context.state.pop("_next_input", None) or context.get_last_output()
-        
-        # 2. 数据清洗 (Data Handover Fix)
-        ## 以前这里会尝试从 dict 中提取 content。
-        ## 现在我们假设 Agent.run 能够处理 raw_input (因为 Agent.run 支持 dict 输入)
-        ## 或者上一个节点的输出就是 Agent 期望的格式。
-        # 如果上一个节点返回的是 AgentOutput (dict)，且当前 Agent 需要文本输入，
-        # 我们尝试提取 content，避免将整个 JSON 结构扔给 LLM。
-        # agent_input = raw_input
-        # if isinstance(raw_input, dict):
-        #     # 如果有 content 且没有 role (说明不是 Message 对象，而是 Output 字典)
-        #     if "content" in raw_input and "role" not in raw_input:
-        #         agent_input = raw_input["content"]
-        
-        # 3. 执行
+
+        # 1. 获取输入（优先 Next 显式传入，其次为上一步输出）
+        #    修复点：使用显式 key 判断，避免 0/False/"" 等合法值被 or 吞掉
+        if "_next_input" in context.state:
+            raw_input = context.state.pop("_next_input")
+        else:
+            raw_input = context.get_last_output()
+
+        # 2. 数据清洗策略（保守版）
+        #    这里不再对 dict 进行 `content` 的自动抽取，
+        #    仅在非常明确的场景下才可以做轻量转换（目前阶段先完全尊重上游输出）。
+        #
+        #    如果未来需要恢复“AgentOutput → 文本”的自动映射，
+        #    建议：
+        #    - 在 Agent 层做 adapter；
+        #    - 或引入显式的转换器配置，而不是在 Workflow 层做隐式解析。
+        #
+        #    因此，这里直接把 raw_input 透传给 obj.run。
+
+        # 3. 执行智能体对象
         output = await obj.run(raw_input)
-        
+
         # 4. 结果处理
+        #    - 若对象实现了 Pydantic 的 model_dump，则统一转为 dict，便于存储/日志
+        #    - 否则保持原样返回，由上层 Workflow/调用者决定如何处理
         if hasattr(output, "model_dump"):
             return output.model_dump()
         return output
+
+    
 
     async def _execute_with_retry(self, func: Callable, context: WorkflowContext) -> Any:
         """重试逻辑"""

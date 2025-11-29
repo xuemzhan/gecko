@@ -127,3 +127,59 @@ async def test_member_result_value_property():
     fail_res = MemberResult(member_index=1, error="failed", is_success=False)
     with pytest.raises(RuntimeError, match="failed"):
         _ = fail_res.value
+
+# ========================= 4. _resolve_input 假值保留测试 =========================
+
+def test_team_resolve_input_preserves_next_input_falsey():
+    """
+    [修正版] 测试 Team._resolve_input 在存在 _next_input 时，能正确保留“假值” (0 / False 等)
+    """
+    from gecko.compose.team import Team
+
+    # 在测试内部定义一个简易的 WorkflowContext 模拟类
+    class MockContext:
+        def __init__(self, input_data, history=None, state=None):
+            self.input = input_data
+            self.history = history or {}
+            self.state = state or {}
+
+    team = Team(members=[lambda x: x], name="ResolveTest")
+
+    ctx = MockContext(
+        input_data="orig",
+        history={"last_output": 1},
+        state={"_next_input": 0},
+    )
+
+    resolved = team._resolve_input(ctx)
+    assert resolved == 0  # ✅ 确认 0 被正确保留
+
+
+
+def test_team_resolve_input_uses_last_output_even_if_false():
+    """
+    [新增] 测试 Team._resolve_input 在没有 _next_input 时，
+    会使用 history['last_output']，并且即使 last_output 为 False 也不会被误丢弃。
+
+    场景：
+    - state 中没有 _next_input
+    - history['last_output'] = False
+    - input = "orig"
+    期望：
+    - _resolve_input 返回 False，而不是回退到 input
+    """
+    from gecko.compose.team import Team
+
+    team = Team(members=[lambda x: x], name="ResolveTest")
+
+    class MockContext2:
+        def __init__(self):
+            self.input = "orig"
+            self.history = {"last_output": False}  # 假值
+            self.state = {}
+
+    ctx = MockContext2()
+    resolved = team._resolve_input(ctx)
+
+    # ✅ 断言：即使 last_output 是 False，也应被认为是“存在的有效值”
+    assert resolved is False

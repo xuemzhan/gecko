@@ -205,6 +205,60 @@ async def test_next_instruction(simple_workflow):
     assert res == "Received: jumped input"
 
 @pytest.mark.asyncio
+async def test_next_instruction_preserves_falsey_input_for_function(simple_workflow):
+    """
+    [新增] 测试 Next 在普通函数节点场景下能正确传递“假值”输入 (0 / False)
+
+    验证点：
+    - Start 节点返回 Next(node="End", input=0)
+    - End 节点签名为 def end(x): return x
+    期望：
+    - 最终 Workflow.execute 返回 0，而不是回退到 last_output 或 initial input
+    """
+    from gecko.compose.nodes import Next
+
+    def start():
+        # 显式将 0 作为下一节点的输入
+        return Next(node="End", input=0)
+
+    def end(value):
+        return value
+
+    simple_workflow.add_node("Start", start)
+    simple_workflow.add_node("End", end)
+
+    # 正常 DAG 边
+    simple_workflow.add_edge("Start", "End")
+    simple_workflow.set_entry_point("Start")
+
+    res = await simple_workflow.execute("init")
+    assert res == 0  # 确认 0 没有被当成“空”而丢失
+
+
+@pytest.mark.asyncio
+async def test_next_instruction_preserves_falsey_input_for_function_false(simple_workflow):
+    """
+    [新增] 再加一个 False 场景，测试布尔假值同样被正确传递
+    """
+    from gecko.compose.nodes import Next
+
+    def start():
+        return Next(node="End", input=False)
+
+    def end(value):
+        return value
+
+    simple_workflow.add_node("Start", start)
+    simple_workflow.add_node("End", end)
+
+    simple_workflow.add_edge("Start", "End")
+    simple_workflow.set_entry_point("Start")
+
+    res = await simple_workflow.execute("init")
+    assert res is False  # 保留 False，不回退
+
+
+@pytest.mark.asyncio
 async def test_runtime_ambiguity_error(simple_workflow):
     """测试运行时歧义：多个条件同时满足"""
     simple_workflow.add_node("Start", lambda: 10)
@@ -898,3 +952,84 @@ def test_validate_cycles_flag(simple_workflow):
     simple_workflow._validation_errors = []
     
     assert simple_workflow.validate() is True
+
+@pytest.mark.asyncio
+async def test_next_instruction_preserves_falsey_input_for_agent_node(simple_workflow):
+    """
+    [新增] 测试 Next 在 Agent/Team 节点场景下能正确传递“假值”输入。
+
+    目的：
+    - 覆盖 Workflow._run_intelligent_object 中的输入获取逻辑：
+      使用显式 "_next_input" in context.state 判断，而不是 or。
+    场景：
+      Start -> DummyAgentNode
+      Start 返回 Next(node="Agent", input=False)
+      DummyAgent.run(input) 原样返回 input
+    """
+    from gecko.compose.nodes import Next
+
+    class DummyAgent:
+        async def run(self, inp):
+            # 模拟一个简单 Agent，直接回显输入
+            return inp
+
+    agent = DummyAgent()
+
+    def start():
+        return Next(node="Agent", input=False)
+
+    simple_workflow.add_node("Start", start)
+    simple_workflow.add_node("Agent", agent)
+
+    simple_workflow.add_edge("Start", "Agent")
+    simple_workflow.set_entry_point("Start")
+
+    res = await simple_workflow.execute("init")
+    assert res is False  # ✅ 确认 False 也能在 Agent 场景下正确传递
+
+def test_build_execution_layers_with_explicit_dependencies(simple_workflow):
+    """
+    [新增] 测试 _build_execution_layers 使用显式依赖 (set_dependency) 构建正确的执行层级。
+
+    DAG 结构：
+        Start -> A
+        Start -> B
+        A -> Merge   (通过 add_edge)
+        Merge 依赖 B (通过 set_dependency)
+
+    期望层级关系：
+        - Start 在第 0 层
+        - A / B 在第 1 层（并行）
+        - Merge 在第 2 层（必须在 A、B 之后）
+    """
+    wf = simple_workflow
+
+    wf.add_node("Start", lambda: None)
+    wf.add_node("A", lambda: "A")
+    wf.add_node("B", lambda: "B")
+    wf.add_node("Merge", lambda: "M")
+
+    # 边关系：Start -> A, Start -> B, A -> Merge
+    wf.add_edge("Start", "A")
+    wf.add_edge("Start", "B")
+    wf.add_edge("A", "Merge")
+
+    # 显式声明 Merge 还依赖 B
+    wf.set_dependency("Merge", depends_on=["B"])
+
+    wf.set_entry_point("Start")
+
+    # 调用内部方法构建执行层级
+    layers = wf._build_execution_layers("Start")
+
+    # 将节点映射到所在层级索引，方便判断顺序
+    node_to_layer = {}
+    for idx, layer in enumerate(layers):
+        for node in layer:
+            node_to_layer[node] = idx
+
+    # 基本断言：三个层
+    assert node_to_layer["Start"] < node_to_layer["A"]
+    assert node_to_layer["Start"] < node_to_layer["B"]
+    assert node_to_layer["A"] < node_to_layer["Merge"]
+    assert node_to_layer["B"] < node_to_layer["Merge"]

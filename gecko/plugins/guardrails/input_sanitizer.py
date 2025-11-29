@@ -88,6 +88,7 @@ class InputSanitizer:
         (r"</?(s|b|i|u|code|pre)>", "html_tag"),
     ]
 
+    
     def __init__(
         self,
         enable_sanitization: bool = True,
@@ -97,37 +98,60 @@ class InputSanitizer:
     ):
         """
         初始化清洗器
-        
+
         参数:
             enable_sanitization: 是否启用清洗（False 则仅检测）
             log_detections: 是否记录检测结果
             block_high_risk: 是否阻止高危输入（抛出异常）
             custom_patterns: 自定义检测模式列表
+
+        自定义模式支持两种形式：
+        - (pattern, name)                   -> 默认视为 HIGH
+        - (pattern, name, ThreatLevel.xxx)  -> 使用指定威胁等级
         """
         self.enable_sanitization = enable_sanitization
         self.log_detections = log_detections
         self.block_high_risk = block_high_risk
-        
-        # 编译正则表达式
+
+        # 编译正则表达式（内置规则）
         self._high_patterns = [
-            (re.compile(p, re.IGNORECASE), name) 
+            (re.compile(p, re.IGNORECASE), name)
             for p, name in self.HIGH_RISK_PATTERNS
         ]
         self._medium_patterns = [
-            (re.compile(p, re.IGNORECASE), name) 
+            (re.compile(p, re.IGNORECASE), name)
             for p, name in self.MEDIUM_RISK_PATTERNS
         ]
         self._low_patterns = [
-            (re.compile(p, re.IGNORECASE), name) 
+            (re.compile(p, re.IGNORECASE), name)
             for p, name in self.LOW_RISK_PATTERNS
         ]
-        
+
+        # 自定义模式的等级映射：
+        # key: 模式名称 name, value: ThreatLevel
+        # 仅用于覆盖高危检测中的默认 HIGH 等级
+        self._custom_levels = {}
+
         # 添加自定义模式
         if custom_patterns:
-            self._high_patterns.extend([
-                (re.compile(p, re.IGNORECASE), name)
-                for p, name in custom_patterns
-            ])
+            for item in custom_patterns:
+                # 兼容两种形状：(pattern, name) / (pattern, name, level)
+                if len(item) == 2:
+                    pattern, name = item
+                    level = ThreatLevel.HIGH  # 未指定等级时默认 HIGH
+                elif len(item) == 3:
+                    pattern, name, level = item
+                else:
+                    raise ValueError(
+                        f"Invalid custom pattern tuple: {item!r}, "
+                        "expected (pattern, name) or (pattern, name, level)"
+                    )
+
+                compiled = re.compile(pattern, re.IGNORECASE)
+                # 统一归入高危模式集合，实际等级由 _custom_levels 控制
+                self._high_patterns.append((compiled, name))
+                self._custom_levels[name] = level
+
 
     @staticmethod
     def _max_level(current: ThreatLevel, new: ThreatLevel) -> ThreatLevel:
@@ -157,7 +181,9 @@ class InputSanitizer:
         for pattern, name in self._high_patterns:
             if pattern.search(text):
                 detected.append(f"high:{name}")
-                threat_level = self._max_level(threat_level, ThreatLevel.HIGH)
+                # 修复点：自定义模式使用自定义等级，内置模式默认 HIGH
+                level = self._custom_levels.get(name, ThreatLevel.HIGH)
+                threat_level = self._max_level(threat_level, level)
         
         # 中危检测
         if threat_level != ThreatLevel.HIGH:

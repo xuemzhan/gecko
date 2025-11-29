@@ -29,10 +29,11 @@ def main():
     
     cli()
 
+from gecko.version import __version__
 
 if CLICK_AVAILABLE:
     @click.group() # type: ignore
-    @click.version_option(version="0.2.0") # type: ignore
+    @click.version_option(version=__version__) # type: ignore
     def cli():
         """Gecko AI Agent Framework CLI"""
         pass

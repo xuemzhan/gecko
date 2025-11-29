@@ -196,31 +196,44 @@ class Team:
     def _resolve_input(self, context_or_input: Any) -> Any:
         """
         智能输入解析 (Refactored: Removed Magic Unpacking)
-        
+
         仅保留从 WorkflowContext 中提取数据的逻辑，移除针对 dict 内容的自动拆包。
+        关键修复：
+        - 不再使用 `or` 进行回退，避免 0/False 等合法业务值被当作“无效”丢弃
         """
-        # 1. 检查是否为 WorkflowContext (Duck Typing)
+        # 1. 检查是否为 WorkflowContext（基于简单 Duck Typing）
+        #    要求同时具有 history / input 属性，且 history 为 dict
         if (
-            hasattr(context_or_input, "history") 
+            hasattr(context_or_input, "history")
             and hasattr(context_or_input, "input")
             and isinstance(getattr(context_or_input, "history", None), dict)
         ):
             ctx = context_or_input
             history = getattr(ctx, "history", {})
             state = getattr(ctx, "state", {})
-            
-            # 优先级: 
-            # 1. 显式传递的 _next_input (Next 指令)
-            # 2. 上一步输出 (last_output)
-            # 3. 全局初始输入 (input)
-            val = state.pop("_next_input", None) or history.get("last_output", getattr(ctx, "input"))
-            
-            # [Removed] Data Handover 清洗逻辑
-            # 以前这里会检查 dict["content"]，现在移除，保持原始数据完整性
+
+            # 修复点：
+            #    使用显式的 key 检查逻辑，而不是 `or`
+            #    优先级：
+            #    1) 若 state 中显式带有 _next_input（Next 指令传入），无条件使用
+            #    2) 否则若 history 中存在 last_output key，则使用该值（即便是 0/False/""）
+            #    3) 否则回退到上下文的初始 input
+            if "_next_input" in state:
+                # 注意：这里消费掉 _next_input，确保只使用一次
+                val = state.pop("_next_input")
+            elif "last_output" in history:
+                val = history["last_output"]
+            else:
+                # 最后回退到 WorkflowContext.input
+                val = getattr(ctx, "input")
+
+            # [保留行为] 不再对 dict 进行 content 提取，保持“无魔法”原则，
+            # 上游节点应负责返回下游真正需要的数据结构。
             return val
-            
-        # 2. 普通输入直接返回
+
+        # 2. 非 WorkflowContext，直接视为普通输入按原样返回
         return context_or_input
+
 
     async def _execute_member(self, member: Any, inp: Any) -> Any:
         """执行单个成员"""
