@@ -104,16 +104,14 @@ def get_model_name(model: Any) -> str:
 
 def validate_model(model: Any) -> None:
     """
-    验证模型
-    
-    修复点：
-    调整错误消息格式，包含 "does not implement ModelProtocol" 以匹配测试正则。
+    验证模型是否满足 ModelProtocol 所需的方法/属性（鸭子类型检查）
+
+    不再依赖 isinstance(model, ModelProtocol)，而是基于 get_missing_methods，
+    这样自定义模型只要实现必要方法即可通过验证。
     """
-    if not isinstance(model, ModelProtocol):
-        missing = get_missing_methods(model, ModelProtocol)
-        # 之前的写法: raise TypeError(f"Model missing methods: {', '.join(missing)}")
-        # 修正后的写法:
+    missing = get_missing_methods(model, ModelProtocol)
+    if missing:
         raise TypeError(
-            f"Model does not implement ModelProtocol. "
-            f"Missing methods: {', '.join(missing) if missing else 'unknown'}"
+            "Model does not implement ModelProtocol. "
+            f"Missing methods: {', '.join(missing)}"
         )

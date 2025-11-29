@@ -2,8 +2,23 @@
 from __future__ import annotations
 import os
 from typing import List
-import litellm
 from gecko.plugins.knowledge.interfaces import EmbedderProtocol
+
+
+def _get_litellm():
+    """
+    惰性加载 litellm，避免导入 gecko.plugins.knowledge 时就强制依赖。
+
+    在真正调用 embedding 时再检查依赖是否存在。
+    """
+    try:
+        import litellm  # type: ignore
+        return litellm
+    except ImportError as e:
+        raise ImportError(
+            "OpenAIEmbedder / OllamaEmbedder requires 'litellm'. "
+            "Install with: pip install litellm"
+        ) from e
 
 class OpenAIEmbedder(EmbedderProtocol):
     """
@@ -20,6 +35,9 @@ class OpenAIEmbedder(EmbedderProtocol):
         return self._dimension
 
     async def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """批量文档嵌入（惰性加载 litellm）"""
+        litellm = _get_litellm()
+
         # 替换换行符以提升某些模型的表现
         texts = [t.replace("\n", " ") for t in texts]
         response = await litellm.aembedding(
@@ -30,6 +48,9 @@ class OpenAIEmbedder(EmbedderProtocol):
         return [r["embedding"] for r in response.data]
 
     async def embed_query(self, text: str) -> List[float]:
+        """单条查询嵌入（惰性加载 litellm）"""
+        litellm = _get_litellm()
+
         text = text.replace("\n", " ")
         response = await litellm.aembedding(
             model=self.model,

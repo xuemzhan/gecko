@@ -134,3 +134,51 @@ async def test_litellm_driver_count_tokens_strategies():
         # "hello" (5 chars) // 3 = 1
         count_fallback = driver_unknown.count_tokens("hello") 
         assert count_fallback > 0
+
+@pytest.mark.asyncio
+async def test_litellm_response_sanitization():
+    """[New] 测试 LiteLLM 响应清洗逻辑 (防止 Pydantic 崩溃)"""
+    from gecko.plugins.models.drivers.litellm_driver import LiteLLMDriver
+    from gecko.plugins.models.config import ModelConfig
+    
+    driver = LiteLLMDriver(ModelConfig(model_name="gpt-3.5"))
+    
+    # 1. 模拟一个损坏的 Pydantic 对象 (model_dump 报错)
+    class BrokenObj:
+        def model_dump(self, **kwargs):
+            raise ValueError("Dump failed")
+        
+        # 只有属性访问有效
+        id = "123"
+        object = "chat.completion"
+        created = 111
+        model = "gpt"
+        choices = []
+        usage = None
+        
+    cleaned = driver._sanitize_response(BrokenObj()) # type: ignore
+    
+    # 验证暴力提取生效
+    assert cleaned["id"] == "123"
+    assert cleaned["model"] == "gpt"
+    assert isinstance(cleaned["choices"], list)
+
+@pytest.mark.asyncio
+async def test_litellm_token_count_fallback():
+    """[New] 测试 Token 计数回退逻辑"""
+    from gecko.plugins.models.drivers.litellm_driver import LiteLLMDriver
+    from gecko.plugins.models.config import ModelConfig
+    
+    # 模拟 Tiktoken 不存在
+    with patch.dict("sys.modules", {"tiktoken": None}):
+        driver = LiteLLMDriver(ModelConfig(model_name="gpt-4"))
+        
+        # 确保 tokenizer 为 None
+        assert driver._tokenizer is None
+        
+        # 测试估算逻辑
+        text = "hello world"
+        count = driver.count_tokens(text)
+        
+        # "hello world" (11 chars) // 3 = 3
+        assert count == 3

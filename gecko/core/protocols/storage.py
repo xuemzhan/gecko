@@ -13,14 +13,11 @@ class StorageProtocol(Protocol):
 
 def validate_storage(storage: Any) -> None:
     """
-    验证存储
-    
-    修复点：
-    调整错误消息格式，包含 "does not implement StorageProtocol" 以匹配测试正则。
+    验证存储是否满足 StorageProtocol 所需的方法/属性（鸭子类型检查）
     """
-    if not isinstance(storage, StorageProtocol):
-        missing = get_missing_methods(storage, StorageProtocol)
+    missing = get_missing_methods(storage, StorageProtocol)
+    if missing:
         raise TypeError(
-            f"Storage does not implement StorageProtocol. "
-            f"Missing methods: {', '.join(missing) if missing else 'unknown'}"
+            "Storage does not implement StorageProtocol. "
+            f"Missing methods: {', '.join(missing)}"
         )

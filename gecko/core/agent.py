@@ -43,52 +43,73 @@ class Agent:
             **engine_kwargs
         )  
   
-    async def run(  
-        self,  
-        messages: str | Message | List[Message] | List[dict] | dict,  
-        response_model: Optional[Type[BaseModel]] = None  
-    ) -> AgentOutput | BaseModel:  
-        """  
-        单次推理入口：对多种输入格式统一转换为 Message 列表  
-        """  
-        input_msgs = self._normalize_messages(messages)  
-  
-        await self.event_bus.publish(  
-            AgentRunEvent(type="run_started", data={"input_count": len(input_msgs)})  
-        )  
-  
-        try:  
-            output = await self.engine.step(input_msgs, response_model=response_model)  
-            payload = self._serialize_output(output)  
-  
-            await self.event_bus.publish(  
-                AgentRunEvent(type="run_completed", data={"output": payload})  
-            )  
-            return output  
-  
-        except Exception as e:  
-            logger.exception("Agent run failed")  
-            await self.event_bus.publish(  
-                AgentRunEvent(type="run_error", error=str(e))  
-            )  
-            raise  
-  
-    async def stream(self, messages: str | Message | List[Message] | List[dict] | dict):  
-        """  
-        流式推理：共用同一套输入标准化逻辑  
-        """  
-        input_msgs = self._normalize_messages(messages)  
-  
-        await self.event_bus.publish(AgentRunEvent(type="stream_started"))  
-        try:  
+    # [FIX] 修复缩进，使其成为类方法而不是 __init__ 的内部函数
+    async def run(
+        self,
+        messages: str | Message | List[Message] | List[dict] | dict,
+        response_model: Optional[Type[BaseModel]] = None
+    ) -> AgentOutput | BaseModel:
+        """
+        单次推理入口：对多种输入格式统一转换为 Message 列表
+        """
+        input_msgs = self._normalize_messages(messages)
+
+        # 新增：拼接用户可读文本，供 Guardrails / 日志使用
+        raw_text = "\n".join(m.get_text_content() for m in input_msgs)
+
+        await self.event_bus.publish(
+            AgentRunEvent(
+                type="run_started",
+                data={
+                    "input": raw_text,
+                    "input_count": len(input_msgs),
+                },
+            )
+        )
+
+        try:
+            output = await self.engine.step(input_msgs, response_model=response_model)
+            payload = self._serialize_output(output)
+
+            await self.event_bus.publish(
+                AgentRunEvent(type="run_completed", data={"output": payload})
+            )
+            return output
+
+        except Exception as e:
+            logger.exception("Agent run failed")
+            await self.event_bus.publish(
+                AgentRunEvent(type="run_error", error=str(e))
+            )
+            raise
+
+    # [FIX] 修复缩进
+    async def stream(self, messages: str | Message | List[Message] | List[dict] | dict):
+        """
+        流式推理：共用同一套输入标准化逻辑
+        """
+        input_msgs = self._normalize_messages(messages)
+
+        raw_text = "\n".join(m.get_text_content() for m in input_msgs)
+
+        await self.event_bus.publish(
+            AgentRunEvent(
+                type="stream_started",
+                data={
+                    "input": raw_text,
+                    "input_count": len(input_msgs),
+                },
+            )
+        )
+        try:
             async for chunk in self.engine.step_stream(input_msgs):   # type: ignore
-                yield chunk  
-            await self.event_bus.publish(AgentRunEvent(type="stream_completed"))  
-        except Exception as e:  
-            logger.exception("Agent stream failed")  
-            await self.event_bus.publish(AgentRunEvent(type="stream_error", error=str(e)))  
-            raise  
-  
+                yield chunk
+            await self.event_bus.publish(AgentRunEvent(type="stream_completed"))
+        except Exception as e:
+            logger.exception("Agent stream failed")
+            await self.event_bus.publish(AgentRunEvent(type="stream_error", error=str(e)))
+            raise
+
     # ---------------- 辅助方法 ----------------  
     def _normalize_messages(  
         self,  

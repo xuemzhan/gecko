@@ -49,13 +49,13 @@ class CalculatorTool(BaseTool):
         仅允许特定的节点类型和函数。
         """
         # 支持的操作符
+        # 支持的操作符（仅数学相关，显式禁用位运算等）
         operators = {
             ast.Add: operator.add,
             ast.Sub: operator.sub,
             ast.Mult: operator.mul,
             ast.Div: operator.truediv,
             ast.Pow: operator.pow,
-            ast.BitXor: operator.xor,
             ast.USub: operator.neg,
         }
 

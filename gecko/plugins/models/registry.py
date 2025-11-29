@@ -32,3 +32,7 @@ def register_driver(name: str) -> Callable[[T], T]:
 def get_driver_class(name: str) -> Optional[Type[BaseChatModel]]:
     """获取驱动类"""
     return _DRIVER_REGISTRY.get(name)
+
+def list_drivers() -> list[str]:
+    """获取已注册的驱动名称列表"""
+    return list(_DRIVER_REGISTRY.keys())

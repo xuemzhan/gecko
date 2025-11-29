@@ -34,7 +34,7 @@ from gecko.core.logging import get_logger
 from gecko.core.memory import TokenMemory
 from gecko.core.message import Message
 from gecko.core.output import AgentOutput
-from gecko.core.protocols import ModelProtocol, supports_streaming
+from gecko.core.protocols import ModelProtocol, supports_streaming, validate_model
 from gecko.core.toolbox import ToolBox
 
 logger = get_logger(__name__)
@@ -147,13 +147,11 @@ class CognitiveEngine(ABC):
         异常:
             TypeError: model 不符合 ModelProtocol
         """
-        # 验证模型
-        if not isinstance(model, ModelProtocol):
-            raise TypeError(
-                f"model 必须实现 ModelProtocol，收到类型: {type(model).__name__}"
-            )
-        
+        # 验证模型（鸭子类型检查）
+        # 如果缺少必要方法，会由 validate_model 抛出带有 Missing methods 提示的 TypeError
+        validate_model(model)
         self.model = model
+        
         self.toolbox = toolbox
         self.event_bus = event_bus
         self.memory = memory

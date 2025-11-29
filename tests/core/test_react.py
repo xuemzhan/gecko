@@ -670,3 +670,61 @@ async def test_step_stream_infinite_loop_notification(engine, mock_model, mock_t
     # 验证输出中包含系统注入的警告
     assert "[System: Execution stopped" in full_text
     assert "infinite tool loop" in full_text
+
+@pytest.mark.asyncio
+async def test_stream_recursion_and_exit_reason(engine, mock_model, mock_toolbox):
+    """
+    [New] 测试流式递归循环和退出原因反馈
+    模拟场景：模型不断调用同一工具，触发死循环保护
+    """
+    # 1. 构造一个总是返回相同 Tool Call 的流式响应
+    tool_chunk = MagicMock()
+    tool_chunk.choices = [{
+        "delta": {
+            "tool_calls": [{
+                "index": 0, 
+                "function": {"name": "t1", "arguments": '{"a": 1}'}
+            }]
+        }
+    }]
+    
+    # 模拟 astream 每次被调用都返回这个 chunk
+    async def infinite_stream(*args, **kwargs):
+        yield tool_chunk
+        
+    mock_model.astream.side_effect = infinite_stream
+    mock_toolbox.execute_many.return_value = [ToolExecutionResult("t1", "id", "result", False)]
+    
+    engine.max_turns = 3
+    
+    chunks = []
+    async for token in engine.step_stream([Message.user("Start")]):
+        chunks.append(token)
+    
+    full_output = "".join(chunks)
+    
+    # 验证系统注入了退出原因
+    assert "System: Execution stopped" in full_output
+    assert "infinite tool loop" in full_output
+
+@pytest.mark.asyncio
+async def test_observation_truncation_logic(engine):
+    """[New] 测试观测值截断逻辑 (v0.2.1)"""
+    engine.max_observation_length = 50
+    
+    # 模拟超长输出
+    long_output = "A" * 100
+    tool_calls = [{"name": "t1", "id": "1", "arguments": {}}]
+    
+    # Mock toolbox return
+    engine.toolbox.execute_many = AsyncMock(return_value=[
+        ToolExecutionResult("t1", "1", long_output, False)
+    ])
+    
+    ctx = ExecutionContext([])
+    await engine._execute_tool_calls(tool_calls, ctx)
+    
+    # 检查上下文中的消息
+    tool_msg = ctx.messages[-1]
+    assert len(tool_msg.content) < 100
+    assert "truncated" in tool_msg.content

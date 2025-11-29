@@ -249,6 +249,65 @@ class TestSessionManager:
         # 验证清理任务已取消
         if manager._cleanup_task:
             assert manager._cleanup_task.cancelled() or manager._cleanup_task.done()
+    
+    @pytest.mark.asyncio
+    async def test_session_migration(self):
+        """[New] 测试会话存储迁移"""
+        source_storage = AsyncMock()
+        target_storage = AsyncMock()
+        
+        manager = SessionManager(storage=source_storage)
+        
+        # 模拟源数据
+        session_data = {
+            "state": {"k": "v"},
+            "metadata": SessionMetadata(session_id="mig_1").model_dump()
+        }
+        
+        # Mock get_session 行为 (需要模拟 Session 对象的加载过程)
+        # 这里直接操作 manager 内部逻辑比较复杂，我们 mock manager.get_session
+        
+        mock_session = MagicMock()
+        mock_session.to_dict.return_value = session_data
+        manager.get_session = AsyncMock(return_value=mock_session) # type: ignore
+        manager.destroy_session = AsyncMock() # type: ignore
+        
+        # 执行迁移
+        success = await manager.migrate_session(
+            "mig_1", 
+            target_storage, 
+            delete_source=True
+        )
+        
+        assert success is True
+        # 验证写入目标
+        target_storage.set.assert_called_with("mig_1", session_data)
+        # 验证删除源
+        manager.destroy_session.assert_called_with("mig_1")
+
+    @pytest.mark.asyncio
+    async def test_import_sessions(self):
+        """[New] 测试批量导入"""
+        # [FIX] 配置 Mock 对象的返回值，防止返回新的 AsyncMock 导致类型错误
+        mock_storage = AsyncMock()
+        mock_storage.get.return_value = None # 模拟 session 不存在，需要创建
+        
+        manager = SessionManager(storage=mock_storage)
+        
+        data = [
+            {"metadata": {"session_id": "s1"}, "state": {"a": 1}},
+            {"metadata": {"session_id": "s2"}, "state": {"b": 2}},
+            {"state": {"c": 3}} # 无效数据 (缺 session_id)
+        ]
+        
+        count = await manager.import_sessions(data)
+        
+        # [FIX] 增加一些断言以消耗 mock 调用，避免 unawaited warning
+        assert mock_storage.set.call_count >= 2
+        
+        assert count == 2
+        assert "s1" in manager._sessions
+        assert "s2" in manager._sessions
 
 @pytest.mark.asyncio
 async def test_session_save_consistency_snapshot():

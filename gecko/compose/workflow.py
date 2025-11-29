@@ -31,6 +31,7 @@ import inspect
 import time
 import uuid
 # 明确导入 run_sync，避免模块/函数混淆
+import anyio
 from anyio.to_thread import run_sync
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar, Union, Set
@@ -99,7 +100,7 @@ class WorkflowContext(BaseModel):
     )
     input: Any = Field(..., description="工作流初始输入")
     state: Dict[str, Any] = Field(
-        default_factory=dict, 
+        default_factory=dict,  # type: ignore
         description="共享状态存储（用户自定义）"
     )
     history: Dict[str, Any] = Field(
@@ -176,9 +177,12 @@ class WorkflowContext(BaseModel):
 
 # [New] 持久化策略枚举
 class CheckpointStrategy(str, Enum):
-    ALWAYS = "always"  # 每步保存 (默认, 最安全)
-    FINAL = "final"    # 仅在结束时保存 (性能最好)
-    MANUAL = "manual"  # 不自动保存 (需用户手动处理)
+    # 每个节点都会先写一遍 Pre-Commit 快照，ALWAYS 还会在循环尾再次写入
+    ALWAYS = "always"  # 每步 Pre-Commit + 循环末尾均保存 (默认, 最安全)
+    # FINAL: 每步仍有 Pre-Commit 快照，但仅在 Workflow 结束时额外写一次最终状态
+    FINAL = "final"    # 每步 Pre-Commit 保存，结束时再保存一次 (折中方案)
+    # MANUAL: 仅保留 Pre-Commit 快照，不在循环末尾/结束处做额外自动保存
+    MANUAL = "manual"  # 仅 Pre-Commit 快照，不在循环尾/结束时自动保存
 
 # ========================= 工作流引擎 =========================
 
@@ -197,6 +201,7 @@ class Workflow:
         max_retries: int = 3,
         allow_cycles: bool = False, # [New] 允许循环
         checkpoint_strategy: Union[str, CheckpointStrategy] = CheckpointStrategy.ALWAYS, # [New]
+        enable_parallel: bool = False,  # 新增：启用并行执行
     ):
         self.name = name
         self.event_bus = event_bus or EventBus()
@@ -206,6 +211,7 @@ class Workflow:
         self.max_retries = max_retries
         self.allow_cycles = allow_cycles 
         self.checkpoint_strategy = CheckpointStrategy(checkpoint_strategy)
+        self.enable_parallel = enable_parallel
 
         # 内部存储
         self._nodes: Dict[str, Callable] = {}
@@ -216,6 +222,284 @@ class Workflow:
         # 验证状态
         self._validated = False
         self._validation_errors: List[str] = []
+
+        # 并行组定义
+        self._parallel_groups: List[Set[str]] = []
+        
+        # 节点依赖关系（用于拓扑排序）
+        self._node_dependencies: Dict[str, Set[str]] = {}
+
+    # ==================== 并行构建 API ====================
+    
+    def add_parallel_group(self, *node_names: str) -> "Workflow":
+        """
+        定义一组可并行执行的节点
+        
+        参数:
+            *node_names: 节点名称列表
+            
+        示例:
+            workflow.add_parallel_group("fetch_a", "fetch_b", "fetch_c")
+        """
+        # 验证节点存在
+        for name in node_names:
+            if name not in self._nodes:
+                raise ValueError(f"Node '{name}' not found")
+        
+        self._parallel_groups.append(set(node_names))
+        self._validated = False
+        
+        logger.debug(
+            "Parallel group added",
+            nodes=list(node_names),
+            group_index=len(self._parallel_groups) - 1
+        )
+        return self
+    
+    def set_dependency(self, node: str, depends_on: Union[str, List[str]]) -> "Workflow":
+        """
+        显式声明节点依赖
+        
+        参数:
+            node: 节点名称
+            depends_on: 依赖的节点（单个或列表）
+            
+        示例:
+            workflow.set_dependency("merge", depends_on=["fetch_a", "fetch_b"])
+        """
+        if node not in self._nodes:
+            raise ValueError(f"Node '{node}' not found")
+        
+        deps = [depends_on] if isinstance(depends_on, str) else depends_on
+        
+        for dep in deps:
+            if dep not in self._nodes:
+                raise ValueError(f"Dependency node '{dep}' not found")
+        
+        self._node_dependencies.setdefault(node, set()).update(deps)
+        self._validated = False
+        return self
+    
+    # ==================== 并行执行逻辑 ====================
+    
+    def _get_parallel_group(self, node: str) -> Optional[Set[str]]:
+        """获取节点所属的并行组"""
+        for group in self._parallel_groups:
+            if node in group:
+                return group
+        return None
+    
+    async def _execute_parallel_group(
+        self,
+        nodes: Set[str],
+        context: WorkflowContext,
+        session_id: Optional[str]
+    ) -> Dict[str, Any]:
+        """
+        并行执行一组节点
+        
+        返回:
+            节点名称到执行结果的映射
+        """
+        results: Dict[str, Any] = {}
+        errors: Dict[str, Exception] = {}
+        
+        async def _run_node(node_name: str):
+            try:
+                result = await self._execute_node_safe(node_name, context)
+                results[node_name] = result
+            except Exception as e:
+                errors[node_name] = e
+                results[node_name] = None
+        
+        # 并发执行所有节点
+        async with anyio.create_task_group() as tg:
+            for node_name in nodes:
+                tg.start_soon(_run_node, node_name)
+        
+        # 处理错误
+        if errors:
+            error_summary = ", ".join(f"{k}: {v}" for k, v in errors.items())
+            logger.error(
+                "Parallel execution had failures",
+                failed_nodes=list(errors.keys()),
+                errors=error_summary
+            )
+            # 可以选择抛出异常或继续
+            if len(errors) == len(nodes):
+                raise WorkflowError(f"All parallel nodes failed: {error_summary}")
+        
+        return results
+    
+    async def _execute_loop_parallel(
+        self,
+        context: WorkflowContext,
+        session_id: Optional[str],
+        start_node: Optional[str],
+        start_step: int
+    ):
+        """
+        支持并行的执行循环
+        
+        使用拓扑排序确定执行顺序，同一层级的节点并行执行
+        """
+        if not self.enable_parallel:
+            # 回退到串行执行
+            await self._execute_loop(context, session_id, start_node, start_step)
+            return
+        
+        # 构建执行计划
+        execution_layers = self._build_execution_layers(start_node)
+        steps = start_step
+        
+        for layer_idx, layer_nodes in enumerate(execution_layers):
+            if steps >= self.max_steps:
+                raise WorkflowError(f"Exceeded max steps: {self.max_steps}")
+            
+            logger.debug(
+                "Executing layer",
+                layer=layer_idx,
+                nodes=list(layer_nodes),
+                step=steps
+            )
+            
+            if len(layer_nodes) == 1:
+                # 单节点，串行执行
+                node_name = list(layer_nodes)[0]
+                result = await self._execute_node_safe(node_name, context)
+                
+                # 处理结果
+                if isinstance(result, Next):
+                    # Next 指令打断并行执行
+                    normalized = self._normalize_result(result.input) if result.input else None
+                    if normalized:
+                        context.history["last_output"] = normalized
+                        context.state["_next_input"] = normalized
+                    context.next_pointer = {"target_node": result.node, "input": normalized}
+                    
+                    # 递归执行目标节点
+                    await self._execute_loop(context, session_id, result.node, steps + 1)
+                    return
+                else:
+                    normalized = self._normalize_result(result)
+                    context.history[node_name] = normalized
+                    context.history["last_output"] = normalized
+            else:
+                # 多节点，并行执行
+                results = await self._execute_parallel_group(layer_nodes, context, session_id)
+                
+                # 合并结果到 history
+                for node_name, result in results.items():
+                    if result is not None:
+                        normalized = self._normalize_result(result)
+                        context.history[node_name] = normalized
+                
+                # 设置 last_output（使用合并后的结果）
+                combined_output = {
+                    node: context.history.get(node)
+                    for node in layer_nodes
+                    if node in context.history
+                }
+                context.history["last_output"] = combined_output
+            
+            steps += 1
+            
+            # 持久化
+            if self.storage and session_id:
+                await self._persist_state(
+                    session_id, 
+                    steps, 
+                    f"parallel_layer_{layer_idx}",
+                    context
+                )
+    
+    def _build_execution_layers(self, start_node: Optional[str]) -> List[Set[str]]:
+        """
+        构建执行层级（基于拓扑排序）
+        
+        返回:
+            每个元素是一组可以并行执行的节点
+        """
+        if not start_node:
+            return []
+        
+        # 简化实现：使用 BFS 构建层级
+        layers: List[Set[str]] = []
+        visited: Set[str] = set()
+        current_layer: Set[str] = {start_node}
+        
+        while current_layer:
+            layers.append(current_layer)
+            visited.update(current_layer)
+            
+            next_layer: Set[str] = set()
+            for node in current_layer:
+                # 获取后继节点
+                for target, _ in self._edges.get(node, []):
+                    if target not in visited:
+                        # 检查是否在同一并行组
+                        group = self._get_parallel_group(target)
+                        if group:
+                            # 添加整个并行组
+                            next_layer.update(group - visited)
+                        else:
+                            next_layer.add(target)
+            
+            current_layer = next_layer
+        
+        return layers
+    
+    # ==================== 增强的执行方法 ====================
+    
+    async def execute_parallel(
+        self,
+        input_data: Any,
+        session_id: Optional[str] = None
+    ) -> Any:
+        """
+        支持并行的执行入口
+        """
+        if not self.validate():
+            raise WorkflowError(
+                f"Workflow validation failed:\n" + "\n".join(self._validation_errors)
+            )
+        
+        context = WorkflowContext(input=input_data)
+        if session_id:
+            context.metadata["session_id"] = session_id
+        
+        await self.event_bus.publish(
+            WorkflowEvent(
+                type="workflow_started",
+                data={"name": self.name, "execution_id": context.execution_id, "parallel": True}
+            )
+        )
+        
+        try:
+            await self._execute_loop_parallel(
+                context, 
+                session_id, 
+                start_node=self._entry_point,
+                start_step=0
+            )
+            
+            result = context.get_last_output()
+            
+            await self.event_bus.publish(
+                WorkflowEvent(
+                    type="workflow_completed",
+                    data={"name": self.name, "summary": context.get_summary()}
+                )
+            )
+            
+            return result
+            
+        except Exception as e:
+            logger.exception("Parallel workflow execution failed")
+            await self.event_bus.publish(
+                WorkflowEvent(type="workflow_error", error=str(e), data={"name": self.name})
+            )
+            raise
 
     # ========================= 构建 API =========================
 
@@ -282,12 +566,15 @@ class Workflow:
             self._validation_errors.append(f"Entry point '{self._entry_point}' not in nodes")
 
         # 2. 检查歧义分支 (同一节点存在多个无条件出边)
-        for node, edges in self._edges.items():
-            unconditional_edges = [t for t, c in edges if c is None]
-            if len(unconditional_edges) > 1:
-                self._validation_errors.append(
-                    f"Node '{node}' has ambiguous edges: multiple unconditional targets {unconditional_edges}"
-                )
+        # [FIX] 修改：仅在非并行模式下视为错误。并行模式下允许 Fan-out。
+        if not self.enable_parallel:
+            for node, edges in self._edges.items():
+                unconditional_edges = [t for t, c in edges if c is None]
+                if len(unconditional_edges) > 1:
+                    self._validation_errors.append(
+                        f"Node '{node}' has ambiguous edges: multiple unconditional targets {unconditional_edges}. "
+                        "Ambiguous branching is only allowed when enable_parallel=True."
+                    )
 
         # 3. 检查死循环 (静态检测)
         # [Updated] 仅在不允许循环时检测环

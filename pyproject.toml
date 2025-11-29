@@ -1,6 +1,6 @@
 [project]
 name = "gecko-ai"
-version = "0.2.0"
+version = "0.3.0"
 description = "Next-gen modular AI Agent framework — Less is More, Plugin First"
 authors = [{ name = "Your Name", email = "zxm0813@gmail.com" }]
 readme = "README.md"
@@ -33,6 +33,9 @@ dependencies = [
     "structlog>=25.5.0",
     "pydantic-settings>=2.12.0",
     "nest-asyncio>=1.6.0",
+    "opentelemetry-api>=1.38.0",
+    "opentelemetry-sdk>=1.38.0",
+    "opentelemetry-distro[otlp]>=0.59b0",
 ]
 
 [project.optional-dependencies]

@@ -80,6 +80,7 @@ google-auth==2.43.0
     # via kubernetes
 googleapis-common-protos==1.72.0
     # via opentelemetry-exporter-otlp-proto-grpc
+    # via opentelemetry-exporter-otlp-proto-http
 greenlet==3.2.4
     # via sqlalchemy
 grpcio==1.76.0
@@ -187,20 +188,38 @@ openai==2.8.1
 opentelemetry-api==1.38.0
     # via chromadb
     # via gecko-ai
+    # via opentelemetry-distro
     # via opentelemetry-exporter-otlp-proto-grpc
+    # via opentelemetry-exporter-otlp-proto-http
+    # via opentelemetry-instrumentation
     # via opentelemetry-sdk
     # via opentelemetry-semantic-conventions
+opentelemetry-distro==0.59b0
+    # via gecko-ai
+opentelemetry-exporter-otlp==1.38.0
+    # via opentelemetry-distro
 opentelemetry-exporter-otlp-proto-common==1.38.0
     # via opentelemetry-exporter-otlp-proto-grpc
+    # via opentelemetry-exporter-otlp-proto-http
 opentelemetry-exporter-otlp-proto-grpc==1.38.0
     # via chromadb
+    # via opentelemetry-exporter-otlp
+opentelemetry-exporter-otlp-proto-http==1.38.0
+    # via opentelemetry-exporter-otlp
+opentelemetry-instrumentation==0.59b0
+    # via opentelemetry-distro
 opentelemetry-proto==1.38.0
     # via opentelemetry-exporter-otlp-proto-common
     # via opentelemetry-exporter-otlp-proto-grpc
+    # via opentelemetry-exporter-otlp-proto-http
 opentelemetry-sdk==1.38.0
     # via chromadb
+    # via gecko-ai
+    # via opentelemetry-distro
     # via opentelemetry-exporter-otlp-proto-grpc
+    # via opentelemetry-exporter-otlp-proto-http
 opentelemetry-semantic-conventions==0.59b0
+    # via opentelemetry-instrumentation
     # via opentelemetry-sdk
 orjson==3.11.4
     # via chromadb
@@ -213,6 +232,7 @@ packaging==25.0
     # via huggingface-hub
     # via lancedb
     # via onnxruntime
+    # via opentelemetry-instrumentation
     # via pytest
 pandas==2.3.3
     # via pymilvus
@@ -312,6 +332,7 @@ regex==2025.11.3
     # via tiktoken
 requests==2.32.5
     # via kubernetes
+    # via opentelemetry-exporter-otlp-proto-http
     # via posthog
     # via requests-oauthlib
     # via tiktoken
@@ -379,6 +400,7 @@ typing-extensions==4.15.0
     # via openai
     # via opentelemetry-api
     # via opentelemetry-exporter-otlp-proto-grpc
+    # via opentelemetry-exporter-otlp-proto-http
     # via opentelemetry-sdk
     # via opentelemetry-semantic-conventions
     # via pydantic
@@ -409,6 +431,8 @@ websocket-client==1.9.0
     # via kubernetes
 websockets==15.0.1
     # via uvicorn
+wrapt==1.17.3
+    # via opentelemetry-instrumentation
 yarl==1.22.0
     # via aiohttp
 zipp==3.23.0

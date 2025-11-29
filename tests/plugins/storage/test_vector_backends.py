@@ -136,3 +136,52 @@ async def test_lance_exceptions(lance_store):
     
     with pytest.raises(StorageError, match="LanceDB search failed"):
         await lance_store.search([0.1, 0.1])
+
+@pytest.mark.skipif(not CHROMA_AVAILABLE, reason="chromadb missing")
+@pytest.mark.asyncio
+async def test_chroma_filter_construction(chroma_store):
+    """[New] 验证 Chroma 过滤条件构造"""
+    # Mock vector_col.query
+    chroma_store.vector_col = MagicMock()
+    chroma_store.vector_col.query.return_value = {"ids": [], "documents": [], "metadatas": [], "distances": []}
+    
+    # 1. 单一条件
+    await chroma_store.search([0.1], filters={"category": "news"})
+    call_args = chroma_store.vector_col.query.call_args[1]
+    assert call_args["where"] == {"category": "news"}
+    
+    # 2. 多条件 (AND)
+    await chroma_store.search([0.1], filters={"category": "news", "year": 2023})
+    call_args = chroma_store.vector_col.query.call_args[1]
+    # 验证是否转换为 {"$and": [...]}
+    where = call_args["where"]
+    assert "$and" in where
+    assert {"category": "news"} in where["$and"]
+    assert {"year": 2023} in where["$and"]
+
+@pytest.mark.skipif(not LANCEDB_AVAILABLE, reason="lancedb missing")
+@pytest.mark.asyncio
+async def test_lance_filter_construction(lance_store):
+    """[New] 验证 LanceDB SQL 过滤条件构造"""
+    # Mock table object
+    mock_table = MagicMock()
+    mock_query = MagicMock()
+    mock_table.search.return_value = mock_query
+    mock_query.limit.return_value = mock_query
+    # 链式调用
+    mock_query.where.return_value = mock_query
+    mock_query.to_list.return_value = []
+    
+    lance_store.table = mock_table
+    
+    # 测试过滤
+    await lance_store.search([0.1], filters={"type": "book", "id": 10})
+    
+    # 验证 where 字符串
+    # 预期: "metadata.type = 'book' AND metadata.id = 10" (顺序可能不同)
+    mock_query.where.assert_called_once()
+    where_clause = mock_query.where.call_args[0][0]
+    
+    assert "metadata.type = 'book'" in where_clause
+    assert "metadata.id = 10" in where_clause
+    assert " AND " in where_clause

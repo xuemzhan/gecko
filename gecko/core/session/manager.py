@@ -1,7 +1,7 @@
 """会话管理器"""
 from __future__ import annotations
 import asyncio
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from gecko.plugins.storage.interfaces import SessionInterface
 from gecko.core.session.entity import Session
 from gecko.core.logging import get_logger
@@ -161,3 +161,81 @@ class SessionManager:
             await session.save(force=True)
         
         logger.info("SessionManager shutdown", sessions_saved=len(sessions))
+
+
+    async def migrate_session(
+        self,
+        session_id: str,
+        target_storage: SessionInterface,
+        delete_source: bool = True
+    ) -> bool:
+        """
+        迁移会话到新存储后端
+        
+        参数:
+            session_id: 会话 ID
+            target_storage: 目标存储
+            delete_source: 是否删除源数据
+        """
+        session = await self.get_session(session_id)
+        if not session:
+            logger.warning("Session not found for migration", session_id=session_id)
+            return False
+        
+        try:
+            # 保存到目标
+            data = session.to_dict()
+            await target_storage.set(session_id, data)
+            
+            # 删除源
+            if delete_source:
+                await self.destroy_session(session_id)
+            
+            logger.info("Session migrated", session_id=session_id)
+            return True
+            
+        except Exception as e:
+            logger.error("Session migration failed", session_id=session_id, error=str(e))
+            return False
+    
+    async def export_all_sessions(self) -> List[Dict[str, Any]]:
+        """导出所有会话数据"""
+        sessions = self.get_all_sessions()
+        return [s.to_dict() for s in sessions]
+    
+    async def import_sessions(
+        self,
+        sessions_data: List[Dict[str, Any]],
+        overwrite: bool = False
+    ) -> int:
+        """
+        导入会话数据
+        
+        返回: 成功导入的数量
+        """
+        imported = 0
+        
+        for data in sessions_data:
+            session_id = data.get("metadata", {}).get("session_id")
+            if not session_id:
+                continue
+            
+            # 检查是否存在
+            existing = await self.get_session(session_id)
+            if existing and not overwrite:
+                continue
+            
+            # 创建新会话
+            session = Session(
+                session_id=session_id,
+                storage=self.storage,
+                auto_save=False
+            )
+            session.from_dict(data)
+            await session.save(force=True)
+            
+            self._sessions[session_id] = session
+            imported += 1
+        
+        logger.info("Sessions imported", count=imported)
+        return imported

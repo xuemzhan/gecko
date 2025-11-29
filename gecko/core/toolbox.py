@@ -387,27 +387,38 @@ class ToolBox:
         results: List[Optional[ToolExecutionResult]] = [None] * len(tool_calls)
         
         # 使用 anyio 信号量控制并发
-        semaphore = Semaphore(self.max_concurrent)
-        
-        async def _worker(idx: int, call: Dict[str, Any]):
-            async with semaphore:
-                name = call.get("name", "")
-                args = call.get("arguments", {})
-                cid = call.get("id", "")
-                
-                if not name:
-                    results[idx] = ToolExecutionResult(
-                        tool_name="unknown", call_id=cid, result="Missing tool name", is_error=True
-                    )
-                    return
+        # max_concurrent <= 0 视为“无限制”(不使用信号量)
+        semaphore: Optional[Semaphore]
+        if self.max_concurrent and self.max_concurrent > 0:
+            semaphore = Semaphore(self.max_concurrent)
+        else:
+            semaphore = None
 
-                try:
-                    # 复用 execute_with_result 以获得完整的统计和重试支持
-                    results[idx] = await self.execute_with_result(name, args, timeout, cid)
-                except Exception as e:
-                    results[idx] = ToolExecutionResult(
-                        tool_name=name, call_id=cid, result=f"Batch error: {e}", is_error=True
-                    )
+        async def _run_single(idx: int, call: Dict[str, Any]):
+            name = call.get("name", "")
+            args = call.get("arguments", {})
+            cid = call.get("id", "")
+            
+            if not name:
+                results[idx] = ToolExecutionResult(
+                    tool_name="unknown", call_id=cid, result="Missing tool name", is_error=True
+                )
+                return
+
+            try:
+                # 复用 execute_with_result 以获得完整的统计和重试支持
+                results[idx] = await self.execute_with_result(name, args, timeout, cid)
+            except Exception as e:
+                results[idx] = ToolExecutionResult(
+                    tool_name=name, call_id=cid, result=f"Batch error: {e}", is_error=True
+                )
+
+        async def _worker(idx: int, call: Dict[str, Any]):
+            if semaphore is not None:
+                async with semaphore:
+                    await _run_single(idx, call)
+            else:
+                await _run_single(idx, call)
 
         async with create_task_group() as tg:
             for i, call in enumerate(tool_calls):

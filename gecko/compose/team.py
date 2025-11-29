@@ -159,14 +159,20 @@ class Team:
             async with anyio.create_task_group() as tg:
                 for idx, member in enumerate(self.members):
                     tg.start_soon(_worker, idx, member)
-        except ExceptionGroup as eg:
-            # 修复: Python 3.11+ 的 ExceptionGroup 处理
-            logger.error(
-                "Team execution encountered exceptions",
-                team=self.name,
-                exception_count=len(eg.exceptions)
-            )
-            # 异常已在 worker 中处理并记录到 results，这里只记录日志
+        except BaseException as eg:
+            # 兼容 Python 3.10/3.11 及 anyio 自定义异常组：
+            # - 如果是异常组（有 .exceptions 属性），仅记录日志；
+            # - 否则重新抛出，保持非预期错误的可见性。
+            if hasattr(eg, "exceptions"):
+                exc_list = getattr(eg, "exceptions", [])
+                logger.error(
+                    "Team execution encountered exceptions",
+                    team=self.name,
+                    exception_count=len(exc_list),
+                )
+                # 异常已在 worker 中处理并记录到 results，这里只记录日志
+            else:
+                raise
             
         # 6. 结果整理
         # 理论上 task_group 结束时所有 results 都已被赋值，这里做一次非空断言过滤

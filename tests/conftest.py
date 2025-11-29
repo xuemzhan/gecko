@@ -11,6 +11,7 @@ from gecko.core.memory import TokenMemory
 from gecko.core.protocols import ModelProtocol
 from gecko.core.toolbox import ToolBox
 
+from gecko.plugins.storage.interfaces import SessionInterface
 from gecko.plugins.tools.registry import ToolRegistry
 
 def pytest_configure(config):
@@ -73,31 +74,43 @@ def mock_toolbox():
 @pytest.fixture
 def mock_llm():
     """
-    [Critical Fix] Mock LLM 对象
+    Mock LLM 对象
     必须返回对象，且实现 count_tokens 以通过 ModelProtocol 检查
+    适配 v0.2.1 ModelProtocol，包含同步的 count_tokens 方法
     """
-    # 1. 使用 spec 自动模拟协议特征
     llm = MagicMock(spec=ModelProtocol)
     
-    # 2. 模拟 acompletion (异步推理)
+    # 1. 模拟 acompletion (异步推理)
     mock_response = MagicMock()
     mock_response.choices = [
         MagicMock(message=MagicMock(content="Test Response", tool_calls=None))
     ]
-    # 确保 model_dump 可调用 (Agent 内部会调用)
+    # 适配 Pydantic/Dict 访问
     mock_response.choices[0].message.model_dump.return_value = {
         "role": "assistant", 
         "content": "Test Response"
     }
+    # 让 message 既像对象也像字典
+    mock_response.choices[0].message.__getitem__ = lambda s, k: {
+        "role": "assistant", "content": "Test Response"
+    }.get(k)
     
     llm.acompletion = AsyncMock(return_value=mock_response)
     
+    # 2. 模拟 astream (异步流式)
+    async def async_gen(*args, **kwargs):
+        chunk = MagicMock()
+        chunk.choices = [{"delta": {"content": "stream"}, "index": 0}]
+        chunk.content = "stream"
+        yield chunk
+    llm.astream = MagicMock(side_effect=async_gen)
+
     # 3. [关键] 模拟 count_tokens (同步计数)
-    # 这是修复 "model 必须实现 ModelProtocol" 错误的核心
+    # 必须接受 text_or_messages 参数
     llm.count_tokens = MagicMock(return_value=10)
     
-    # 4. [关键] 必须返回对象，否则测试中收到 None
     return llm
+
 
 @pytest.fixture
 def model(mock_llm):
@@ -106,18 +119,31 @@ def model(mock_llm):
     """
     return mock_llm
 
+
 @pytest.fixture
-def memory(mock_llm):
+def mock_storage():
+    """[New] Mock 存储后端"""
+    storage = MagicMock(spec=SessionInterface)
+    storage.get = AsyncMock(return_value=None)
+    storage.set = AsyncMock()
+    storage.delete = AsyncMock()
+    return storage
+
+@pytest.fixture
+def memory(mock_llm, mock_storage):
     """
-    Memory Fixture
-    [Fix] 注入 model_driver 以支持新的计数逻辑
+    [Updated] Memory Fixture
+    注入 storage 和 model_driver
     """
     return TokenMemory(
         session_id="test_session", 
         max_tokens=4000, 
         model_name="gpt-3.5-turbo",
-        model_driver=mock_llm  # 注入 Mock 驱动
+        model_driver=mock_llm,  # 注入驱动
+        storage=mock_storage,   # 注入存储
+        enable_async_counting=False # 测试中默认同步，便于调试，特定测试可覆盖
     )
+
 
 # @pytest.fixture
 # def memory():

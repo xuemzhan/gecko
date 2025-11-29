@@ -21,12 +21,12 @@ def register_litellm_cleanup():
             import litellm
             # LiteLLM 官方提供的异步关闭方法（v1.40+ 支持）
             if hasattr(litellm, "async_http_handler"):
-                if litellm.async_http_handler:
-                    await litellm.async_http_handler.client.close()
+                if litellm.async_http_handler: # type: ignore
+                    await litellm.async_http_handler.client.close() # type: ignore
             # 兼容旧版本
             if hasattr(litellm, "http_client"):
-                if litellm.http_client:
-                    await litellm.http_client.close()
+                if litellm.http_client: # type: ignore
+                    await litellm.http_client.close() # type: ignore
         except Exception:
             pass
 

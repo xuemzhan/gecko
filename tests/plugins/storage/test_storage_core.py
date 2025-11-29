@@ -161,3 +161,49 @@ async def test_abstract_lifecycle():
         assert s is storage
     
     assert not storage.is_initialized
+
+@pytest.mark.asyncio
+async def test_atomic_mixin_filelock_behavior():
+    """[New] 验证 AtomicWriteMixin 在 setup_multiprocess_lock 后的行为"""
+    
+    # 模拟 filelock 库已安装
+    with patch("gecko.plugins.storage.mixins.FILELOCK_AVAILABLE", True):
+        # Mock FileLock 类
+        with patch("gecko.plugins.storage.mixins.FileLock") as MockFileLock:
+            mock_lock_instance = MagicMock()
+            MockFileLock.return_value = mock_lock_instance
+            
+            storage = MockStorage()
+            # 1. 设置锁路径
+            storage.setup_multiprocess_lock("./test.db")
+            
+            # 验证 FileLock 被实例化
+            MockFileLock.assert_called_with("./test.db.lock")
+            
+            # 2. 测试 file_lock_guard (同步上下文)
+            # 必须调用 acquire/release (或者 __enter__/__exit__)
+            with storage.file_lock_guard():
+                pass
+            
+            mock_lock_instance.__enter__.assert_called()
+            mock_lock_instance.__exit__.assert_called()
+
+@pytest.mark.asyncio
+async def test_atomic_mixin_fallback_without_filelock():
+    """[New] 验证 filelock 未安装时的降级行为"""
+    
+    with patch("gecko.plugins.storage.mixins.FILELOCK_AVAILABLE", False):
+        with patch("gecko.plugins.storage.mixins.logger") as mock_logger:
+            storage = MockStorage()
+            storage.setup_multiprocess_lock("./test.db")
+            
+            # 1. 验证日志警告
+            mock_logger.warning.assert_called()
+            assert storage._file_lock is None
+            
+            # 2. 验证 file_lock_guard 不报错且无操作
+            try:
+                with storage.file_lock_guard():
+                    pass # Should execute safely
+            except Exception as e:
+                pytest.fail(f"file_lock_guard raised exception in fallback mode: {e}")

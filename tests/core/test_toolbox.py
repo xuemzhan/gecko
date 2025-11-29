@@ -1,4 +1,5 @@
 # tests/core/test_toolbox.py
+import time
 import pytest
 import asyncio
 from typing import Type
@@ -166,6 +167,74 @@ class TestToolExecution:
         )
         assert result.is_error
         assert "Intentional error" in result.result
+
+    @pytest.mark.asyncio
+    async def test_toolbox_thread_safe_stats(self, toolbox):
+        """[New] 测试多协程并发更新统计数据的安全性"""
+        toolbox.reset_stats()
+        
+        # 模拟并发执行 50 次
+        count = 50
+        
+        async def worker():
+            # 模拟执行，不实际 sleep 以加快测试
+            # update_stats 会在 execute_with_result 内部调用
+            await toolbox.execute("mock_tool", {})
+
+        tasks = [worker() for _ in range(count)]
+        await asyncio.gather(*tasks)
+        
+        stats = toolbox.get_stats()
+        assert stats["mock_tool"]["calls"] == count
+        # 如果没有锁，这里的计数可能会少于 50
+
+    @pytest.mark.asyncio
+    async def test_toolbox_execute_many_concurrency(self, toolbox):
+        """[New] 验证 execute_many 的并发限制"""
+        # 设置较小的并发数
+        toolbox.max_concurrent = 2
+        
+        # 创建一个慢速工具
+        class SlowMockTool(BaseTool):
+            name: str = "slow"
+            description: str = "desc"
+            args_schema: Type[BaseModel] = EmptyArgs
+            
+            async def _run(self, args):
+                await asyncio.sleep(0.05)
+                return ToolResult(content="ok")
+        
+        toolbox.register(SlowMockTool())
+        
+        # 准备 5 个调用
+        calls = [{"name": "slow", "arguments": {}, "id": str(i)} for i in range(5)]
+        
+        start_time = time.time()
+        await toolbox.execute_many(calls)
+        duration = time.time() - start_time
+        
+        # 理论分析：
+        # 5 个任务，并发 2
+        # Round 1: T1, T2 (0.05s)
+        # Round 2: T3, T4 (0.05s)
+        # Round 3: T5     (0.05s)
+        # 总耗时应 >= 0.15s
+        # 如果是全并发 (max=0/5)，耗时应 ~= 0.05s
+        
+        assert duration >= 0.14, f"Concurrency limit failed, too fast: {duration}s"
+
+    @pytest.mark.asyncio
+    async def test_execute_with_parse_error_flag(self, toolbox):
+        """[New] 测试从 Engine 传递下来的解析错误标记"""
+        # 即使工具不存在，也不应该抛出 ToolNotFoundError，而是直接返回错误信息
+        # 模拟参数解析阶段就已经失败的情况
+        bad_args = {"__gecko_parse_error__": "Invalid JSON"}
+        
+        res = await toolbox.execute_with_result("non_existent_tool", bad_args)
+        
+        assert res.is_error is True
+        assert "System Error" in res.result
+        assert "Invalid JSON" in res.result
 
 
 class TestBatchExecution:

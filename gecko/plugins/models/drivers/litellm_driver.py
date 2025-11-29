@@ -4,7 +4,6 @@ from __future__ import annotations
 from typing import Any, AsyncIterator, Dict, List, Union
 
 import litellm
-import tiktoken
 
 from gecko.core.exceptions import ModelError
 from gecko.core.logging import get_logger

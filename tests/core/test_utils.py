@@ -1,5 +1,6 @@
 # tests/core/test_utils.py
 import threading
+from typing import Any
 from pydantic import BaseModel
 import pytest
 import asyncio
@@ -286,3 +287,42 @@ def test_safe_serialize_unserializable():
     # 必须变为 dict 标记，且不抛错
     assert isinstance(clean["lock"], dict)
     assert clean["lock"].get("__gecko_unserializable__") is True
+
+def test_safe_serialize_complex_objects():
+    """[New] 测试复杂对象的序列化清洗能力"""
+    import threading
+    from pydantic import BaseModel, Field, PrivateAttr
+    
+    class UnserializableModel(BaseModel):
+        name: str
+        # [FIX] 使用 PrivateAttr 或 default_factory 防止 Pydantic 深拷贝默认值
+        _lock: Any = PrivateAttr(default_factory=threading.Lock)
+
+    lock = threading.Lock()
+    
+    data = {
+        "normal": "value",
+        "nested": {
+            "lock_obj": lock,
+            "list": [1, lock, 2]
+        },
+        "pydantic_obj": UnserializableModel(name="test")
+    }
+    
+    clean = safe_serialize_context(data)
+    
+    # 1. 验证正常数据保留
+    assert clean["normal"] == "value"
+    assert clean["nested"]["list"][0] == 1
+    
+    # 2. 验证锁对象被转换为标记字典
+    lock_marker = clean["nested"]["lock_obj"]
+    assert isinstance(lock_marker, dict)
+    assert lock_marker.get("__gecko_unserializable__") is True
+    assert "lock" in lock_marker.get("type", "")
+    
+    # 3. 验证列表中的锁也被处理
+    assert clean["nested"]["list"][1].get("__gecko_unserializable__") is True
+    
+    # 4. 验证 Pydantic 对象被转为 dict
+    assert clean["pydantic_obj"] == {"name": "test"}
