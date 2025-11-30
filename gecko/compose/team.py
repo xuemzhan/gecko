@@ -1,28 +1,16 @@
 # gecko/compose/team.py
 """
-Team 多智能体并行引擎
-
-提供 Map-Reduce 模式的并行执行能力，将单一任务分发给多个 Agent/Function 执行，
-并聚合结果。适用于 "专家评审团"、"多路赛马"、"并发搜索" 等场景。
-
-核心功能：
-1. 高效并行：基于 AnyIO TaskGroup 实现异步并发。
-2. 流量整形：支持 max_concurrent 限制，防止触发 LLM Rate Limit。
-3. 容错机制：单个成员失败不熔断整体任务 (Partial Success)。
-4. 智能绑定：自动解析 WorkflowContext，支持数据流转。
+Team 多智能体并行引擎 (Enhanced)
 
 优化日志：
-- [Fix] 增加 max_concurrent 信号量控制，防止 API 速率超限
-- [Fix] 完善异常捕获边界，确保 TaskGroup 稳定性
-- [Refactor] 统一输入解析与结果标准化逻辑
-
-优化日志：
-- [Refactor] 引入 MemberResult 标准化返回结果
-- [Refactor] 移除输入处理中的隐式拆包逻辑 (Magic Unpacking)
-- [Fix] 异常处理改为对象封装，不再返回错误字符串
+- [Feat] 增加 ExecutionStrategy 枚举 (ALL, RACE)
+- [Feat] 增加 input_mapper 支持输入分片 (Sharding)
+- [Perf] 实现 Race 模式下的快速返回与任务取消
+- [Refactor] 保持 MemberResult 标准化结构
 """
 from __future__ import annotations
 
+from enum import Enum
 from typing import Any, Callable, Generic, List, Optional, TypeVar, Union, TYPE_CHECKING
 
 import anyio
@@ -35,17 +23,24 @@ from gecko.core.output import AgentOutput
 from gecko.core.utils import ensure_awaitable
 
 if TYPE_CHECKING:
-    from gecko.compose.workflow import WorkflowContext
+    from gecko.compose.workflow.models import WorkflowContext
 
 logger = get_logger(__name__)
 
 R = TypeVar("R")
 
 
+class ExecutionStrategy(str, Enum):
+    """
+    执行策略枚举
+    """
+    ALL = "all"       # 等待所有成员执行完毕 (Map-Reduce 默认)
+    RACE = "race"     # 赛马模式：取第一个成功的结果，取消其他任务 (降低延迟)
+    # Future: MAJORITY (投票), BEST_OF_N (采样)
+
+
 class MemberResult(BaseModel, Generic[R]):
-    """
-    标准化成员执行结果
-    """
+    """标准化成员执行结果"""
     result: Optional[R] = Field(default=None, description="执行成功时的返回值")
     error: Optional[str] = Field(default=None, description="执行失败时的错误信息")
     member_index: int = Field(..., description="成员在 Team 中的索引")
@@ -53,12 +48,9 @@ class MemberResult(BaseModel, Generic[R]):
 
     @property
     def value(self) -> R:
-        """
-        获取结果，如果是错误则抛出异常 (便捷方法)
-        """
         if not self.is_success:
             raise RuntimeError(f"Member execution failed: {self.error}")
-        return self.result # type: ignore
+        return self.result  # type: ignore
 
 
 class Team:
@@ -67,142 +59,143 @@ class Team:
     """
 
     def __init__(
-        self, 
+        self,
         members: List[Union[Agent, Callable]],
         name: str = "Team",
         max_concurrent: int = 0,
-        return_full_output: bool = False
+        return_full_output: bool = False,
+        strategy: ExecutionStrategy = ExecutionStrategy.ALL,  # [新增] 策略
+        input_mapper: Optional[Callable[[Any, int], Any]] = None, # [新增] 输入分片
     ):
         self.members = members
         self.name = name
         self.max_concurrent = max_concurrent
         self.return_full_output = return_full_output
+        self.strategy = strategy
+        self.input_mapper = input_mapper
 
     # ========================= 接口协议 =========================
 
     async def __call__(self, context_or_input: Any) -> List[MemberResult]:
-        """
-        实现 Callable 协议
-        """
         return await self.run(context_or_input)
 
     async def run(self, context_or_input: Any) -> List[MemberResult]:
-        """
-        执行 Team 逻辑
-        
-        返回:
-            MemberResult 列表，包含每个成员的执行状态和结果
-        """
-        # 1. 解析输入 (不再进行隐式内容提取)
-        inp = self._resolve_input(context_or_input)
-        
+        """执行 Team 逻辑"""
+        # 1. 解析原始输入
+        raw_input = self._resolve_input(context_or_input)
         member_count = len(self.members)
+
         logger.info(
-            "Team execution started", 
-            team=self.name, 
-            member_count=member_count,
-            max_concurrent=self.max_concurrent or "unlimited"
+            "Team execution started",
+            team=self.name,
+            members=member_count,
+            strategy=self.strategy
         )
 
-        # 2. 初始化容器
-        # 注释: results[idx] 的写入是索引隔离的，每个 worker 只写自己的索引
-        # 这种模式在 Python 中是并发安全的，因为列表元素的赋值是原子操作
-        results: List[Optional[MemberResult]] = [None] * member_count
-        
-        # 3. 准备并发控制
+        # 2. 准备分片输入 (Sharding Logic)
+        inputs = []
+        for i in range(member_count):
+            if self.input_mapper:
+                try:
+                    # input_mapper(raw_input, member_index)
+                    # 允许根据索引切分数据
+                    val = self.input_mapper(raw_input, i)
+                    inputs.append(val)
+                except Exception as e:
+                    logger.error(f"Input mapping failed for member {i}", error=str(e))
+                    inputs.append(None) # 映射失败视为 None 或抛出，这里选择防御性 None
+            else:
+                inputs.append(raw_input)
+
+        # 3. 根据策略分发
+        if self.strategy == ExecutionStrategy.RACE:
+            return await self._execute_race(inputs)
+        else:
+            return await self._execute_all(inputs)
+
+    # ========================= 核心执行模式 =========================
+
+    async def _execute_all(self, inputs: List[Any]) -> List[MemberResult]:
+        """
+        [默认模式] 等待所有成员完成
+        """
+        results: List[Optional[MemberResult]] = [None] * len(self.members)
         semaphore = anyio.Semaphore(self.max_concurrent) if self.max_concurrent > 0 else None
 
-        # 修复: 追踪是否有任务失败（用于日志）
-        failed_indices: List[int] = []
-        failed_lock = anyio.Lock()  # 用于保护 failed_indices 的并发写入
-
-        # 4. 定义 Worker
-        async def _worker(idx: int, member: Any):
+        async def _worker(idx: int, member: Any, inp: Any):
             if semaphore:
                 await semaphore.acquire()
-            
             try:
-                # 执行成员逻辑
-                raw_result = await self._execute_member(member, inp)
-                # 结果标准化
-                processed = self._process_result(raw_result)
-                
-                results[idx] = MemberResult(
-                    member_index=idx,
-                    result=processed,
-                    is_success=True
-                )
-            except Exception as e:
-                logger.error(
-                    "Team member execution failed",
-                    team=self.name,
-                    member_index=idx,
-                    error=str(e)
-                )
-                results[idx] = MemberResult(
-                    member_index=idx,
-                    error=str(e),
-                    is_success=False
-                )
-                # 修复: 安全地记录失败索引
-                async with failed_lock:
-                    failed_indices.append(idx)
+                res = await self._safe_execute_member(idx, member, inp)
+                results[idx] = res
             finally:
                 if semaphore:
                     semaphore.release()
 
-        # 5. 启动并发任务组
-        # 注释: anyio.create_task_group 会等待所有任务完成
-        # 如果任何任务抛出未捕获的异常，会取消其他任务
-        # 但我们在 _worker 中已经捕获了所有异常，所以不会发生取消
+        async with anyio.create_task_group() as tg:
+            for i, member in enumerate(self.members):
+                tg.start_soon(_worker, i, member, inputs[i])
+
+        # 整理结果
+        final_results = [r for r in results if r is not None]
+        self._log_completion(final_results)
+        return final_results
+
+    async def _execute_race(self, inputs: List[Any]) -> List[MemberResult]:
+        """
+        [赛马模式] 返回最快成功的那个，取消其他
+        """
+        # 用于存储获胜者的容器 (list 是可变的，闭包可写)
+        winner: List[MemberResult] = []
+        
+        # 使用 CancelScope 实现“一人成功，全员取消”
+        # 注意：这里需要在外部包裹 try-except 处理取消异常
         try:
             async with anyio.create_task_group() as tg:
-                for idx, member in enumerate(self.members):
-                    tg.start_soon(_worker, idx, member)
-        except BaseException as eg:
-            # 兼容 Python 3.10/3.11 及 anyio 自定义异常组：
-            # - 如果是异常组（有 .exceptions 属性），仅记录日志；
-            # - 否则重新抛出，保持非预期错误的可见性。
-            if hasattr(eg, "exceptions"):
-                exc_list = getattr(eg, "exceptions", [])
-                logger.error(
-                    "Team execution encountered exceptions",
-                    team=self.name,
-                    exception_count=len(exc_list),
-                )
-                # 异常已在 worker 中处理并记录到 results，这里只记录日志
-            else:
-                raise
-            
-        # 6. 结果整理
-        # 理论上 task_group 结束时所有 results 都已被赋值，这里做一次非空断言过滤
-        final_results = [r for r in results if r is not None]
-        
-        # 统计
-        success_count = sum(1 for r in final_results if r.is_success)
-        fail_count = member_count - success_count
-        
-        logger.info(
-            "Team execution completed",
-            team=self.name,
-            success=success_count,
-            failed=fail_count
-        )
+                for i, member in enumerate(self.members):
+                    
+                    async def _racer(idx: int, mem: Any, inp: Any):
+                        # 执行成员逻辑
+                        res = await self._safe_execute_member(idx, mem, inp)
+                        
+                        # 只有成功的才算赢
+                        if res.is_success:
+                            if not winner: # 双重检查避免覆盖
+                                winner.append(res)
+                                # 核心：取消整个 TaskGroup 的 Scope
+                                tg.cancel_scope.cancel()
+                        
+                    tg.start_soon(_racer, i, member, inputs[i])
+                    
+        except anyio.get_cancelled_exc_class():
+            # 捕获取消异常是预期行为（因为我们主动 cancel 了）
+            pass
+        except Exception as e:
+            logger.error("Race execution crashed", error=str(e))
 
-        return final_results
+        if winner:
+            logger.info(f"Team {self.name} Race won by member {winner[0].member_index}")
+            return winner
+        
+        # 如果所有人都失败了，或者没有任何人成功，返回空列表或全失败记录
+        # 这里简化处理，返回空列表表示无 winner
+        logger.warning(f"Team {self.name} Race failed: no winner")
+        return []
 
     # ========================= 内部逻辑 =========================
 
-    def _resolve_input(self, context_or_input: Any) -> Any:
-        """
-        智能输入解析 (Refactored: Removed Magic Unpacking)
+    async def _safe_execute_member(self, idx: int, member: Any, inp: Any) -> MemberResult:
+        """单成员执行封装（含异常处理与结果标准化）"""
+        try:
+            raw = await self._execute_member(member, inp)
+            processed = self._process_result(raw)
+            return MemberResult(member_index=idx, result=processed, is_success=True)
+        except Exception as e:
+            logger.error(f"Member {idx} failed", error=str(e))
+            return MemberResult(member_index=idx, error=str(e), is_success=False)
 
-        仅保留从 WorkflowContext 中提取数据的逻辑，移除针对 dict 内容的自动拆包。
-        关键修复：
-        - 不再使用 `or` 进行回退，避免 0/False 等合法业务值被当作“无效”丢弃
-        """
-        # 1. 检查是否为 WorkflowContext（基于简单 Duck Typing）
-        #    要求同时具有 history / input 属性，且 history 为 dict
+    def _resolve_input(self, context_or_input: Any) -> Any:
+        """从 Context 提取输入 (保留 WorkflowContext 的 Duck Typing)"""
         if (
             hasattr(context_or_input, "history")
             and hasattr(context_or_input, "input")
@@ -212,59 +205,38 @@ class Team:
             history = getattr(ctx, "history", {})
             state = getattr(ctx, "state", {})
 
-            # 修复点：
-            #    使用显式的 key 检查逻辑，而不是 `or`
-            #    优先级：
-            #    1) 若 state 中显式带有 _next_input（Next 指令传入），无条件使用
-            #    2) 否则若 history 中存在 last_output key，则使用该值（即便是 0/False/""）
-            #    3) 否则回退到上下文的初始 input
             if "_next_input" in state:
-                # 注意：这里消费掉 _next_input，确保只使用一次
-                val = state.pop("_next_input")
+                return state.pop("_next_input")
             elif "last_output" in history:
-                val = history["last_output"]
+                return history["last_output"]
             else:
-                # 最后回退到 WorkflowContext.input
-                val = getattr(ctx, "input")
-
-            # [保留行为] 不再对 dict 进行 content 提取，保持“无魔法”原则，
-            # 上游节点应负责返回下游真正需要的数据结构。
-            return val
-
-        # 2. 非 WorkflowContext，直接视为普通输入按原样返回
+                return getattr(ctx, "input")
         return context_or_input
 
-
     async def _execute_member(self, member: Any, inp: Any) -> Any:
-        """执行单个成员"""
         if hasattr(member, "run"):
             return await member.run(inp)
-        
         if callable(member):
             return await ensure_awaitable(member, inp)
-            
-        raise TypeError(f"Member {member} is not executable (must be Agent or Callable)")
+        raise TypeError(f"Member {member} is not executable")
 
     def _process_result(self, result: Any) -> Any:
-        """结果标准化处理"""
         if self.return_full_output:
             if isinstance(result, (BaseModel, AgentOutput, Message)):
                 return result.model_dump()
             return result
-            
-        # 默认模式：仅提取核心文本内容
+        # 默认提取内容
         if isinstance(result, AgentOutput):
             return result.content
         if isinstance(result, Message):
             return result.content
-        # [Modified] 这里的 dict 检查仅针对 AgentOutput.model_dump() 后的结构
-        # 普通的 dict 不会被提取 content，除非它是 AgentOutput 的序列化形式
-        # 但为了安全起见，我们仅处理明确的对象类型，对于 dict 保持原样，
-        # 或者我们可以保留这里的逻辑如果确信 dict 是由 Agent 产生的。
-        # 为了贯彻 "No Magic"，建议此处如果用户返回的是 dict，就返回 dict。
-        # AgentOutput/Message 对象在上一步已经被识别处理了。
-        
         return result
 
-    def __repr__(self) -> str:
-        return f"Team(name='{self.name}', members={len(self.members)}, concurrency={self.max_concurrent})"
+    def _log_completion(self, results: List[MemberResult]):
+        success = sum(1 for r in results if r.is_success)
+        logger.info(
+            "Team execution completed",
+            team=self.name,
+            success=success,
+            total=len(results)
+        )
