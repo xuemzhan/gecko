@@ -177,6 +177,8 @@ class LiteLLMDriver(BaseChatModel):
 
     async def acompletion(self, messages: List[Dict[str, Any]], **kwargs: Any) -> CompletionResponse:
         try:
+            kwargs.pop("stream", None)
+
             params = self._get_params(messages, stream=False, **kwargs)
             resp = await litellm.acompletion(**params)
             # 使用适配器清洗
@@ -187,6 +189,8 @@ class LiteLLMDriver(BaseChatModel):
 
     async def astream(self, messages: List[Dict[str, Any]], **kwargs: Any) -> AsyncIterator[StreamChunk]: # type: ignore
         try:
+            kwargs.pop("stream", None)
+
             params = self._get_params(messages, stream=True, **kwargs)
             iterator = await litellm.acompletion(**params)
             

@@ -163,15 +163,34 @@ class Message(BaseModel):
         return cls(role="user", content=blocks, name=name)
 
     @classmethod
-    def assistant(cls, content: str, name: Optional[str] = None) -> Message:
+    def assistant(
+        cls, 
+        content: str = "", 
+        tool_calls: Optional[List[Dict[str, Any]]] = None, # 新增参数
+        name: Optional[str] = None
+    ) -> Message:
         """
         创建助手消息
         
         参数:
             content: 回复内容
+            tool_calls: 工具调用列表
             name: 助手名称（可选）
         """
-        return cls(role="assistant", content=content, name=name)
+        return cls(
+            role="assistant", 
+            content=content, 
+            tool_calls=tool_calls, 
+            name=name
+        )
+    
+    @property
+    def safe_tool_calls(self) -> List[Dict[str, Any]]:
+        """
+        安全获取 tool_calls，确保返回列表而不是 None。
+        用于减少 if msg.tool_calls is not None 的检查。
+        """
+        return self.tool_calls or []
 
     @classmethod
     def system(cls, content: str) -> Message:

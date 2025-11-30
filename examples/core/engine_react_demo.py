@@ -135,12 +135,21 @@ async def main():
 
     print("-" * 50)
 
-    # --- 场景 2: 结构化输出 ---
-    query2 = "Based on the weather in Beijing, suggest a weekend plan."
+    # 修改 query2，增加极其明确的格式指令
+    # 技巧：给出 JSON 示例的开头 "{"，诱导模型进入 JSON 补全模式
+    query2 = (
+        "Based on the weather in Beijing, suggest a weekend plan. "
+        "You MUST output the result strictly in JSON format matching the schema. "
+        "Do not output any conversational text."
+    )
     print(f"\n👤 User: {query2} (Requesting Structured Output)")
     
-    # 使用 run() 并指定 response_model
-    result = await agent.run(query2, response_model=AnalysisReport)
+    # 保持 max_retries=3
+    result = await agent.run(
+        query2, 
+        response_model=AnalysisReport, 
+        max_retries=3
+    )
     print(f"📦 Structured Result:\n{result.model_dump_json(indent=2)}\n")
 
     print("-" * 50)

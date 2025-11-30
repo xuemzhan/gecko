@@ -117,9 +117,14 @@ class TestToolExecution:
         
         # 验证
         assert result.is_error is True
+        # 验证包含前缀
         assert "System Error: Failed to parse arguments" in result.result
+        
+        # 验证包含具体的解析错误信息
         assert "Unexpected end of string" in result.result
-        assert "Please correct your JSON format" in result.result
+        
+        # [修复] 修改断言以匹配实现中的文本 "Please check your output format and retry."
+        assert "Please check your output format and retry" in result.result
         
         # 验证没有抛出 ToolNotFoundError 或其他异常
     

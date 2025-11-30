@@ -113,6 +113,8 @@ class LiteLLMChatModel(BaseChatModel):
 
     async def acompletion(self, messages: List[Dict[str, Any]], **kwargs: Any) -> CompletionResponse:
         try:
+            kwargs.pop("stream", None)
+
             params = self._get_params(messages, stream=False, **kwargs)
             resp = await litellm.acompletion(**params)
             
@@ -130,6 +132,8 @@ class LiteLLMChatModel(BaseChatModel):
 
     async def astream(self, messages: List[Dict[str, Any]], **kwargs: Any) -> AsyncIterator[StreamChunk]: # type: ignore
         try:
+            kwargs.pop("stream", None)
+
             params = self._get_params(messages, stream=True, **kwargs)
             response_iterator = await litellm.acompletion(**params)
             

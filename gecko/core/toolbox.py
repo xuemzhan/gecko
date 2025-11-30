@@ -264,14 +264,18 @@ class ToolBox:
     ) -> ToolExecutionResult:
         """
         执行单个工具（完整版）
-        
-        包含：超时控制、重试逻辑、统计记录
         """
-        # [新增] 同样的检查逻辑，确保 execute_many 也能受益
+        # [修复] 优先处理 Engine 层传递下来的解析错误
+        # 这种情况下 arguments 只有这个特殊的 key
         if "__gecko_parse_error__" in arguments:
-            error_msg = f"System Error: Failed to parse arguments. {arguments['__gecko_parse_error__']} \
-                Please correct your JSON format."
+            error_msg = (
+                f"System Error: Failed to parse arguments JSON. "
+                f"{arguments['__gecko_parse_error__']} "
+                "Please check your output format and retry."
+            )
+            # 记录一次错误统计
             self._update_stats(name, 0.0, is_error=True)
+            
             return ToolExecutionResult(
                 tool_name=name,
                 call_id=call_id,
@@ -285,10 +289,10 @@ class ToolBox:
             self._update_stats(name, 0, is_error=True)
             raise ToolNotFoundError(name)
         
+        # ... (后续原有逻辑保持不变: retry, execute_once, stats update) ...
         actual_timeout = timeout or self.default_timeout
         start_time = time.time()
         
-        # 选择执行策略
         if self.enable_retry:
             result_str, is_error = await self._execute_with_retry(
                 tool, arguments, actual_timeout

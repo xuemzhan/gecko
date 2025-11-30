@@ -1,4 +1,5 @@
 # tests/conftest.py
+import gc
 import os
 import warnings
 import pytest
@@ -156,3 +157,55 @@ def toolbox():
 @pytest.fixture
 def event_bus():
     return EventBus()
+
+@pytest.fixture(autouse=True)
+async def cleanup_litellm_resources():
+    """
+    [自动执行] 每个测试结束后，强制关闭 LiteLLM 的全局异步客户端。
+    防止 ResourceWarning: unclosed socket 导致测试失败。
+    """
+    yield  # 等待测试执行完成
+    
+    # 尝试导入 litellm，如果未安装则跳过
+    try:
+        import litellm
+    except ImportError:
+        return
+
+    # 清理 LiteLLM 可能持有的各种全局 Client
+    # 注意：LiteLLM 不同版本的内部变量名可能不同，这里做防御性处理
+    
+    clients_to_close = []
+
+    # 1. 处理 async_http_handler (新版)
+    if hasattr(litellm, "async_http_handler") and litellm.async_http_handler: # type: ignore
+        if hasattr(litellm.async_http_handler, "client"): # type: ignore
+            clients_to_close.append(litellm.async_http_handler.client) # type: ignore
+        # 清空引用，迫使下个测试重建
+        litellm.async_http_handler = None # type: ignore
+
+    # 2. 处理 module_level_aclient (某些版本)
+    if hasattr(litellm, "module_level_aclient") and litellm.module_level_aclient:
+        clients_to_close.append(litellm.module_level_aclient)
+        litellm.module_level_aclient = None
+
+    # 3. 处理 http_client (旧版)
+    if hasattr(litellm, "http_client") and litellm.http_client: # type: ignore
+        clients_to_close.append(litellm.http_client) # type: ignore
+        litellm.http_client = None # type: ignore
+
+    # 执行关闭
+    for client in clients_to_close:
+        try:
+            if hasattr(client, "aclose"):
+                await client.aclose()
+            elif hasattr(client, "close"):
+                if asyncio.iscoroutinefunction(client.close):
+                    await client.close()
+                else:
+                    client.close()
+        except Exception:
+            pass
+            
+    # 强制垃圾回收，确保 socket 立即释放
+    gc.collect()

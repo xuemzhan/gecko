@@ -2,13 +2,13 @@
 import asyncio
 from gecko.core.toolbox import ToolBox
 from gecko.plugins.tools.standard.calculator import CalculatorTool
-from gecko.plugins.tools.standard.duckduckgo import DuckDuckGoSearch
+from gecko.plugins.tools.standard.duckduckgo import DuckDuckGoSearchTool
 
 
 async def main():
     # 1. 创建工具箱
     toolbox = ToolBox(
-        tools=[CalculatorTool(), DuckDuckGoSearch()],
+        tools=[CalculatorTool(), DuckDuckGoSearchTool()], # type: ignore
         max_concurrent=3,
         default_timeout=10.0,
         enable_retry=True,

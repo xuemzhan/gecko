@@ -1,11 +1,12 @@
 # gecko/core/agent.py  
 from __future__ import annotations  
   
-from typing import Any, Iterable, List, Optional, Type, Union  
+from typing import Any, AsyncIterator, Iterable, List, Optional, Type, Union  
   
 from pydantic import BaseModel  
   
 from gecko.core.events import AgentRunEvent, EventBus  
+from gecko.core.events.types import AgentStreamEvent
 from gecko.core.message import Message  
 from gecko.core.output import AgentOutput  
 from gecko.core.toolbox import ToolBox  
@@ -43,11 +44,12 @@ class Agent:
             **engine_kwargs
         )  
   
-    # [FIX] 修复缩进，使其成为类方法而不是 __init__ 的内部函数
+    # 修复缩进，使其成为类方法而不是 __init__ 的内部函数
     async def run(
         self,
         messages: str | Message | List[Message] | List[dict] | dict,
-        response_model: Optional[Type[BaseModel]] = None
+        response_model: Optional[Type[BaseModel]] = None,
+        **kwargs: Any
     ) -> AgentOutput | BaseModel:
         """
         单次推理入口：对多种输入格式统一转换为 Message 列表
@@ -68,7 +70,10 @@ class Agent:
         )
 
         try:
-            output = await self.engine.step(input_msgs, response_model=response_model)
+            output = await self.engine.step(
+                input_msgs, 
+                response_model=response_model,
+                **kwargs)
             payload = self._serialize_output(output)
 
             await self.event_bus.publish(
@@ -83,31 +88,63 @@ class Agent:
             )
             raise
 
-    # [FIX] 修复缩进
-    async def stream(self, messages: str | Message | List[Message] | List[dict] | dict):
+    async def stream(
+        self, 
+        messages: str | Message | List[Message] | List[dict] | dict
+    ) -> AsyncIterator[str]:
         """
-        流式推理：共用同一套输入标准化逻辑
+        流式推理（简易模式）：仅返回文本 Token。
+        
+        [修复] 适配 Engine 的 AgentStreamEvent 输出。
         """
         input_msgs = self._normalize_messages(messages)
-
         raw_text = "\n".join(m.get_text_content() for m in input_msgs)
 
         await self.event_bus.publish(
             AgentRunEvent(
                 type="stream_started",
-                data={
-                    "input": raw_text,
-                    "input_count": len(input_msgs),
-                },
+                data={"input": raw_text, "input_count": len(input_msgs)},
             )
         )
+        
         try:
-            async for chunk in self.engine.step_stream(input_msgs):   # type: ignore
-                yield chunk
+            # 迭代 Engine 产生的高级事件
+            async for event in self.engine.step_stream(input_msgs): # type: ignore
+                # 1. 如果是 Token，直接 yield 给用户
+                if event.type == "token":
+                    yield event.content
+                
+                # 2. 如果是 Error，记录日志 (是否抛出取决于策略，这里选择记录不中断流，除非是致命错误)
+                elif event.type == "error":
+                    logger.warning(f"Stream error event: {event.content}")
+                    # 可选：yield f"[Error: {event.content}]"
+                
+                # 3. 其他事件 (tool_input, result) 可以通过 EventBus 转发，
+                #    或者在这里忽略，仅供 stream_events 方法使用。
+            
             await self.event_bus.publish(AgentRunEvent(type="stream_completed"))
+            
         except Exception as e:
             logger.exception("Agent stream failed")
             await self.event_bus.publish(AgentRunEvent(type="stream_error", error=str(e)))
+            raise
+
+    async def stream_events(
+        self, 
+        messages: str | Message | List[Message] | List[dict] | dict
+    ) -> AsyncIterator[AgentStreamEvent]:
+        """
+        [新增] 高级流式接口：返回完整的事件流 (Token, Tools, Result)。
+        适用于需要展示“正在思考”、“正在调用工具”等状态的 UI。
+        """
+        input_msgs = self._normalize_messages(messages)
+        
+        try:
+            async for event in self.engine.step_stream(input_msgs): # type: ignore
+                yield event
+        except Exception as e:
+            # 即使发生异常，也尝试 yield 一个 error 事件给前端
+            yield AgentStreamEvent(type="error", content=str(e))
             raise
 
     # ---------------- 辅助方法 ----------------  

@@ -109,10 +109,13 @@ class LiteLLMAdapter:
 
     @staticmethod
     def to_gecko_chunk(chunk: Any) -> Optional[StreamChunk]:
-        """将 LiteLLM 流式块转换为 StreamChunk"""
+        """
+        将 LiteLLM 流式块转换为 StreamChunk
+        """
         raw_choices = safe_access(chunk, "choices", [])
         
         # 过滤 Keep-Alive 空包
+        # 有些 provider 会发送仅含 id 的包作为心跳，或者完全空的包
         if not raw_choices and not safe_access(chunk, "id"):
             return None
 
@@ -120,6 +123,17 @@ class LiteLLMAdapter:
         if isinstance(raw_choices, list):
             for c in raw_choices:
                 delta = safe_access(c, "delta", {})
+                
+                # [修复] 确保 delta 是字典，防止 AttributeError
+                if not isinstance(delta, dict):
+                    # 某些情况下 delta 可能是 Pydantic 对象
+                    if hasattr(delta, "model_dump"):
+                        delta = delta.model_dump()
+                    elif hasattr(delta, "dict"):
+                        delta = delta.dict()
+                    else:
+                        delta = {}
+
                 mapped_choices.append({
                     "index": safe_access(c, "index", 0),
                     "delta": {
