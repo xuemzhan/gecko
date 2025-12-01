@@ -1,6 +1,6 @@
 [project]
 name = "gecko-ai"
-version = "0.3.0"
+version = "0.3.1"
 description = "Next-gen modular AI Agent framework — Less is More, Plugin First"
 authors = [{ name = "Your Name", email = "zxm0813@gmail.com" }]
 readme = "README.md"
