@@ -13,6 +13,7 @@ import asyncio
 import inspect
 from typing import Any, Callable, Optional, Union, List, Set
 
+from gecko.config import get_settings
 from gecko.core.events import EventBus
 from gecko.core.logging import get_logger
 from gecko.core.exceptions import WorkflowError
@@ -39,8 +40,8 @@ class Workflow:
         event_bus: Optional[EventBus] = None,
         storage: Optional[SessionInterface] = None,
         max_steps: int = 100,
-        checkpoint_strategy: str = "always",
-        max_history_retention: int = 20,
+        checkpoint_strategy: Optional[str] = None, 
+        max_history_retention: Optional[int] = None,
         enable_retry: bool = False,
         max_retries: int = 3,
         allow_cycles: bool = False,
@@ -49,6 +50,18 @@ class Workflow:
         self.name = name
         self.event_bus = event_bus or EventBus()
         self.max_steps = max_steps
+
+        # [Fix] 动态获取最新配置
+        current_settings = get_settings()
+
+        # [优化] 解析默认值
+        strategy_val = checkpoint_strategy or current_settings.workflow_checkpoint_strategy
+        # 注意：这里使用 if is not None 判断，防止 0 被误判（虽然 config 限制 ge=1）
+        retention_val = (
+            max_history_retention 
+            if max_history_retention is not None 
+            else current_settings.workflow_history_retention
+        )
         
         # 配置项缓存 (用于 validate 时的参数)
         self._allow_cycles = allow_cycles
@@ -67,8 +80,8 @@ class Workflow:
         
         self.persistence = PersistenceManager(
             storage=storage,
-            strategy=CheckpointStrategy(checkpoint_strategy),
-            history_retention=max_history_retention
+            strategy=CheckpointStrategy(strategy_val), # 使用配置值
+            history_retention=retention_val            # 使用配置值
         )
 
     # ================= 属性代理 (兼容性支持) =================

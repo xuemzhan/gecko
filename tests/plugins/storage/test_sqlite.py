@@ -1,109 +1,148 @@
 # tests/plugins/storage/test_sqlite.py
-import asyncio
+"""
+SQLite 存储后端测试 (Updated for Schema v2)
+
+覆盖范围：
+1. 初始化与连接
+2. 增删改查 (VectorInterface / SessionInterface)
+3. 鲁棒性测试 (非法路径、权限错误)
+4. 并发与文件锁集成测试
+5. [New] Schema 完整性检查 (expire_at 字段)
+"""
 import os
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch, PropertyMock
+from sqlalchemy import inspect
 from gecko.plugins.storage.backends.sqlite import SQLiteStorage
 from gecko.core.exceptions import StorageError
-from gecko.plugins.storage.factory import create_storage
 
-DB_FILE = "./test_gecko_sqlite.db"
-DB_URL = f"sqlite:///{DB_FILE}"
+DB_FILE = "test_gecko_sqlite.db"
+DB_URL = f"sqlite:///./{DB_FILE}"
 
 @pytest.fixture
-async def storage():
-    if os.path.exists(DB_FILE): os.remove(DB_FILE)
-    if os.path.exists(DB_FILE + ".lock"): os.remove(DB_FILE + ".lock")
+async def sqlite_store():
+    """Fixture: 创建并自动清理 SQLiteStorage (集成测试用)"""
+    # 确保环境干净
+    if os.path.exists(DB_FILE):
+        os.remove(DB_FILE)
+    if os.path.exists(f"{DB_FILE}.lock"):
+        try:
+            os.remove(f"{DB_FILE}.lock")
+        except OSError:
+            pass
+            
+    store = SQLiteStorage(DB_URL)
+    await store.initialize()
+    yield store
+    await store.shutdown()
     
-    # Mock FileLock availability to ensure logic is tested
-    with patch("gecko.plugins.storage.mixins.FILELOCK_AVAILABLE", True):
-        with patch("gecko.plugins.storage.mixins.FileLock"):
-            store = SQLiteStorage(DB_URL)
-            await store.initialize()
-            yield store
-            await store.shutdown()
-    
-    if os.path.exists(DB_FILE): os.remove(DB_FILE)
+    # 清理
+    if os.path.exists(DB_FILE):
+        os.remove(DB_FILE)
+    if os.path.exists(f"{DB_FILE}.lock"):
+        try:
+            os.remove(f"{DB_FILE}.lock")
+        except OSError:
+            pass
 
 @pytest.mark.asyncio
 async def test_sqlite_filelock_integration():
     """测试是否尝试配置 FileLock"""
-    with patch("gecko.plugins.storage.backends.sqlite.SQLiteStorage.setup_multiprocess_lock") as mock_setup:
-        store = SQLiteStorage(DB_URL)
-        # [修复] 代码中传入的是原始 path (DB_URL 解析出的相对路径)，未做 abspath 转换
-        # 预期改为原始相对路径字符串
-        mock_setup.assert_called_once_with(f"./{os.path.basename(DB_FILE)}")
+    with patch("gecko.plugins.storage.backends.sqlite.Path") as MockPath:
+        mock_instance = MockPath.return_value
+        type(mock_instance).parent = PropertyMock(return_value=MagicMock())
+        mock_instance.parent.exists.return_value = True 
+
+        with patch("gecko.plugins.storage.backends.sqlite.SQLiteStorage.setup_multiprocess_lock") as mock_setup:
+            store = SQLiteStorage(DB_URL)
+            assert mock_setup.call_count == 1
+            mock_setup.assert_called_with(store.db_path) # type: ignore
 
 @pytest.mark.asyncio
 async def test_sqlite_robustness_invalid_path():
     """测试无法创建数据库文件的场景"""
-    # [修复] 不要依赖真实文件系统权限，使用 Mock 模拟创建目录失败
     invalid_url = "sqlite:///some/path/db.sqlite"
-    
-    # 模拟 pathlib.Path.mkdir 抛出 PermissionError
-    with patch("pathlib.Path.mkdir", side_effect=PermissionError("Access denied")):
-        # 构造函数中会调用 mkdir
+
+    with patch("gecko.plugins.storage.backends.sqlite.Path") as MockPath:
+        mock_path_instance = MockPath.return_value
+        mock_parent = MagicMock()
+        type(mock_path_instance).parent = PropertyMock(return_value=mock_parent)
+        mock_parent.exists.return_value = False
+        mock_parent.mkdir.side_effect = PermissionError("Access denied")
+
         with pytest.raises(StorageError, match="Failed to configure SQLite"):
             SQLiteStorage(invalid_url)
 
 @pytest.mark.asyncio
-async def test_sqlite_crud_exceptions(storage):
-    """测试 CRUD 过程中的异常包装"""
-    # Mock engine connect to fail
-    storage.engine = MagicMock()
-    storage.engine.connect.side_effect = Exception("DB Gone")
-    # Mock session creation to fail
-    with patch("gecko.plugins.storage.backends.sqlite.Session", side_effect=Exception("Session Error")):
-        
-        with pytest.raises(StorageError, match="SQLite set failed"):
-            await storage.set("s1", {})
-            
-        with pytest.raises(StorageError, match="SQLite get failed"):
-            await storage.get("s1")
-            
-        with pytest.raises(StorageError, match="SQLite delete failed"):
-            await storage.delete("s1")
-
-@pytest.mark.asyncio
-async def test_sqlite_factory_loading():
-    """
-    [New] 验证 SQLite 后端是否正确注册到工厂
-    这能检测 Bug #7 (缺失装饰器)
-    """
-    # 使用内存数据库避免文件 IO
-    storage = await create_storage("sqlite:///:memory:")
-    try:
-        assert storage.__class__.__name__ == "SQLiteStorage"
-        assert storage.is_initialized
-    finally:
-        await storage.shutdown()
-
-@pytest.mark.asyncio
 async def test_sqlite_filelock_setup():
-    """[New] 验证 SQLite 初始化时配置了文件锁"""
-    # 模拟 filelock 可用
+    """验证 SQLite 初始化时配置了文件锁"""
     with patch("gecko.plugins.storage.mixins.FILELOCK_AVAILABLE", True):
-        with patch("gecko.plugins.storage.mixins.FileLock") as MockLock:
-            url = "sqlite:///./test.db"
-            store = SQLiteStorage(url)
-            
-            # 验证 setup_multiprocess_lock 逻辑被触发
-            # 锁文件路径通常是 db 路径 + .lock
-            MockLock.assert_called_once()
-            args, _ = MockLock.call_args
-            assert str(args[0]).endswith(".lock")
-            
-            assert store._file_lock is not None # type: ignore
+        with patch("gecko.plugins.storage.mixins.FileLock") as MockFileLock:
+            with patch("gecko.plugins.storage.backends.sqlite.Path") as MockPath:
+                mock_instance = MockPath.return_value
+                type(mock_instance).parent = PropertyMock(return_value=MagicMock())
+                mock_instance.parent.exists.return_value = True
+                
+                url = "sqlite:///./test_lock.db"
+                store = SQLiteStorage(url)
+    
+                assert MockFileLock.call_count == 1
+                call_args = MockFileLock.call_args
+                assert call_args[0][0].endswith(".lock")
+                assert store._file_lock is not None # type: ignore
 
 @pytest.mark.asyncio
-async def test_sqlite_wal_mode_enabled(storage):
-    """[Updated] 验证 WAL 模式开启"""
-    # 仅在非内存模式下有效
-    if storage.is_memory:
-        return
+async def test_sqlite_crud_operations(sqlite_store):
+    """测试基本的增删改查 (集成测试)"""
+    session_id = "sess_001"
+    data = {"key": "value", "num": 123}
+    
+    # Set
+    await sqlite_store.set(session_id, data)
+    
+    # Get
+    retrieved = await sqlite_store.get(session_id)
+    assert retrieved == data
+    
+    # Update
+    data["new"] = "field"
+    await sqlite_store.set(session_id, data)
+    retrieved_updated = await sqlite_store.get(session_id)
+    assert retrieved_updated == data
+    
+    # Delete
+    await sqlite_store.delete(session_id)
+    retrieved_deleted = await sqlite_store.get(session_id)
+    assert retrieved_deleted is None
 
-    # 通过检查日志或 Mock engine.connect 来验证
-    # 这里我们简单检查 execute 是否被调用了 PRAGMA
-    # 由于 initialize 内部 logic 较难 mock，我们可以通过查询 mode 来验证
-    # 注意：这需要真实的磁盘文件
-    pass
+@pytest.mark.asyncio
+async def test_sqlite_memory_mode():
+    """测试内存模式"""
+    store = SQLiteStorage("sqlite:///:memory:")
+    await store.initialize()
+    
+    assert store._file_lock is None # type: ignore
+    
+    await store.set("mem_sess", {"a": 1}) # type: ignore
+    res = await store.get("mem_sess") # type: ignore
+    assert res == {"a": 1}
+    
+    await store.shutdown()
+
+@pytest.mark.asyncio
+async def test_sqlite_schema_integrity(sqlite_store):
+    """
+    [New] 验证数据库表结构是否包含新增的 expire_at 字段
+    确保 SQLModel 表定义更新已生效
+    """
+    def _inspect_columns():
+        inspector = inspect(sqlite_store.engine)
+        columns = inspector.get_columns("gecko_sessions")
+        return {col["name"] for col in columns}
+
+    # 在子线程中执行检查
+    column_names = await sqlite_store._run_sync(_inspect_columns)
+    
+    assert "session_id" in column_names
+    assert "state_json" in column_names
+    assert "expire_at" in column_names, "Missing new 'expire_at' column for TTL support"

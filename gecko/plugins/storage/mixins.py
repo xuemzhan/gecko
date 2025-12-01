@@ -14,10 +14,12 @@ import asyncio
 import json
 from contextlib import asynccontextmanager, contextmanager
 from functools import partial
+import os
 from typing import Any, Callable, TypeVar, Optional
 
 from anyio import to_thread
 
+from gecko.core.exceptions import ConfigurationError
 from gecko.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -90,18 +92,32 @@ class AtomicWriteMixin:
         参数:
             lock_path: 锁文件路径（通常是数据库文件路径）
         """
+        # 获取当前运行环境，默认为 development
+        env = os.getenv("GECKO_ENV", "development").lower()
+        
         if not FILELOCK_AVAILABLE:
-            logger.warning(
-                "filelock module not installed. Cross-process safety is NOT guaranteed. "
+            msg = (
+                "filelock module not installed. "
                 "Install with: pip install filelock"
+            )
+            # 生产环境强制检查
+            if env == "production":
+                raise ConfigurationError(
+                    f"[CRITICAL] Running in PRODUCTION mode without filelock! "
+                    f"This will cause data corruption in multi-worker setups. {msg}"
+                )
+            
+            logger.warning(
+                f"filelock module not installed. Cross-process safety is NOT guaranteed. {msg}"
             )
             return
 
         try:
-            # 创建 .lock 文件
             self._file_lock = FileLock(f"{lock_path}.lock") # type: ignore
             logger.debug("FileLock initialized", path=f"{lock_path}.lock")
         except Exception as e:
+            if env == "production":
+                raise ConfigurationError(f"Failed to initialize FileLock in production: {e}") from e
             logger.error("Failed to initialize FileLock", error=str(e))
 
     @asynccontextmanager

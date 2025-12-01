@@ -29,6 +29,7 @@ from gecko.plugins.storage.interfaces import SessionInterface
 from gecko.plugins.storage.mixins import JSONSerializerMixin
 from gecko.plugins.storage.registry import register_storage
 from gecko.plugins.storage.utils import parse_storage_url
+from gecko.config import get_settings
 
 logger = get_logger(__name__)
 
@@ -61,12 +62,21 @@ class RedisStorage(
             return
 
         logger.info("Connecting to Redis", url=self.url)
+
+        settings = get_settings()
         
         try:
+            # [优化] 配置 Redis 连接池
+            # redis-py 的 from_url 支持 max_connections 参数
+            max_connections = self.config.get("max_connections", settings.storage_pool_size * 2)
+            
             self.client = redis.from_url( # type: ignore
                 self.url,
                 decode_responses=True,
-                encoding="utf-8"
+                encoding="utf-8",
+                max_connections=max_connections, # [新增]
+                socket_timeout=5.0, # [新增] 防止网络卡死
+                socket_connect_timeout=5.0
             )
             if self.client:
                 await self.client.ping()

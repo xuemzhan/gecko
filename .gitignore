@@ -177,6 +177,7 @@ chroma_db/
 tmp/
 temp/
 debug.log
+test_*.lock
 
 # 示例生成的媒体文件（如果有多模态测试）
 media/
