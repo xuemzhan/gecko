@@ -12,6 +12,13 @@ from gecko.plugins.models.adapter import LiteLLMAdapter
 from gecko.plugins.models.base import BaseChatModel
 from gecko.plugins.models.config import ModelConfig
 from gecko.plugins.models.registry import register_driver
+from gecko.plugins.models.exceptions import (
+    AuthenticationError, 
+    RateLimitError, 
+    ContextWindowExceededError,
+    ServiceUnavailableError,
+    ProviderError
+)
 
 logger = get_logger(__name__)
 
@@ -203,17 +210,34 @@ class LiteLLMDriver(BaseChatModel):
             self._handle_error(e)
 
     def _handle_error(self, e: Exception) -> None:
+        """
+        统一异常映射
+        将 LiteLLM 的异常转换为 Gecko 标准异常
+        """
         msg = str(e)
         err_name = type(e).__name__
         
+        # 记录原始错误以便调试
+        logger.warning(f"LiteLLM raw error: {err_name} - {msg}")
+
         if "AuthenticationError" in err_name:
-            raise ModelError(f"Auth failed: {msg}", error_code="AUTH_ERROR") from e
+            raise AuthenticationError(f"Auth failed: {msg}") from e
+            
         if "RateLimitError" in err_name:
-            raise ModelError(f"Rate limit: {msg}", error_code="RATE_LIMIT") from e
+            # 尝试提取 retry_after，默认为 0
+            raise RateLimitError(f"Rate limit exceeded: {msg}") from e
+            
         if "ContextWindowExceededError" in err_name:
-             raise ModelError(f"Context limit: {msg}", error_code="CONTEXT_LIMIT") from e
-             
-        raise ModelError(f"LiteLLM execution failed ({err_name}): {msg}") from e
+            raise ContextWindowExceededError(f"Context limit exceeded: {msg}") from e
+            
+        if "ServiceUnavailableError" in err_name or "APIConnectionError" in err_name:
+            raise ServiceUnavailableError(f"Service unavailable: {msg}") from e
+            
+        if "Timeout" in err_name:
+            raise ServiceUnavailableError(f"Request timeout: {msg}") from e
+
+        # 兜底异常
+        raise ProviderError(f"Unknown provider error ({err_name}): {msg}") from e
     
     def _sanitize_response(self, raw: Any) -> Dict[str, Any]:
         """

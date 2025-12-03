@@ -1,12 +1,12 @@
 # gecko/compose/workflow/executor.py
 """
-节点执行器 (Node Executor)
+节点执行器 (Node Executor) - v0.4 Enhanced
 
 职责：
 1. 负责单个节点（Function / Agent / Team）的调度与执行。
-2. 实现“智能参数绑定” (Smart Binding)：根据函数签名自动注入 Context 或 Input。
+2. 实现“智能参数绑定” (Smart Binding)：根据函数签名或类型提示自动注入 Context 或 Input。
 3. 处理重试逻辑 (Retries) 与 异常捕获。
-4. 结果标准化 (Normalization)：将各种返回值统一为可序列化的格式。
+4. [v0.4 关键修复] 识别并透传 Next 控制流指令，防止被错误序列化。
 """
 from __future__ import annotations
 
@@ -31,6 +31,7 @@ class NodeExecutor:
     """
     节点执行引擎
     独立于 Workflow 主逻辑，专注于“如何执行一个节点”。
+    它是无状态的（Stateless），可以安全地在并发环境中使用。
     """
 
     def __init__(self, enable_retry: bool = False, max_retries: int = 3):
@@ -46,38 +47,39 @@ class NodeExecutor:
         """
         执行节点并返回结果（包含状态记录与异常处理）
         
-        参数:
+        Args:
             node_name: 节点名称
             node_func: 节点可调用对象
-            context: 工作流上下文
+            context: 工作流上下文 (在并行执行中，这是主 Context 的深拷贝)
             
-        返回:
+        Returns:
             执行结果（如果是 Next 指令则原样返回，否则返回标准化后的数据）
         """
         # 1. 记录执行开始状态 (Trace)
-        # 注意：此时 status=RUNNING，持久化层会利用此状态做 Pre-Commit
+        # 注意：持久化层会利用 RUNNING 状态做 Pre-Commit
         execution = NodeExecution(node_name=node_name, status=NodeStatus.RUNNING)
         context.add_execution(execution)
         
         try:
-            # 2. 执行核心逻辑 (带重试)
+            # 2. 执行核心逻辑 (根据配置决定是否重试)
             if self.enable_retry:
                 result = await self._execute_with_retry(node_func, context)
             else:
                 result = await self._dispatch_call(node_func, context)
             
-            # 3. 处理控制流指令 (Next)
+            # 3. [v0.4 关键修复] 处理控制流指令 (Next)
+            # 如果返回值是 Next 对象，必须原样返回给 Engine，
+            # 绝不能进行 _normalize_result，否则 Engine 无法识别跳转意图。
             if isinstance(result, Next):
                 execution.output_data = f"<Next -> {result.node}>"
                 execution.status = NodeStatus.SUCCESS
-                # Next 指令不进行标准化，直接交给 Engine 处理跳转
                 return result
             
             # 4. 结果标准化 (Normalization)
             # 将 Pydantic 对象、Message 对象转为 Dict/Str，便于存储和下游使用
             normalized = self._normalize_result(result)
             
-            # 更新执行记录
+            # 更新执行记录 (仅记录预览，防止大对象爆内存)
             execution.output_data = self._safe_preview(normalized)
             execution.status = NodeStatus.SUCCESS
             
@@ -87,7 +89,7 @@ class NodeExecutor:
             # 5. 异常捕获
             execution.status = NodeStatus.FAILED
             execution.error = str(e)
-            # 这里抛出异常，由上层 Engine 决定是中断还是处理
+            # 异常向上冒泡，由 Engine 或 TaskGroup 处理 (取消并行任务)
             raise e
         finally:
             execution.end_time = time.time()
@@ -102,6 +104,8 @@ class NodeExecutor:
             return result.model_dump()
         if hasattr(result, "model_dump"):
             return result.model_dump()
+        if hasattr(result, "dict"): # 兼容 Pydantic v1
+            return result.dict()
         if isinstance(result, Message):
             return result.to_openai_format()
         return result
@@ -117,17 +121,22 @@ class NodeExecutor:
     async def _execute_with_retry(self, func: Callable, context: WorkflowContext) -> Any:
         """执行带有指数退避的重试循环"""
         last_error = None
-        for attempt in range(self.max_retries):
+        for attempt in range(self.max_retries + 1):
             try:
                 return await self._dispatch_call(func, context)
             except Exception as e:
                 last_error = e
-                logger.warning(
-                    f"Node execution failed, retrying ({attempt+1}/{self.max_retries})", 
-                    error=str(e)
-                )
-                if attempt < self.max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)
+                # 如果不是最后一次尝试，则记录日志并等待
+                if attempt < self.max_retries:
+                    wait_time = 2 ** attempt
+                    logger.warning(
+                        f"Node execution failed, retrying ({attempt+1}/{self.max_retries})", 
+                        error=str(e),
+                        wait_s=wait_time
+                    )
+                    await asyncio.sleep(wait_time)
+        
+        # 重试耗尽，抛出最后一次异常
         raise last_error # type: ignore
 
     async def _dispatch_call(self, func: Callable, context: WorkflowContext) -> Any:
@@ -151,8 +160,10 @@ class NodeExecutor:
         策略：
         - 优先检查 state 中是否有 `_next_input` (由上一个节点的 Next 指令显式传递)。
         - 否则使用 `last_output`。
+        - 否则使用 原始 `input`。
         """
         # pop 确保 _next_input 是一次性的
+        # 注意：在并行执行中，context 是 deepcopy 的，pop 不会影响其他并发分支，是安全的
         if "_next_input" in context.state:
             inp = context.state.pop("_next_input")
         else:
@@ -166,8 +177,9 @@ class NodeExecutor:
         
         策略：
         1. 分析函数签名。
-        2. 如果参数名包含 `context` 或 `workflow_context`，注入 WorkflowContext 对象。
-        3. 如果还有其他位置参数未被填充，注入当前 Input 数据。
+        2. [v0.4 新增] 优先检查 Type Hint：如果参数类型是 WorkflowContext，注入 Context。
+        3. 其次检查参数名：如果包含 `context` 或 `workflow_context`，注入 Context。
+        4. 如果还有其他位置参数未被填充，注入当前 Input 数据。
         """
         sig = inspect.signature(func)
         kwargs = {}
@@ -179,22 +191,40 @@ class NodeExecutor:
         else:
             current_input = context.get_last_output()
 
-        # 2. 注入 Context (支持多种命名习惯)
-        if "context" in sig.parameters:
-            kwargs["context"] = context
-        elif "workflow_context" in sig.parameters:
-            # [Fix] 兼容旧版本测试用例中使用的参数名
-            kwargs["workflow_context"] = context
+        # 遍历参数寻找 Context 注入点
+        params_to_skip = set(["self"])
         
-        # 3. 注入 Input (Input Injection)
-        # 排除掉 self, context, workflow_context 之后，如果还有参数，则认为第一个参数是 Input
-        remaining = [
-            p for p in sig.parameters 
-            if p not in kwargs and p != "self"
+        for name, param in sig.parameters.items():
+            if name in params_to_skip:
+                continue
+            
+            # 策略 A: 基于类型注解 (Type Hint)
+            # 注意: 需要处理字符串注解的情况 (from __future__ import annotations)
+            annotation = param.annotation
+            is_context_type = False
+            
+            if annotation is not inspect.Parameter.empty:
+                if annotation is WorkflowContext:
+                    is_context_type = True
+                elif isinstance(annotation, str) and "WorkflowContext" in annotation:
+                    is_context_type = True
+            
+            # 策略 B: 基于参数名
+            is_context_name = name in ("context", "workflow_context")
+            
+            if is_context_type or is_context_name:
+                kwargs[name] = context
+                params_to_skip.add(name)
+
+        # 重新扫描以注入 Input (排除已注入 Context 的参数)
+        # 简化逻辑：排除掉 kwargs 中的参数后，剩下的第一个参数给 Input
+        remaining_params = [
+            p for name, p in sig.parameters.items()
+            if name not in kwargs and name != "self"
         ]
         
-        if remaining:
-            # 将 current_input 作为第一个位置参数传入
+        if remaining_params:
+            # 将 current_input 作为第一个剩余的位置参数传入
             args.append(current_input)
             
         # 4. 执行 (ensure_awaitable 兼容同步/异步函数)

@@ -24,6 +24,7 @@ from gecko.compose.nodes import Next
 from gecko.core.exceptions import WorkflowError, WorkflowCycleError
 from gecko.core.message import Message
 from gecko.plugins.storage.interfaces import SessionInterface
+from gecko.compose.workflow import WorkflowContext # 确保引入类型
 
 # ========================= Fixtures =========================
 
@@ -343,7 +344,9 @@ async def test_condition_evaluation_error(simple_workflow):
         assert res == 1
         
         mock_logger.error.assert_called()
-        assert "Condition evaluation failed" in mock_logger.error.call_args[0][0]
+        # [修复] 只要包含关键信息即可，不要全匹配
+        call_args = mock_logger.error.call_args[0][0]
+        assert "Condition check failed" in call_args or "Condition evaluation failed" in call_args
 
 @pytest.mark.asyncio
 async def test_max_steps_exceeded(simple_workflow):
@@ -464,3 +467,130 @@ def test_explicit_dependency_setting(simple_workflow):
     # 列表依赖
     simple_workflow.set_dependency("A", ["B"]) # 虽造成环，但 set_dependency 只管存
     assert "B" in simple_workflow.graph.node_dependencies["A"]
+
+@pytest.mark.asyncio
+async def test_workflow_parallel_execution_time(simple_workflow):
+    """
+    [Phase 2] 验证并行执行的耗时
+    构造菱形图，B 和 C 各睡 0.1s。
+    如果是串行，总耗时 > 0.2s。
+    如果是并行，总耗时 ~ 0.1s。
+    """
+    import time
+    
+    async def slow_node(ctx):
+        await asyncio.sleep(0.1)
+        return "done"
+
+    simple_workflow.add_node("Start", lambda: "start")
+    simple_workflow.add_node("B", slow_node)
+    simple_workflow.add_node("C", slow_node)
+    simple_workflow.add_node("End", lambda: "end")
+    
+    simple_workflow.set_entry_point("Start")
+    simple_workflow.add_edge("Start", "B")
+    simple_workflow.add_edge("Start", "C")
+    simple_workflow.add_edge("B", "End")
+    simple_workflow.add_edge("C", "End")
+    
+    start_time = time.time()
+    await simple_workflow.execute(None)
+    duration = time.time() - start_time
+    
+    # 验证耗时显著小于串行总和 (0.2s)，但肯定大于单节点耗时 (0.1s)
+    # 给一点 buffer，定为 0.15s
+    assert duration < 0.18, f"Execution took {duration}s, expected parallel execution"
+
+@pytest.mark.asyncio
+async def test_workflow_state_merge_diff(simple_workflow):
+    """
+    [Phase 2] 验证 State Diff 合并逻辑 (Copy-On-Write)
+    """
+    input_data = {"initial": 0}
+    
+    # [修复] 改用标准参数名 context
+    def node_b(context): 
+        context.state["b"] = 1
+        return "b_done"
+        
+    def node_c(context): 
+        context.state["c"] = 2
+        return "c_done"
+        
+    def node_check(context):
+        return context.state
+    
+    simple_workflow.add_node("Start", lambda: None)
+    simple_workflow.add_node("B", node_b)
+    simple_workflow.add_node("C", node_c)
+    simple_workflow.add_node("Check", node_check)
+    
+    simple_workflow.set_entry_point("Start")
+    # 并行层: {B, C}
+    simple_workflow.add_edge("Start", "B")
+    simple_workflow.add_edge("Start", "C")
+    # 汇聚层: {Check}
+    simple_workflow.add_edge("B", "Check")
+    simple_workflow.add_edge("C", "Check")
+    
+    final_state = await simple_workflow.execute(input_data)
+    
+    # 验证最终状态包含两个并行节点的修改
+    assert final_state.get("b") == 1
+    assert final_state.get("c") == 2
+
+@pytest.mark.asyncio
+async def test_workflow_state_merge_conflict(simple_workflow):
+    """
+    [Phase 2] 验证 State 冲突时的行为 (Last Write Wins)
+    """
+    # [修复] 改用标准参数名 context
+    def node_b(context): context.state["x"] = "B"
+    def node_c(context): context.state["x"] = "C"
+    
+    simple_workflow.add_node("Start", lambda: None)
+    simple_workflow.add_node("B", node_b)
+    simple_workflow.add_node("C", node_c)
+    # 这里用 lambda ctx 也会有问题，改为标准写法或 lambda context
+    simple_workflow.add_node("End", lambda context: context.state["x"])
+    
+    simple_workflow.set_entry_point("Start")
+
+    simple_workflow.add_edge("Start", "B")
+    simple_workflow.add_edge("Start", "C")
+    simple_workflow.add_edge("B", "End")
+    simple_workflow.add_edge("C", "End")
+    
+    res = await simple_workflow.execute(None)
+    
+    # 结果是不确定的 B 或 C，但必须是其中之一
+    assert res in ["B", "C"]
+
+@pytest.mark.asyncio
+async def test_workflow_history_parallel_aggregation(simple_workflow):
+    """
+    [Phase 2] 验证 History 和 Last Output 在并行层的聚合
+    """
+    simple_workflow.add_node("Start", lambda: "start_val")
+    simple_workflow.add_node("B", lambda: "val_b")
+    simple_workflow.add_node("C", lambda: "val_c")
+    
+    def check_history(ctx: WorkflowContext):
+        # 检查上一层 (B, C) 的输出是否聚合为字典
+        last = ctx.history["last_output"]
+        return last
+    
+    simple_workflow.add_node("End", check_history)
+    
+    simple_workflow.set_entry_point("Start")
+    simple_workflow.add_edge("Start", "B")
+    simple_workflow.add_edge("Start", "C")
+    simple_workflow.add_edge("B", "End")
+    simple_workflow.add_edge("C", "End")
+    
+    res = await simple_workflow.execute(None)
+    
+    # 在 End 节点看到的 last_output 应该是 B 和 C 的聚合字典
+    assert isinstance(res, dict)
+    assert res["B"] == "val_b"
+    assert res["C"] == "val_c"

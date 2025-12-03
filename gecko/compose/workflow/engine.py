@@ -1,17 +1,24 @@
 # gecko/compose/workflow/engine.py
 """
-Workflow 引擎主入口 (Engine Facade)
+Workflow 引擎主入口 (v0.4 Stable / 2025-12-03 Optimized)
 
-职责：
-1. 组装 Graph (拓扑), Executor (执行), Persistence (存储) 三大组件。
-2. 提供统一的对外 API (execute, resume, add_node 等)。
-3. 控制核心执行循环 (Loop) 和 两阶段提交 (Two-Phase Commit)。
+核心职责：
+1. **并行执行调度 (Phase 2 Core)**: 将 DAG 解析为执行层级 (Layers)，利用 TaskGroup 并行执行。
+2. **状态管理 (State Management)**:
+   - 隔离: 使用 Copy-On-Write (COW) 机制防止并行节点污染主上下文。
+   - 合并: 基于 Diff 的状态合并策略 (Last Write Wins)。
+3. **动态流控制 (Dynamic Flow)**: 支持 Next 指令动态跳转，可中断静态 DAG 计划。
+4. **断点恢复 (Resume Support)**: 支持从存储加载状态并从指定节点继续执行。
+5. **持久化 (Persistence)**: 细粒度的 Step 级状态保存 (Pre-Commit / Post-Commit)。
 """
 from __future__ import annotations
 
 import asyncio
 import inspect
-from typing import Any, Callable, Optional, Union, List, Set
+from collections import deque
+from typing import Any, Callable, Dict, Optional, Set, Union, List
+
+import anyio
 
 from gecko.config import get_settings
 from gecko.core.events import EventBus
@@ -32,6 +39,12 @@ logger = get_logger(__name__)
 class Workflow:
     """
     DAG 工作流引擎
+    
+    特性:
+    - 支持并行节点执行
+    - 支持条件分支
+    - 支持循环与动态跳转
+    - 支持持久化与断点恢复
     """
 
     def __init__(
@@ -51,23 +64,19 @@ class Workflow:
         self.event_bus = event_bus or EventBus()
         self.max_steps = max_steps
 
-        # [Fix] 动态获取最新配置
+        # 动态获取最新配置
         current_settings = get_settings()
 
-        # [优化] 解析默认值
         strategy_val = checkpoint_strategy or current_settings.workflow_checkpoint_strategy
-        # 注意：这里使用 if is not None 判断，防止 0 被误判（虽然 config 限制 ge=1）
         retention_val = (
             max_history_retention 
             if max_history_retention is not None 
             else current_settings.workflow_history_retention
         )
         
-        # 配置项缓存 (用于 validate 时的参数)
         self._allow_cycles = allow_cycles
         self._enable_parallel = enable_parallel
         
-        # 为了兼容旧测试直接访问 _validation_errors
         self._validation_errors = []
 
         # === 子组件组装 ===
@@ -80,13 +89,12 @@ class Workflow:
         
         self.persistence = PersistenceManager(
             storage=storage,
-            strategy=CheckpointStrategy(strategy_val), # 使用配置值
-            history_retention=retention_val            # 使用配置值
+            strategy=CheckpointStrategy(strategy_val),
+            history_retention=retention_val
         )
 
-    # ================= 属性代理 (兼容性支持) =================
+    # ================= 属性代理 (保持兼容性) =================
     
-    # [Fix] 允许测试代码通过 wf.storage = mock 注入
     @property
     def storage(self) -> Optional[SessionInterface]:
         return self.persistence.storage
@@ -116,19 +124,22 @@ class Workflow:
     # ================= 构建 API (Proxy to Graph) =================
     
     def add_node(self, name: str, func: Callable) -> "Workflow":
+        """添加节点"""
         self.graph.add_node(name, func)
         return self
 
     def add_edge(self, source: str, target: str, condition: Optional[Callable] = None) -> "Workflow":
+        """添加边 (支持条件)"""
         self.graph.add_edge(source, target, condition)
         return self
 
     def set_entry_point(self, name: str) -> "Workflow":
+        """设置入口节点"""
         self.graph.set_entry_point(name)
         return self
 
-    # [Fix] 补全 Facade 方法
     def to_mermaid(self) -> str:
+        """生成 Mermaid 图表"""
         return self.graph.to_mermaid()
         
     def print_structure(self):
@@ -140,64 +151,148 @@ class Workflow:
             allow_cycles=self.allow_cycles,
             enable_parallel=self._enable_parallel
         )
-        # 同步错误信息，满足测试断言
         self._validation_errors = errors
         return valid
 
     def add_parallel_group(self, *node_names: str) -> "Workflow":
         """
-        定义并行组 (Placeholder for v0.3)
-        注意：目前 Graph 层尚未完全实现并行分层执行，
-        此处仅做简单记录以通过接口测试。
+        [Deprecated] 定义并行组
+        v0.4 引擎会自动通过图拓扑推导并行层级，此方法保留仅作兼容。
         """
-        # 简单验证节点存在性
         for name in node_names:
             if name not in self.graph.nodes:
                 raise ValueError(f"Node '{name}' not found")
-        # 实际逻辑待后续版本完善
         return self
 
     def set_dependency(self, node: str, depends_on: Union[str, List[str]]) -> "Workflow":
-        """显式设置节点依赖"""
+        """显式设置节点依赖 (辅助构建图)"""
         deps = [depends_on] if isinstance(depends_on, str) else depends_on
-        # 代理给 Graph 维护
         self.graph.node_dependencies.setdefault(node, set()).update(deps)
         self.graph._validated = False
         return self
         
-    # [Fix] 暴露内部方法供测试调用
+    # 暴露内部方法供测试调用
     def _build_execution_layers(self, start_node: str):
         return self.graph.build_execution_layers(start_node)
     
-    # [Fix] 暴露内部方法供测试调用
     def _normalize_result(self, result: Any) -> Any:
         return self.executor._normalize_result(result)
 
-    # ================= 执行入口 (Execution) =================
+    # ================= 执行入口 (Execution Core) =================
 
-    async def execute(self, input_data: Any, session_id: Optional[str] = None) -> Any:
+    async def execute_parallel(self, input_data: Any, session_id: Optional[str] = None) -> Any:
+        """
+        并行执行入口 (Phase 2 新增别名)
+        """
+        return await self.execute(input_data, session_id)
+
+    async def execute(
+        self, 
+        input_data: Any, 
+        session_id: Optional[str] = None, 
+        start_node: Optional[str] = None,
+        _resume_context: Optional[WorkflowContext] = None
+    ) -> Any:
         """
         执行工作流 (主入口)
+        
+        Args:
+            input_data: 初始输入数据
+            session_id: 会话 ID (可选，用于持久化)
+            start_node: [v0.4] 指定起始节点 (可选，用于 Resume 或特定入口)
+            _resume_context: [v0.4] 注入已恢复的上下文 (用于 Resume)
+        
+        执行流程:
+        1. 验证图结构 (强制启用并行支持)。
+        2. 初始化或恢复上下文。
+        3. 拓扑排序：构建静态分层执行计划 (Execution Plan)。
+        4. 执行循环：逐层并行调度节点。
+        5. 状态管理：处理状态合并、持久化与动态跳转。
         """
-        # 1. 验证
+        # 1. 强制启用并行验证，允许分支结构
+        self._enable_parallel = True 
         if not self.validate():
             raise WorkflowError(f"Workflow validation failed: {self._validation_errors}")
 
-        # 2. 初始化上下文
-        context = WorkflowContext(input=input_data)
+        # 2. 上下文准备
+        if _resume_context:
+            # 恢复模式：使用传入的上下文
+            context = _resume_context
+            # 注意：恢复时通常保留原有 input，除非 input_data 显式提供新值且逻辑允许覆盖
+        else:
+            # 全新模式：创建新上下文
+            context = WorkflowContext(input=input_data)
+            
         if session_id:
             context.metadata["session_id"] = session_id
 
-        # 3. 启动循环
+        # 3. 规划执行路径
+        # 优先使用传入的 start_node (Resume 场景)，否则使用图的 Entry Point
+        entry = start_node or self.graph.entry_point
+        if not entry:
+            raise WorkflowError("No entry point defined")
+
+        # 使用 Kahn 算法构建并行层级 (Static Plan)
+        layers = self.graph.build_execution_layers(entry)
+        
+        # 将层级放入双端队列，作为初始执行计划
+        execution_queue = deque(layers)
+        
+        # 记录计划到元数据 (用于调试/UI展示)
+        context.metadata["execution_plan"] = [list(l) for l in layers]
+
+        current_step = 0
+        
         try:
-            await self._execute_loop(
-                context, 
-                session_id, 
-                start_node=self.graph.entry_point, 
-                start_step=0
-            )
-            
-            # 4. 最终保存 (Strategy=FINAL)
+            # 4. 主执行循环
+            while execution_queue:
+                # 安全检查：防止无限循环
+                if current_step >= self.max_steps:
+                    raise WorkflowError(f"Exceeded max steps: {self.max_steps}")
+
+                # 取出当前层 (Set[node_name])
+                layer = execution_queue.popleft()
+
+                # 4.1 Pre-Commit (持久化 RUNNING 状态)
+                # 记录即将执行的层，以便 Crash 后知道是在哪一步挂的
+                if session_id:
+                    await self.persistence.save_checkpoint(
+                        session_id, current_step, list(layer), context, force=True # type: ignore
+                    )
+
+                # 4.2 [核心] 并行执行当前层
+                # 返回: {node_name: {"output": ..., "state_diff": ...}}
+                layer_results = await self._execute_layer_parallel(layer, context)
+                
+                # 4.3 合并结果与状态 (Merge)
+                # 将并行节点的输出和状态变更合并回主 Context
+                self._merge_layer_results(context, layer_results)
+                
+                # 4.4 处理动态跳转 (Next)
+                # 策略: 如果层中任何节点返回了 Next，则中断静态计划，优先处理跳转
+                jump_instruction = self._handle_dynamic_jump(layer_results, context)
+                
+                if jump_instruction:
+                    target_node = jump_instruction.node
+                    logger.info(f"Dynamic jump to '{target_node}', static plan interrupted.")
+                    
+                    # 清空当前静态队列
+                    execution_queue.clear()
+                    # 将目标节点作为新的一层加入，转为动态执行模式
+                    execution_queue.append({target_node})
+                    # 清除上下文中的指针，防止污染
+                    context.clear_next_pointer()
+                
+                # 4.5 Post-Commit (持久化 SUCCESS 状态)
+                # 记录本层已完成
+                if session_id:
+                    await self.persistence.save_checkpoint(
+                        session_id, current_step, list(layer), context # type: ignore
+                    )
+                
+                current_step += 1
+
+            # 5. 最终保存 (Strategy=FINAL)
             if self.persistence.strategy == CheckpointStrategy.FINAL:
                 await self.persistence.save_checkpoint(
                     session_id, 9999, None, context, force=True # type: ignore
@@ -205,161 +300,232 @@ class Workflow:
                 
             return context.get_last_output()
             
-        except WorkflowError:
-            # 已经是封装好的异常，直接抛出
-            raise
         except Exception as e:
             logger.exception("Workflow execution failed")
-            # [Fix] 包装通用异常，满足 test_node_execution_failure 预期
-            raise WorkflowError(f"Workflow execution failed: {e}") from e
+            if not isinstance(e, WorkflowError):
+                raise WorkflowError(f"Workflow execution failed: {e}") from e
+            raise
 
-    async def execute_parallel(self, input_data: Any, session_id: Optional[str] = None) -> Any:
+    async def _execute_layer_parallel(self, layer: Set[str], context: WorkflowContext) -> Dict[str, Any]:
         """
-        并行执行入口 (Stub)
-        目前复用串行 execute，待 Graph.build_execution_layers 完善后对接
+        并行执行单层节点
+        
+        Args:
+            layer: 当前层的节点集合
+            context: 主上下文
+            
+        Returns:
+            Dict[node_name, exec_result_wrapper]
         """
-        return await self.execute(input_data, session_id)
+        results: Dict[str, Any] = {}
+        
+        # 使用 anyio.create_task_group 实现结构化并发
+        # 如果任一任务抛出异常，整个 Group 会被取消
+        async with anyio.create_task_group() as tg:
+            for node_name in layer:
+                node_func = self.graph.nodes[node_name]
+                
+                # [核心机制] Copy-On-Write (COW)
+                # 为每个节点创建 Context 的深拷贝，防止并发修改 State 导致竞态。
+                # 仅 input 保持只读引用，history/state 均被隔离。
+                node_context = context.model_copy(deep=True)
+                
+                tg.start_soon(
+                    self._run_node_wrapper, 
+                    node_name, 
+                    node_func, 
+                    node_context, 
+                    results
+                )
+        
+        return results
+
+    async def _run_node_wrapper(
+        self, 
+        name: str, 
+        func: Callable, 
+        ctx: WorkflowContext, 
+        results: Dict[str, Any]
+    ):
+        """
+        节点执行包装器 (Worker)
+        
+        职责:
+        1. 运行时条件检查 (Condition Check)
+        2. 调用 Executor 执行节点
+        3. 捕获结果与状态变更 (Diff Calculation)
+        """
+        # 1. 运行时条件检查
+        # 逻辑: 只要有一条指向本节点的边满足条件 (OR 逻辑)，则执行。
+        # 如果所有入边的条件都不满足，则跳过。
+        incoming_edges = []
+        for src, edges in self.graph.edges.items():
+            for target, cond in edges:
+                if target == name:
+                    incoming_edges.append((src, cond))
+        
+        if incoming_edges:
+            should_run = False
+            for src, cond in incoming_edges:
+                # 只有当上游已执行 (在 history 中) 或者是 Start 节点时，条件才有意义
+                # 如果上游节点未执行（被跳过），则该路径视为不通
+                if src == self.graph.entry_point or src in ctx.history:
+                    # 无条件边 -> 视为 True
+                    if cond is None:
+                        should_run = True
+                        break
+                    try:
+                        # 评估条件 (支持 sync/async)
+                        res = cond(ctx)
+                        if inspect.isawaitable(res):
+                            res = await res
+                        if res:
+                            should_run = True
+                            break
+                    except Exception as e:
+                        # 条件执行报错视为不通过 (Fail Safe)
+                        logger.error(f"Condition check failed for {src}->{name}: {e}")
+            
+            if not should_run:
+                logger.info(f"Node {name} skipped due to conditions")
+                return
+
+        # 2. 执行节点
+        try:
+            output = await self.executor.execute_node(name, func, ctx)
+            
+            # 3. 计算 State Diff
+            # 简单策略：直接返回当前节点的所有 state，由 merge 负责更新 (Last Write Wins)
+            # 进阶策略：可以对比 ctx.state 和初始快照，只返回变更部分
+            state_diff = ctx.state 
+            
+            # 写入结果容器 (线程安全，因为是在协程回调中写入 dict)
+            results[name] = {
+                "output": output,
+                "state_diff": state_diff
+            }
+        except Exception as e:
+            # 异常冒泡，TaskGroup 会捕获并取消其他任务
+            raise e
+
+    def _merge_layer_results(self, context: WorkflowContext, results: Dict[str, Any]):
+        """
+        合并并行结果回主上下文 (Synchronization Point)
+        """
+        layer_outputs = {}
+        
+        for node_name, res in results.items():
+            output = res["output"]
+            state_diff = res["state_diff"]
+            
+            # [Fix] 处理 Next 对象：确保 History 存储的是实际数据 Input
+            # Executor 现在返回原始 Next 对象，这里需要解包
+            actual_data = output
+            if isinstance(output, Next):
+                actual_data = output.input
+            
+            # 兼容性处理：如果 Executor 返回的是 dict 形式的 Next (被意外 normalize 了)
+            elif isinstance(output, dict) and output.get("node") and "<Next" in str(output):
+                 actual_data = output.get("input")
+
+            # 更新 History
+            context.history[node_name] = actual_data
+            layer_outputs[node_name] = actual_data
+            
+            # 合并 State (Last Write Wins)
+            # 并行节点若修改同一 Key，后处理者覆盖前者
+            if state_diff:
+                context.state.update(state_diff)
+        
+        # 更新 Last Output (供下一层使用)
+        if not layer_outputs:
+            return
+
+        if len(layer_outputs) == 1:
+            # 单节点：直接作为值
+            context.history["last_output"] = list(layer_outputs.values())[0]
+        else:
+            # 多节点：聚合为字典 {node_name: output}
+            context.history["last_output"] = layer_outputs
+
+    def _handle_dynamic_jump(self, results: Dict[str, Any], context: WorkflowContext) -> Optional[Next]:
+        """
+        检查并处理动态跳转 (Next)
+        
+        Args:
+            results: 当前层的执行结果
+            
+        Returns:
+            找到的第一个 Next 指令 (如果有)
+        """
+        for res in results.values():
+            val = res["output"]
+            
+            if isinstance(val, Next):
+                # 将 Next.input 注入 state 的 _next_input，供下一个节点作为 input 使用
+                if val.input is not None:
+                    context.state["_next_input"] = val.input
+                
+                # 处理附带的 state 更新
+                if val.update_state:
+                    context.state.update(val.update_state)
+                    
+                return val
+        return None
 
     async def resume(self, session_id: str) -> Any:
         """
         从存储恢复执行
+        
+        逻辑：
+        1. 加载 Checkpoint 数据。
+        2. 重建 WorkflowContext。
+        3. 确定断点位置 (Next Pointer 优先，其次是 Last Node 的下游)。
+        4. 调用 execute 从断点继续运行。
         """
-        # 1. 加载
         data = await self.persistence.load_checkpoint(session_id)
         if not data:
             raise ValueError(f"Session {session_id} not found")
             
-        # 2. 重建 Context (自动补全缺失字段)
         try:
             context = WorkflowContext.from_storage_payload(data["context"])
         except Exception as e:
             raise WorkflowError(f"Failed to reconstruct context: {e}") from e
 
         last_node = data.get("last_node")
-        step = data.get("step", 0)
         
-        # 3. 决定下一步 (优先 Next Pointer -> 其次 Graph Search -> 最后 Entry)
-        next_node = None
-        
+        # 1. 动态跳转优先 (Next Pointer)
         if context.next_pointer:
             next_node = context.next_pointer.get("target_node")
             # 恢复 Next 携带的输入
             if context.next_pointer.get("input") is not None:
                 context.state["_next_input"] = context.next_pointer["input"]
-        elif last_node:
-            # 查找下一跳
-            next_node = await self._find_next_node(last_node, context)
-        else:
-            next_node = self.graph.entry_point
             
-        # 4. 继续循环
-        try:
-            await self._execute_loop(context, session_id, next_node, step)
-            return context.get_last_output()
-        except Exception as e:
-            if not isinstance(e, WorkflowError):
-                raise WorkflowError(f"Resume execution failed: {e}") from e
-            raise
+            logger.info(f"Resuming workflow from dynamic jump: {next_node}")
+            return await self.execute(
+                input_data=context.input,
+                session_id=session_id,
+                start_node=next_node,
+                _resume_context=context # 注入恢复后的上下文
+            )
 
-    # ================= 内部循环 (The Loop) =================
-
-    async def _execute_loop(
-        self, 
-        context: WorkflowContext, 
-        session_id: Optional[str],
-        start_node: Optional[str], 
-        start_step: int
-    ):
-        """核心执行循环"""
-        current_node = start_node
-        steps = start_step
+        # 2. 静态流程恢复 (Last Node Successor)
+        next_node = None
+        if last_node:
+             edges = self.graph.edges.get(last_node, [])
+             if edges:
+                 # 简单取第一条出边 (复杂分叉恢复需更完整状态记录)
+                 next_node = edges[0][0] 
         
-        # 标记是否为恢复后的首步
-        is_first_step_of_run = True
-        
-        while current_node and steps < self.max_steps:
-            steps += 1
+        if next_node:
+            logger.info(f"Resuming workflow from static flow: {next_node}")
+            return await self.execute(
+                input_data=context.input,
+                session_id=session_id,
+                start_node=next_node,
+                _resume_context=context
+            )
             
-            # 1. 持久化 Pre-Commit (保存 RUNNING 状态)
-            # 确保即使节点执行 Crash，也能知道是在哪个节点挂的
-            if session_id:
-                await self.persistence.save_checkpoint(
-                    session_id, steps, current_node, context, force=True
-                )
-
-            # 2. 执行节点
-            node_func = self.graph.nodes[current_node]
-            result = await self.executor.execute_node(current_node, node_func, context)
-            
-            # 如果是从 Next Pointer 恢复的，首步执行成功后清除指针
-            if is_first_step_of_run:
-                context.clear_next_pointer()
-                is_first_step_of_run = False
-            
-            # 3. 处理流转
-            next_target = None
-            
-            if isinstance(result, Next):
-                next_target = result.node
-                # 处理 Next 携带的数据
-                if result.input is not None:
-                    context.history["last_output"] = result.input
-                    context.state["_next_input"] = result.input
-                if result.update_state:
-                    context.state.update(result.update_state)
-                
-                # 设置 pointer (动态跳转)
-                context.next_pointer = {
-                    "target_node": next_target,
-                    "input": context.state.get("_next_input")
-                }
-            else:
-                # 正常流转：结果存入历史
-                context.history[current_node] = result
-                context.history["last_output"] = result
-                context.clear_next_pointer()
-                
-                # 查找图中的下一跳
-                next_target = await self._find_next_node(current_node, context)
-
-            # 4. 持久化 Post-Commit (保存 SUCCESS 状态及跳转目标)
-            if session_id:
-                # 注意：这里传的是 current_node，状态是刚执行完的状态
-                await self.persistence.save_checkpoint(
-                    session_id, steps, current_node, context
-                )
-                
-            current_node = next_target
-
-        # 步数超限检查
-        if steps >= self.max_steps:
-            raise WorkflowError(f"Exceeded max steps: {self.max_steps}")
-
-    async def _find_next_node(self, current: str, context: WorkflowContext) -> Optional[str]:
-        """
-        查找下一个节点
-        
-        [Fix] 这里的逻辑必须独立于 Executor。
-        Executor 的 dispatch 倾向于注入 input，但 Condition 函数
-        严格定义为 func(context) -> bool。
-        """
-        edges = self.graph.edges.get(current, [])
-        for target, condition in edges:
-            should_go = False
-            if condition is None:
-                should_go = True
-            else:
-                try:
-                    # 显式检查协程并调用
-                    if inspect.iscoroutinefunction(condition):
-                        should_go = await condition(context)
-                    else:
-                        should_go = condition(context)
-                except Exception as e:
-                    logger.error("Condition evaluation failed", source=current, target=target, error=str(e))
-                    # 条件报错视为 False
-                    should_go = False
-            
-            if should_go:
-                return target
-        return None
+        # 3. 无法确定下一跳，返回历史结果
+        logger.warning(f"Could not determine next step from checkpoint {session_id}. Returning last output.")
+        return context.get_last_output()

@@ -11,6 +11,13 @@ from gecko.plugins.models.config import ModelConfig
 from gecko.plugins.models.presets.zhipu import ZhipuChat
 from gecko.core.protocols import CompletionResponse, StreamChunk
 from gecko.core.exceptions import ModelError
+from gecko.plugins.models.exceptions import (
+    AuthenticationError,
+    RateLimitError,
+    ContextWindowExceededError,
+    ServiceUnavailableError,
+    ProviderError
+)
 
 # ===================== 1. 单元测试 (Mock) =====================
 
@@ -69,10 +76,23 @@ async def test_litellm_driver_error():
     config = ModelConfig(model_name="gpt-mock")
     driver = LiteLLMDriver(config)
 
-    with patch("gecko.plugins.models.drivers.litellm_driver.litellm.acompletion", side_effect=Exception("Auth Failed")):
-        with pytest.raises(ModelError) as exc:
+    # 1. 测试通用异常 -> ProviderError
+    with patch("gecko.plugins.models.drivers.litellm_driver.litellm.acompletion", side_effect=Exception("Generic Error")):
+        # [修复] 断言 ProviderError
+        with pytest.raises(ProviderError) as exc:
             await driver.acompletion([])
-        assert "LiteLLM execution failed" in str(exc.value)
+        assert "Unknown provider error" in str(exc.value)
+        assert "Generic Error" in str(exc.value)
+
+    # 2. [新增] 测试特定异常映射 (例如 Auth)
+    # 模拟 LiteLLM 抛出的 AuthenticationError (通过类名匹配)
+    AuthErr = type("AuthenticationError", (Exception,), {})
+    
+    with patch("gecko.plugins.models.drivers.litellm_driver.litellm.acompletion", side_effect=AuthErr("Invalid Key")):
+        # [修复] 断言 AuthenticationError
+        with pytest.raises(AuthenticationError) as exc:
+            await driver.acompletion([])
+        assert "Auth failed" in str(exc.value)
 
 # ===================== 2. 集成测试 (Zhipu Live) =====================
 
@@ -182,3 +202,50 @@ async def test_litellm_token_count_fallback():
         
         # "hello world" (11 chars) // 3 = 3
         assert count == 3
+
+@pytest.mark.asyncio
+async def test_litellm_driver_standard_exceptions():
+    """
+    [Phase 1] 验证 LiteLLMDriver 正确映射异常到 Gecko 标准异常体系
+    """
+    from gecko.plugins.models.drivers.litellm_driver import LiteLLMDriver
+    from gecko.plugins.models.config import ModelConfig
+    
+    driver = LiteLLMDriver(ModelConfig(model_name="mock"))
+    
+    # 辅助函数：构造特定类型的 LiteLLM 异常
+    def raise_litellm_error(error_name, msg="mock error"):
+        # 模拟 LiteLLM 异常，主要依赖类名匹配
+        # 这里动态创建一个异常类来模拟
+        E = type(error_name, (Exception,), {})
+        return E(msg)
+
+    # 1. AuthenticationError
+    with patch("gecko.plugins.models.drivers.litellm_driver.litellm.acompletion", 
+               side_effect=raise_litellm_error("AuthenticationError")):
+        with pytest.raises(AuthenticationError):
+            await driver.acompletion([])
+
+    # 2. RateLimitError
+    with patch("gecko.plugins.models.drivers.litellm_driver.litellm.acompletion", 
+               side_effect=raise_litellm_error("RateLimitError")):
+        with pytest.raises(RateLimitError):
+            await driver.acompletion([])
+
+    # 3. ContextWindowExceededError
+    with patch("gecko.plugins.models.drivers.litellm_driver.litellm.acompletion", 
+               side_effect=raise_litellm_error("ContextWindowExceededError")):
+        with pytest.raises(ContextWindowExceededError):
+            await driver.acompletion([])
+
+    # 4. ServiceUnavailableError (APIConnectionError / ServiceUnavailableError / Timeout)
+    with patch("gecko.plugins.models.drivers.litellm_driver.litellm.acompletion", 
+               side_effect=raise_litellm_error("APIConnectionError")):
+        with pytest.raises(ServiceUnavailableError):
+            await driver.acompletion([])
+            
+    # 5. Unknown -> ProviderError
+    with patch("gecko.plugins.models.drivers.litellm_driver.litellm.acompletion", 
+               side_effect=raise_litellm_error("SomeWeirdError")):
+        with pytest.raises(ProviderError):
+            await driver.acompletion([])
