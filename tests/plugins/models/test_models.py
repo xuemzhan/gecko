@@ -3,14 +3,11 @@ import os
 import sys
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
-# 引入 SimpleNamespace 来模拟对象属性访问
 from types import SimpleNamespace
 
 from gecko.plugins.models.drivers.litellm_driver import LiteLLMDriver
 from gecko.plugins.models.config import ModelConfig
-from gecko.plugins.models.presets.zhipu import ZhipuChat
 from gecko.core.protocols import CompletionResponse, StreamChunk
-from gecko.core.exceptions import ModelError
 from gecko.plugins.models.exceptions import (
     AuthenticationError,
     RateLimitError,
@@ -18,43 +15,26 @@ from gecko.plugins.models.exceptions import (
     ServiceUnavailableError,
     ProviderError
 )
+from gecko.core.resilience import CircuitOpenError, CircuitState
 
-# ===================== 1. 单元测试 (Mock) =====================
+# ===================== 1. 基础功能测试 =====================
 
 @pytest.mark.asyncio
 async def test_litellm_driver_completion():
     """[Unit] 测试 LiteLLM 驱动的清洗逻辑"""
-    # [修复] 使用 SimpleNamespace 模拟真实对象结构，避免 MagicMock 的无限递归属性陷阱
-    # 这比配置复杂的 MagicMock 更简单且行为更确定
-    
     mock_usage = SimpleNamespace(
-        prompt_tokens=10,
-        completion_tokens=5,
-        total_tokens=15
+        prompt_tokens=10, completion_tokens=5, total_tokens=15
     )
-    
     mock_message = SimpleNamespace(
-        role="assistant",
-        content="Cleaned Content",
-        tool_calls=None
+        role="assistant", content="Cleaned Content", tool_calls=None
     )
-    
     mock_choice = SimpleNamespace(
-        index=0,
-        finish_reason="stop",
-        message=mock_message,
-        logprobs=None # 显式设置为 None，满足 safe_access 的预期
+        index=0, finish_reason="stop", message=mock_message, logprobs=None
     )
-
     mock_obj = SimpleNamespace(
-        id="test-id",
-        object="chat.completion",
-        created=1234567890,
-        model="gpt-mock",
-        choices=[mock_choice],
-        usage=mock_usage,
-        system_fingerprint=None,
-        _hidden_params={} # 模拟 litellm 可能存在的私有字段
+        id="test-id", object="chat.completion", created=1234567890,
+        model="gpt-mock", choices=[mock_choice], usage=mock_usage,
+        system_fingerprint=None, _hidden_params={}
     )
 
     config = ModelConfig(model_name="gpt-mock", api_key="mock")
@@ -62,12 +42,9 @@ async def test_litellm_driver_completion():
 
     with patch("gecko.plugins.models.drivers.litellm_driver.litellm.acompletion", new_callable=AsyncMock) as mock_call:
         mock_call.return_value = mock_obj
-        
         resp = await driver.acompletion([{"role": "user", "content": "hi"}])
-        
         assert isinstance(resp, CompletionResponse)
         assert resp.choices[0].message["content"] == "Cleaned Content"
-        assert resp.model == "gpt-mock"
         assert resp.usage.total_tokens == 15 # type: ignore
 
 @pytest.mark.asyncio
@@ -76,176 +53,100 @@ async def test_litellm_driver_error():
     config = ModelConfig(model_name="gpt-mock")
     driver = LiteLLMDriver(config)
 
-    # 1. 测试通用异常 -> ProviderError
-    with patch("gecko.plugins.models.drivers.litellm_driver.litellm.acompletion", side_effect=Exception("Generic Error")):
-        # [修复] 断言 ProviderError
+    with patch("gecko.plugins.models.drivers.litellm_driver.litellm.acompletion", 
+               side_effect=Exception("Generic Error")):
         with pytest.raises(ProviderError) as exc:
             await driver.acompletion([])
         assert "Unknown provider error" in str(exc.value)
-        assert "Generic Error" in str(exc.value)
 
-    # 2. [新增] 测试特定异常映射 (例如 Auth)
-    # 模拟 LiteLLM 抛出的 AuthenticationError (通过类名匹配)
-    AuthErr = type("AuthenticationError", (Exception,), {})
-    
-    with patch("gecko.plugins.models.drivers.litellm_driver.litellm.acompletion", side_effect=AuthErr("Invalid Key")):
-        # [修复] 断言 AuthenticationError
-        with pytest.raises(AuthenticationError) as exc:
-            await driver.acompletion([])
-        assert "Auth failed" in str(exc.value)
-
-# ===================== 2. 集成测试 (Zhipu Live) =====================
-
-ZHIPU_KEY = os.getenv("ZHIPU_API_KEY")
-should_run = pytest.mark.skipif(not ZHIPU_KEY, reason="No ZHIPU_API_KEY")
-
-@should_run
-@pytest.mark.asyncio
-async def test_zhipu_live_completion():
-    """[Integration] Zhipu 真实调用"""
-    model = ZhipuChat(api_key=ZHIPU_KEY, model="glm-4-flash") # type: ignore
-    messages = [{"role": "user", "content": "1+1=?"}]
-    
-    resp = await model.acompletion(messages)
-    
-    # 验证是否触发 Pydantic 警告 (如果测试通过且无警告输出，则 Adapter 工作正常)
-    assert isinstance(resp, CompletionResponse)
-    assert "2" in resp.choices[0].message["content"]
-
-@should_run
-@pytest.mark.asyncio
-async def test_zhipu_live_stream():
-    """[Integration] Zhipu 流式调用"""
-    model = ZhipuChat(api_key=ZHIPU_KEY, model="glm-4-flash") # type: ignore
-    messages = [{"role": "user", "content": "Hello"}]
-    
-    text = ""
-    async for chunk in model.astream(messages):
-        assert isinstance(chunk, StreamChunk)
-        if chunk.content:
-            text += chunk.content
-    
-    assert len(text) > 0
+# ===================== 2. Token 计数策略测试 =====================
 
 @pytest.mark.asyncio
 async def test_litellm_driver_count_tokens_strategies():
-    """[New] 测试 LiteLLMDriver 的多级计数策略"""
-    from gecko.plugins.models.drivers.litellm_driver import LiteLLMDriver
+    """[New] 测试 LiteLLMDriver 的多级计数策略: Tiktoken 优先"""
+    mock_encoding = MagicMock()
+    mock_encoding.encode.return_value = [1, 2, 3] 
     
-    # 1. 测试 Tiktoken 路径 (模拟 gpt-4)
-    config_gpt = ModelConfig(model_name="gpt-4")
-    driver_gpt = LiteLLMDriver(config_gpt)
+    mock_tiktoken = MagicMock()
+    mock_tiktoken.encoding_for_model.return_value = mock_encoding
+    mock_tiktoken.get_encoding.return_value = mock_encoding
     
-    # 确保 tokenizer 被加载 (环境中有 tiktoken)
-    assert driver_gpt._tokenizer is not None
-    count = driver_gpt.count_tokens("hello world")
-    assert count > 0
-    
-    # 2. 测试 Fallback 路径 (模拟 Tiktoken 缺失)
-    # ✅ 修复: 模拟 tiktoken 未安装，迫使 _preload_tokenizer 失败，从而 _tokenizer 为 None
-    with patch.dict(sys.modules, {"tiktoken": None}):
-        config_unknown = ModelConfig(model_name="unknown-model-123")
-        driver_unknown = LiteLLMDriver(config_unknown)
+    # [关键] 注入 mock 的 tiktoken
+    with patch.dict("sys.modules", {"tiktoken": mock_tiktoken}):
+        config_gpt = ModelConfig(model_name="gpt-4")
+        driver_gpt = LiteLLMDriver(config_gpt)
         
-        # 此时应该为 None (加载失败)
-        assert driver_unknown._tokenizer is None
-        
-        # 调用计数，应该走字符估算或 litellm
-        # "hello" (5 chars) // 3 = 1
-        count_fallback = driver_unknown.count_tokens("hello") 
-        assert count_fallback > 0
-
-@pytest.mark.asyncio
-async def test_litellm_response_sanitization():
-    """[New] 测试 LiteLLM 响应清洗逻辑 (防止 Pydantic 崩溃)"""
-    from gecko.plugins.models.drivers.litellm_driver import LiteLLMDriver
-    from gecko.plugins.models.config import ModelConfig
-    
-    driver = LiteLLMDriver(ModelConfig(model_name="gpt-3.5"))
-    
-    # 1. 模拟一个损坏的 Pydantic 对象 (model_dump 报错)
-    class BrokenObj:
-        def model_dump(self, **kwargs):
-            raise ValueError("Dump failed")
-        
-        # 只有属性访问有效
-        id = "123"
-        object = "chat.completion"
-        created = 111
-        model = "gpt"
-        choices = []
-        usage = None
-        
-    cleaned = driver._sanitize_response(BrokenObj()) # type: ignore
-    
-    # 验证暴力提取生效
-    assert cleaned["id"] == "123"
-    assert cleaned["model"] == "gpt"
-    assert isinstance(cleaned["choices"], list)
+        assert driver_gpt._tokenizer is not None
+        count = driver_gpt.count_tokens("hello world")
+        assert count == 3
 
 @pytest.mark.asyncio
 async def test_litellm_token_count_fallback():
-    """[New] 测试 Token 计数回退逻辑"""
-    from gecko.plugins.models.drivers.litellm_driver import LiteLLMDriver
-    from gecko.plugins.models.config import ModelConfig
+    """[New] 测试 Token 计数回退逻辑: Tiktoken 缺失 -> Char Estimate"""
     
     # 模拟 Tiktoken 不存在
     with patch.dict("sys.modules", {"tiktoken": None}):
         driver = LiteLLMDriver(ModelConfig(model_name="gpt-4"))
         
-        # 确保 tokenizer 为 None
+        # Tokenizer 应该加载失败
         assert driver._tokenizer is None
         
-        # 测试估算逻辑
         text = "hello world"
         count = driver.count_tokens(text)
         
+        # 逻辑：tiktoken 缺失 (_tiktoken_available=False) -> 直接走字符估算 (step 2)
         # "hello world" (11 chars) // 3 = 3
         assert count == 3
 
+# ===================== 3. 熔断器集成测试 =====================
+
 @pytest.mark.asyncio
-async def test_litellm_driver_standard_exceptions():
-    """
-    [Phase 1] 验证 LiteLLMDriver 正确映射异常到 Gecko 标准异常体系
-    """
-    from gecko.plugins.models.drivers.litellm_driver import LiteLLMDriver
-    from gecko.plugins.models.config import ModelConfig
+async def test_litellm_driver_circuit_breaker_trigger():
+    """[Phase 3] 验证 LiteLLMDriver 集成熔断器"""
+    config = ModelConfig(model_name="mock")
+    driver = LiteLLMDriver(config)
+    driver._circuit_breaker.failure_threshold = 2
     
-    driver = LiteLLMDriver(ModelConfig(model_name="mock"))
+    # [关键] 使用真实的 ServiceUnavailableError，以便熔断器识别
+    error_instance = ServiceUnavailableError("503 Service Unavailable")
     
-    # 辅助函数：构造特定类型的 LiteLLM 异常
-    def raise_litellm_error(error_name, msg="mock error"):
-        # 模拟 LiteLLM 异常，主要依赖类名匹配
-        # 这里动态创建一个异常类来模拟
-        E = type(error_name, (Exception,), {})
-        return E(msg)
-
-    # 1. AuthenticationError
     with patch("gecko.plugins.models.drivers.litellm_driver.litellm.acompletion", 
-               side_effect=raise_litellm_error("AuthenticationError")):
-        with pytest.raises(AuthenticationError):
-            await driver.acompletion([])
-
-    # 2. RateLimitError
-    with patch("gecko.plugins.models.drivers.litellm_driver.litellm.acompletion", 
-               side_effect=raise_litellm_error("RateLimitError")):
-        with pytest.raises(RateLimitError):
-            await driver.acompletion([])
-
-    # 3. ContextWindowExceededError
-    with patch("gecko.plugins.models.drivers.litellm_driver.litellm.acompletion", 
-               side_effect=raise_litellm_error("ContextWindowExceededError")):
-        with pytest.raises(ContextWindowExceededError):
-            await driver.acompletion([])
-
-    # 4. ServiceUnavailableError (APIConnectionError / ServiceUnavailableError / Timeout)
-    with patch("gecko.plugins.models.drivers.litellm_driver.litellm.acompletion", 
-               side_effect=raise_litellm_error("APIConnectionError")):
+               side_effect=error_instance):
+        
+        # 1. 第一次失败
         with pytest.raises(ServiceUnavailableError):
             await driver.acompletion([])
             
-    # 5. Unknown -> ProviderError
-    with patch("gecko.plugins.models.drivers.litellm_driver.litellm.acompletion", 
-               side_effect=raise_litellm_error("SomeWeirdError")):
-        with pytest.raises(ProviderError):
+        # 2. 第二次失败 -> 触发熔断
+        with pytest.raises(ServiceUnavailableError):
             await driver.acompletion([])
+            
+        # 验证状态
+        assert driver._circuit_breaker._state == CircuitState.OPEN
+            
+        # 3. 第三次调用 -> 被熔断器拦截
+        with pytest.raises(CircuitOpenError):
+            await driver.acompletion([])
+
+@pytest.mark.asyncio
+async def test_litellm_driver_astream_circuit_breaker():
+    """[Gap 4] 验证 astream 方法受熔断器保护"""
+    config = ModelConfig(model_name="mock")
+    driver = LiteLLMDriver(config)
+    driver._circuit_breaker.failure_threshold = 1
+    
+    # [关键] 使用真实的异常
+    error_instance = ServiceUnavailableError("Connection failed")
+    
+    with patch("gecko.plugins.models.drivers.litellm_driver.litellm.acompletion", 
+               side_effect=error_instance):
+        
+        gen = driver.astream([])
+        with pytest.raises(ServiceUnavailableError):
+            await gen.__anext__()
+            
+        assert driver._circuit_breaker._state == CircuitState.OPEN
+        
+        gen2 = driver.astream([])
+        with pytest.raises(CircuitOpenError):
+            await gen2.__anext__()

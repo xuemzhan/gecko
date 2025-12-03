@@ -16,8 +16,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from typing import Any, List
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -27,6 +29,7 @@ from gecko.core.memory import (
     shutdown_token_executor,
 )
 from gecko.core.memory._executor import get_token_executor
+from gecko.core.memory.hybrid import HybridMemory
 from gecko.core.message import Message
 
 
@@ -777,3 +780,88 @@ def test_shutdown_token_executor_idempotent():
     """
     shutdown_token_executor()
     shutdown_token_executor()
+
+
+@pytest.mark.asyncio
+async def test_hybrid_memory_parallel_execution_strict():
+    """
+    [Gap 2] 严谨验证并行执行。
+    通过 Mock 父类方法强制增加延时，证明 asyncio.gather 生效。
+    """
+    mock_vec = AsyncMock()
+    mock_embed = AsyncMock()
+    
+    # 模拟向量检索耗时 0.2s
+    async def slow_search(*args, **kwargs):
+        await asyncio.sleep(0.2)
+        return []
+    mock_vec.search.side_effect = slow_search
+    
+    memory = HybridMemory(
+        session_id="test-parallel",
+        vector_store=mock_vec,
+        embedder=mock_embed
+    )
+    
+    # Mock 父类 TokenMemory.get_history 耗时 0.2s
+    # 注意：patch 的路径取决于 HybridMemory 继承的模块路径
+    with patch("gecko.core.memory.base.TokenMemory.get_history", new_callable=AsyncMock) as mock_super:
+        async def slow_super(*args, **kwargs):
+            await asyncio.sleep(0.2)
+            return [Message.user("hi")]
+        mock_super.side_effect = slow_super
+        
+        import time
+        start = time.time()
+        
+        await memory.get_history([{"role": "user", "content": "hi"}], query="hi")
+        
+        duration = time.time() - start
+        
+        # 串行需要 0.4s，并行只需要 ~0.2s
+        # 考虑到开销，断言小于 0.35s 即可证明不是串行
+        assert duration < 0.35
+        assert mock_vec.search.called
+        assert mock_super.called
+
+@pytest.mark.asyncio
+async def test_hybrid_memory_archive_message():
+    """
+    [Gap 3] 验证消息归档逻辑
+    """
+    mock_vec = AsyncMock()
+    mock_embed = AsyncMock()
+    mock_embed.embed_query.return_value = [0.1, 0.2, 0.3] # Mock 向量
+    
+    memory = HybridMemory(
+        session_id="test-archive",
+        vector_store=mock_vec,
+        embedder=mock_embed
+    )
+    
+    msg = Message(role="assistant", content="Important memory")
+    await memory.archive_message(msg)
+    
+    # 验证调用了 embedder
+    mock_embed.embed_query.assert_called_with("Important memory")
+    
+    # 验证调用了 upsert
+    mock_vec.upsert.assert_called_once()
+    call_args = mock_vec.upsert.call_args[0][0] # list[dict]
+    doc = call_args[0]
+    
+    assert doc["text"] == "Important memory"
+    assert doc["embedding"] == [0.1, 0.2, 0.3]
+    assert doc["metadata"]["session_id"] == "test-archive"
+    assert doc["metadata"]["role"] == "assistant"
+
+@pytest.mark.asyncio
+async def test_hybrid_memory_archive_skips_short_message():
+    """
+    验证过短消息不归档
+    """
+    mock_vec = AsyncMock()
+    memory = HybridMemory("sid", mock_vec, AsyncMock())
+    
+    await memory.archive_message(Message.user("short")) # < 10 chars
+    mock_vec.upsert.assert_not_called()

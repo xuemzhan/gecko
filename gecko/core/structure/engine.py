@@ -1,33 +1,26 @@
 # gecko/core/structure/engine.py
 """
-结构化输出引擎模块
+结构化输出引擎模块 (v0.4 Phase 3 Complete)
 
 职责：
-- 作为“协调者”，将不同解析策略串联起来：
-    * 优先尝试从工具调用（tool calls）中提取结构化数据
-    * 如果没有 tool calls 或解析失败，则回退到纯文本 JSON 提取
-- 暴露统一的异步接口 `StructureEngine.parse`
-- 将 schema 相关的工具（OpenAI tool schema、schema diff）作为静态/类方法对外暴露，
-  方便调用方统一访问。
-
-内部依赖：
-- errors.StructureParseError：统一错误类型
-- json_extractor.extract_structured_data：文本 JSON 提取的具体实现
-- schema.to_openai_tool / schema.get_schema_diff：Schema 工具函数
+- 作为结构化解析的统一入口。
+- 协调多种解析策略：Tool Call -> 文本提取 -> (新增) LLM 自愈修复。
+- 提供 Schema 生成与差异比对工具。
 """
-
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional, Type, TypeVar
+from typing import Any, Dict, List, Optional, Type, TypeVar, TYPE_CHECKING
 
 from pydantic import BaseModel
 
 from gecko.core.logging import get_logger
-
 from gecko.core.structure.errors import StructureParseError
 from gecko.core.structure.json_extractor import extract_structured_data
 from . import schema as schema_utils
+
+if TYPE_CHECKING:
+    from gecko.core.protocols import ModelProtocol
 
 logger = get_logger(__name__)
 
@@ -37,62 +30,25 @@ T = TypeVar("T", bound=BaseModel)
 class StructureEngine:
     """
     结构化输出引擎
-
-    使用示例：
-
-        from pydantic import BaseModel
-
-        class User(BaseModel):
-            name: str
-            age: int
-
-        # 异步场景
-        result = await StructureEngine.parse(
-            content='{"name": "Alice", "age": 25}',
-            model_class=User,
-        )
-
-        # 如果有 tool calls（例如来自 OpenAI / Zhipu 的工具调用结果）
-        result = await StructureEngine.parse(
-            content="",
-            model_class=User,
-            raw_tool_calls=[{
-                "function": {
-                    "arguments": '{"name": "Alice", "age": 25}'
-                }
-            }]
-        )
     """
 
-    # ===== Schema 相关静态方法 =====
+    # ================= Schema 工具方法 (代理) =================
 
     @staticmethod
     def to_openai_tool(model: type[BaseModel]) -> Dict[str, Any]:
         """
-        将 Pydantic 模型转换为 OpenAI Function Calling 所需的 tool schema
-
-        说明：
-            - 内部委托给 schema_utils.to_openai_tool 实现
-            - 之所以作为静态方法暴露，是为了保持与旧版本 API 一致
+        将 Pydantic 模型转换为 OpenAI Tool Schema
         """
         return schema_utils.to_openai_tool(model)
 
     @classmethod
-    def get_schema_diff(
-        cls,
-        data: Dict[str, Any],
-        model_class: type[BaseModel],
-    ) -> Dict[str, Any]:
+    def get_schema_diff(cls, data: Dict[str, Any], model_class: type[BaseModel]) -> Dict[str, Any]:
         """
-        比较数据与模型 schema 的差异（基础版）
-
-        说明：
-            - 内部委托给 schema_utils.get_schema_diff 实现
-            - 作为类方法暴露，方便调用方通过 StructureEngine 统一访问
+        比较数据与模型 Schema 的差异
         """
         return schema_utils.get_schema_diff(data, model_class)
 
-    # ===== 核心解析方法 =====
+    # ================= 核心解析流程 =================
 
     @classmethod
     async def parse(
@@ -102,34 +58,33 @@ class StructureEngine:
         raw_tool_calls: Optional[List[Dict[str, Any]]] = None,
         strict: bool = True,
         auto_fix: bool = True,
+        model: Optional["ModelProtocol"] = None,
     ) -> T:
         """
-        解析文本为 Pydantic 模型（异步接口）
+        解析文本为 Pydantic 模型 (Async)
 
-        参数:
-            content:
-                LLM 的原始文本输出
-            model_class:
-                目标 Pydantic 模型类
-            raw_tool_calls:
-                原始工具调用列表（例如 OpenAI tools 调用结果）
-                如果提供，则优先使用 tool calls 作为结构化数据来源。
-            strict:
-                预留参数，当前版本中尚未改变具体行为；
-                未来可用于控制“宽松模式”（例如更激进的类型转换）。
-            auto_fix:
-                是否对明显的 JSON 格式问题进行自动修复（去注释、去尾逗号等）
+        解析策略优先级：
+        1. Tool Call: 如果 LLM 使用了工具调用，直接解析参数。
+        2. Text Extraction: 尝试从文本中提取 JSON (正则/Markdown/括号匹配)。
+        3. LLM Repair: (新增) 如果提供了 model 参数，调用 LLM 尝试修复格式错误的 JSON。
 
-        返回:
-            Pydantic 模型实例
+        Args:
+            content: LLM 的原始文本输出
+            model_class: 目标 Pydantic 模型类
+            raw_tool_calls: 原始工具调用列表 (OpenAI 格式)
+            strict: 是否启用严格模式 (预留)
+            auto_fix: 是否启用基础的字符串清理修复
+            model: [Phase 3 新增] 用于自愈修复的模型实例
 
-        异常:
-            StructureParseError:
-                当所有解析策略均失败时抛出，并包含详细的尝试轨迹。
+        Returns:
+            T: Pydantic 模型实例
+
+        Raises:
+            StructureParseError: 当所有策略均失败时抛出
         """
         attempts: List[Dict[str, str]] = []
 
-        # 策略 1: 从 tool calls 中解析（如果提供了）
+        # --- 策略 1: Tool Call 解析 ---
         if raw_tool_calls:
             for idx, call in enumerate(raw_tool_calls):
                 try:
@@ -147,13 +102,9 @@ class StructureEngine:
                             "error": str(e),
                         }
                     )
-                    logger.debug(
-                        "Tool call parse failed",
-                        index=idx,
-                        error=str(e),
-                    )
 
-        # 策略 2-5: 纯文本 JSON 提取与解析
+        # --- 策略 2-5: 纯文本 JSON 提取 ---
+        # 包含：Direct JSON, Markdown Block, Braced {}, Bracket [], Cleaned JSON
         try:
             return extract_structured_data(
                 text=content,
@@ -162,57 +113,66 @@ class StructureEngine:
                 auto_fix=auto_fix,
             )
         except Exception as e:
-            # 如果子异常本身就是 StructureParseError，并带有 attempts，
-            # 则直接合并子层 attempts，避免信息丢失。
-            if hasattr(e, "attempts") and getattr(e, "attempts"):  # type: ignore[attr-defined]
-                attempts.extend(getattr(e, "attempts"))  # type: ignore[attr-defined]
+            # 合并子解析器的尝试记录
+            if hasattr(e, "attempts") and getattr(e, "attempts"):
+                attempts.extend(getattr(e, "attempts"))
             else:
-                attempts.append(
-                    {
-                        "strategy": "text_extraction",
-                        "error": str(e),
-                    }
-                )
+                attempts.append({"strategy": "text_extraction", "error": str(e)})
 
-            error_details = "\n".join(
-                f"  - {a['strategy']}: {a['error'][:100]}" for a in attempts
-            )
+        # --- 策略 6: LLM 自愈 (Self-Healing) ---
+        if model:
+            try:
+                # 延迟导入以避免循环依赖
+                from gecko.core.structure.repair import repair_json_with_llm
+                
+                # 获取最后一次报错信息作为参考，帮助 LLM 理解错误原因
+                last_error = attempts[-1]['error'] if attempts else "Unknown parsing error"
+                
+                logger.info("Attempting LLM-based JSON repair...")
+                
+                # 调用修复逻辑 (Phase 3 核心)
+                fixed_dict = await repair_json_with_llm(content, last_error, model)
+                
+                # 再次校验 Pydantic Schema
+                result = model_class.model_validate(fixed_dict)
+                
+                logger.info(f"StructureEngine: Successfully repaired output for {model_class.__name__}")
+                return result
+                
+            except Exception as repair_err:
+                attempts.append({
+                    "strategy": "llm_repair", 
+                    "error": str(repair_err)
+                })
 
-            raise StructureParseError(
-                f"无法解析为 {model_class.__name__}。尝试了 {len(attempts)} 种策略:\n{error_details}",
-                attempts=attempts,
-                raw_content=content,
-            ) from e
+        # --- 最终失败处理 ---
+        error_details = "\n".join(
+            f"  - {a['strategy']}: {a['error'][:100]}" for a in attempts
+        )
 
-    # ===== 内部工具调用解析 =====
+        raise StructureParseError(
+            f"无法解析为 {model_class.__name__}。尝试了 {len(attempts)} 种策略:\n{error_details}",
+            attempts=attempts,
+            raw_content=content,
+        )
 
     @classmethod
-    def _parse_from_tool_call(
-        cls,
-        call: Dict[str, Any],
-        model_class: Type[T],
-    ) -> T:
+    def _parse_from_tool_call(cls, call: Dict[str, Any], model_class: Type[T]) -> T:
         """
-        从单个工具调用中解析出目标模型实例
-
-        典型工具调用结构（以 OpenAI 为例）：
-        {
-            "function": {
-                "name": "xxx",
-                "arguments": "{...}"   # JSON 字符串
-            }
-            ...
-        }
+        从单个工具调用中解析
         """
         func = call.get("function", {})
         args = func.get("arguments", "")
 
-        # 解析 arguments 字段
         if isinstance(args, str):
-            data = json.loads(args)
+            # 处理可能的 JSON 解析错误
+            try:
+                data = json.loads(args)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Invalid JSON in tool arguments: {e}")
         elif isinstance(args, dict):
             data = args
         else:
             raise ValueError(f"Invalid arguments type: {type(args)}")
 
-        return model_class(**data)
+        return model_class.model_validate(data)

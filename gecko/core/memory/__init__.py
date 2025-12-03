@@ -23,10 +23,12 @@ from __future__ import annotations
 
 from gecko.core.memory.base import TokenMemory
 from gecko.core.memory.summary import SummaryTokenMemory
+from gecko.core.memory.hybrid import HybridMemory
 from gecko.core.memory._executor import shutdown_token_executor
 
 __all__ = [
     "TokenMemory",
     "SummaryTokenMemory",
+    "HybridMemory", 
     "shutdown_token_executor",
 ]
