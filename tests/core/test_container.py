@@ -1,6 +1,7 @@
 # tests/core/test_container.py
 import pytest
 from gecko.core.container import Container, Lifetime
+from gecko.core.exceptions import CircularDependencyError
 
 class ServiceA:
     pass
@@ -56,3 +57,19 @@ async def test_container_scopes():
         async with container.create_scope() as scope2:
             a3 = scope2.resolve(ServiceA)
             assert a1 is not a3 # 不同 Scope 实例不同
+
+def test_circular_dependency_detection():
+    class C1:
+        def __init__(self, c2: "C2"):
+            pass
+
+    class C2:
+        def __init__(self, c1: C1):
+            pass
+
+    container = Container()
+    container.register(C1)
+    container.register(C2)
+
+    with pytest.raises(CircularDependencyError):
+        container.resolve(C1)
