@@ -1,0 +1,88 @@
+{
+  "timestamp": "2025-12-04T07:21:09.179307",
+  "results": [
+    {
+      "name": "Small (10L x 5N, shallow history)",
+      "layers": 10,
+      "nodes_per_layer": 5,
+      "total_nodes": 51,
+      "history_depth": 0,
+      "execution_time_ms": 82.13520050048828,
+      "baseline_memory_mb": 49.89453125,
+      "peak_memory_mb": 51.51953125,
+      "memory_delta_mb": 1.625,
+      "efficiency": 19.428571428571427,
+      "status": "OK"
+    },
+    {
+      "name": "Small (10L x 5N, deep history)",
+      "layers": 10,
+      "nodes_per_layer": 5,
+      "total_nodes": 51,
+      "history_depth": 100,
+      "execution_time_ms": 5.184412002563477,
+      "baseline_memory_mb": 51.51953125,
+      "peak_memory_mb": 51.51953125,
+      "memory_delta_mb": 0.0,
+      "efficiency": 51.0,
+      "status": "OK"
+    },
+    {
+      "name": "Medium (20L x 10N, shallow history)",
+      "layers": 20,
+      "nodes_per_layer": 10,
+      "total_nodes": 201,
+      "history_depth": 0,
+      "execution_time_ms": 262.0382308959961,
+      "baseline_memory_mb": 51.51953125,
+      "peak_memory_mb": 52.234375,
+      "memory_delta_mb": 0.71484375,
+      "efficiency": 117.21184510250569,
+      "status": "OK"
+    },
+    {
+      "name": "Medium (20L x 10N, deep history)",
+      "layers": 20,
+      "nodes_per_layer": 10,
+      "total_nodes": 201,
+      "history_depth": 200,
+      "execution_time_ms": 18.308401107788086,
+      "baseline_memory_mb": 52.234375,
+      "peak_memory_mb": 52.234375,
+      "memory_delta_mb": 0.0,
+      "efficiency": 201.0,
+      "status": "OK"
+    },
+    {
+      "name": "Large (50L x 10N, shallow history)",
+      "layers": 50,
+      "nodes_per_layer": 10,
+      "total_nodes": 501,
+      "history_depth": 0,
+      "execution_time_ms": 311.47146224975586,
+      "baseline_memory_mb": 52.234375,
+      "peak_memory_mb": 52.734375,
+      "memory_delta_mb": 0.5,
+      "efficiency": 334.0,
+      "status": "OK"
+    },
+    {
+      "name": "Large (50L x 10N, deep history)",
+      "layers": 50,
+      "nodes_per_layer": 10,
+      "total_nodes": 501,
+      "history_depth": 500,
+      "execution_time_ms": 47.51729965209961,
+      "baseline_memory_mb": 52.734375,
+      "peak_memory_mb": 52.859375,
+      "memory_delta_mb": 0.125,
+      "efficiency": 445.3333333333333,
+      "status": "OK"
+    }
+  ],
+  "summary": {
+    "total_tests": 6,
+    "passed": 6,
+    "failed": 0
+  }
+}
