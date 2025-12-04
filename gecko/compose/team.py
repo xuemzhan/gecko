@@ -73,6 +73,8 @@ class Team:
         self.return_full_output = return_full_output
         self.strategy = strategy
         self.input_mapper = input_mapper
+        # [P0-1 修复] Race 模式下的线程安全 Lock
+        self._winner_lock: Optional[anyio.Lock] = None
 
     # ========================= 接口协议 =========================
 
@@ -147,6 +149,10 @@ class Team:
         """
         # 用于存储获胜者的容器 (list 是可变的，闭包可写)
         winner: List[MemberResult] = []
+
+        # 初始化 winner lock（确保在并发场景中可用）
+        # [P0-1 修复] 在调用之前创建 Lock，避免 None 导致的异常
+        self._winner_lock = anyio.Lock()
         
         # 使用 CancelScope 实现“一人成功，全员取消”
         # 注意：这里需要在外部包裹 try-except 处理取消异常
@@ -158,9 +164,10 @@ class Team:
                         # 执行成员逻辑
                         res = await self._safe_execute_member(idx, mem, inp)
                         
-                        # 只有成功的才算赢
-                        if res.is_success:
-                            if not winner: # 双重检查避免覆盖
+                        # [P0-1 修复] 使用原子 Lock 保护
+                        # 防止多个协程同时通过 "if not winner" 的检查
+                        async with self._winner_lock:
+                            if res.is_success and not winner:
                                 winner.append(res)
                                 # 核心：取消整个 TaskGroup 的 Scope
                                 tg.cancel_scope.cancel()
@@ -172,15 +179,24 @@ class Team:
             pass
         except Exception as e:
             logger.error("Race execution crashed", error=str(e))
+        finally:
+            # [P0-1 修复] 清理 Lock
+            self._winner_lock = None
 
         if winner:
             logger.info(f"Team {self.name} Race won by member {winner[0].member_index}")
             return winner
         
-        # 如果所有人都失败了，或者没有任何人成功，返回空列表或全失败记录
-        # 这里简化处理，返回空列表表示无 winner
+        # [P0-2 修复] 失败时返回有意义的结果，而不是空列表
         logger.warning(f"Team {self.name} Race failed: no winner")
-        return []
+        return [
+            MemberResult(
+                member_index=i,
+                error="Race failed - no successful member",
+                is_success=False
+            )
+            for i in range(len(self.members))
+        ]
 
     # ========================= 内部逻辑 =========================
 

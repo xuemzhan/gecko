@@ -77,6 +77,11 @@ async def test_team_race_all_fail():
     team = Team(members, strategy=ExecutionStrategy.RACE) # type: ignore
     
     results = await team.run("start")
-    
-    # 预期：没有赢家，返回空列表
-    assert results == []
+
+    # 预期：没有赢家，返回包含每个成员失败信息的 MemberResult 列表
+    assert isinstance(results, list)
+    assert len(results) == 2
+    for r in results:
+        # 每个元素都是 MemberResult，标记为失败并包含错误信息
+        assert hasattr(r, "is_success") and r.is_success is False
+        assert getattr(r, "error", None) is not None

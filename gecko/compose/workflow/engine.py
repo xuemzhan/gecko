@@ -27,7 +27,7 @@ from gecko.core.exceptions import WorkflowError
 from gecko.plugins.storage.interfaces import SessionInterface
 
 # 导入子模块
-from gecko.compose.workflow.models import WorkflowContext, CheckpointStrategy
+from gecko.compose.workflow.models import WorkflowContext, CheckpointStrategy, NodeStatus
 from gecko.compose.workflow.graph import WorkflowGraph
 from gecko.compose.workflow.executor import NodeExecutor
 from gecko.compose.workflow.persistence import PersistenceManager
@@ -268,6 +268,9 @@ class Workflow:
                 # 将并行节点的输出和状态变更合并回主 Context
                 self._merge_layer_results(context, layer_results)
                 
+                # [P1-2 修复] 定期清理 history，防止无界增长
+                self._cleanup_history(context, max_steps=self.persistence.history_retention)
+                
                 # 4.4 处理动态跳转 (Next)
                 # 策略: 如果层中任何节点返回了 Next，则中断静态计划，优先处理跳转
                 jump_instruction = self._handle_dynamic_jump(layer_results, context)
@@ -306,6 +309,38 @@ class Workflow:
                 raise WorkflowError(f"Workflow execution failed: {e}") from e
             raise
 
+    def _cleanup_history(self, context: WorkflowContext, max_steps: int = 20):
+        """
+        [P1-2 修复] 定期清理 history，防止无界增长
+        
+        策略:
+        1. 保留最后 N 步的历史记录
+        2. 必须保留 last_output，它是下一步的默认输入
+        3. 删除最老的记录以限制内存使用
+        """
+        if len(context.history) <= max_steps:
+            return
+        
+        # 必须保留的关键字段
+        must_keep = {"last_output"}
+        
+        # 获取所有可删除的键
+        all_keys = set(context.history.keys()) - must_keep
+        old_keys = sorted(all_keys)[:-max_steps]
+        
+        # 删除最老的键
+        for key in old_keys:
+            logger.debug(f"Cleaning up history key: {key}")
+            del context.history[key]
+        
+        if old_keys:
+            logger.info(
+                "History cleanup",
+                before=len(context.history) + len(old_keys),
+                after=len(context.history),
+                removed=len(old_keys)
+            )
+
     async def _execute_layer_parallel(self, layer: Set[str], context: WorkflowContext) -> Dict[str, Any]:
         """
         并行执行单层节点
@@ -326,9 +361,14 @@ class Workflow:
                 node_func = self.graph.nodes[node_name]
                 
                 # [核心机制] Copy-On-Write (COW)
-                # 为每个节点创建 Context 的深拷贝，防止并发修改 State 导致竞态。
-                # 仅 input 保持只读引用，history/state 均被隔离。
-                node_context = context.model_copy(deep=True)
+                # 为每个节点创建 Context 的浅拷贝 (避免对大 history 做深拷贝)，
+                # 并对 `state` 做一次浅复制以实现写时复制（Copy-On-Write）。
+                # history 保持共享引用以节省内存和拷贝成本（只读语义）。
+                node_context = context.model_copy(deep=False)
+                # 将 state 设置为主 state 的浅拷贝，写操作不会影响主 context
+                node_context.state = dict(context.state)
+                # history 共享引用（只读），避免深拷贝开销
+                node_context.history = context.history
                 
                 tg.start_soon(
                     self._run_node_wrapper, 
@@ -388,6 +428,13 @@ class Workflow:
             
             if not should_run:
                 logger.info(f"Node {name} skipped due to conditions")
+                # [P0-4 修复] 返回 SKIPPED 状态，而不是 None
+                # 这样 _merge_layer_results 可以正确处理被跳过的节点
+                results[name] = {
+                    "output": None,
+                    "state_diff": {},
+                    "status": NodeStatus.SKIPPED  # [新增] 标记为跳过
+                }
                 return
 
         # 2. 执行节点
@@ -411,18 +458,30 @@ class Workflow:
     def _merge_layer_results(self, context: WorkflowContext, results: Dict[str, Any]):
         """
         合并并行结果回主上下文 (Synchronization Point)
+        
+        [P0-3 修复] Next.input=None 时，保留上一步输出而不是用 None 覆盖
+        [P0-4 修复] 处理 SKIPPED 节点，不更新历史
         """
         layer_outputs = {}
         
         for node_name, res in results.items():
+            # [P0-4 修复] 跳过的节点不更新 history
+            if res.get("status") == NodeStatus.SKIPPED:
+                logger.debug(f"Node {node_name} was skipped, not updating history")
+                continue
+                
             output = res["output"]
             state_diff = res["state_diff"]
             
-            # [Fix] 处理 Next 对象：确保 History 存储的是实际数据 Input
-            # Executor 现在返回原始 Next 对象，这里需要解包
+            # [P0-3 修复] 处理 Next 对象：仅当 input 被显式提供时才覆盖
             actual_data = output
             if isinstance(output, Next):
-                actual_data = output.input
+                # 重点：如果 input 为 None，保留上一步的输出
+                if output.input is not None:
+                    actual_data = output.input
+                else:
+                    # 保留原有输出，不用 None 覆盖
+                    actual_data = context.get_last_output()
             
             # 兼容性处理：如果 Executor 返回的是 dict 形式的 Next (被意外 normalize 了)
             elif isinstance(output, dict) and output.get("node") and "<Next" in str(output):
