@@ -33,14 +33,16 @@ class SimpleJsonStorage(
         super().__init__(url, **kwargs)
         # 解析路径: myjson://./data.json -> ./data.json
         self.file_path = url.replace("myjson://", "")
+        # [v0.4 必需] 初始化文件锁，否则 AtomicWriteMixin 无法工作
+        self.setup_multiprocess_lock(self.file_path)
         
         # [关键] 配置 FileLock，这样即使多个进程同时操作这个文件也不会坏
         self.setup_multiprocess_lock(self.file_path)
 
     async def initialize(self) -> None:
         """初始化：确保文件存在"""
+        # [v0.4 建议] 显式初始化逻辑
         if not os.path.exists(self.file_path):
-            # 使用 run_sync 在线程中执行文件写入
             await self._run_sync(self._write_file, {})
         self._is_initialized = True
         print(f"[Init] Storage ready at {self.file_path}")

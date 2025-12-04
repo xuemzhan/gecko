@@ -18,10 +18,13 @@ from gecko.plugins.models.presets.zhipu import ZhipuChat
 # ==========================================
 # 1. 定义简单的工具 (保持不变)
 # ==========================================
+class CalculatorArgs(BaseModel):
+    expression: str = Field(..., description="Math expression to evaluate")
 
 class CalculatorTool(BaseTool):
     name: str = "calculator"
     description: str = "Useful for performing basic arithmetic operations. Input should be a math expression string."
+    args_schema: type[BaseModel] = CalculatorArgs
     parameters: Dict[str, Any] = { # type: ignore
         "type": "object",
         "properties": {
@@ -32,6 +35,7 @@ class CalculatorTool(BaseTool):
         },
         "required": ["expression"]
     }
+    
     # 为了兼容新版 BaseTool，这里虽然没有用 args_schema，但手动实现了 parameters 属性
     # 如果使用新版 BaseTool，建议定义 Pydantic Model。
     # 这里为了最小化改动，我们通过覆盖 _run 并忽略类型检查来适配 Demo
