@@ -108,10 +108,12 @@ class StreamBuffer:
                     if tc.get("id"):
                         target["id"] += tc["id"]
 
-                    # 增量拼接函数名和参数
+                    # 增量合并函数名和参数
+                    # 对于函数名使用“最新非空片段覆盖”策略，避免在流式分片时产生重复拼接
                     func = tc.get("function", {})
                     if func.get("name"):
-                        target["function"]["name"] += func["name"]
+                        # 使用最新的非空片段替换之前的 name（而不是拼接）
+                        target["function"]["name"] = func.get("name")
                     if func.get("arguments"):
                         # 防止参数字符串过长
                         if len(target["function"]["arguments"]) + len(func.get("arguments", "")) > 100_000:
