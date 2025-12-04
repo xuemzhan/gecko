@@ -168,6 +168,8 @@ class CognitiveEngine(ABC):
         
         # 存储额外的配置
         self._config = kwargs
+        # hooks 出错时是否立即 fail-fast（默认 False，作为 P3 优化可开启）
+        self.hooks_fail_fast: bool = bool(kwargs.get("hooks_fail_fast", False))
         
         logger.debug(
             "Engine initialized",
@@ -339,6 +341,8 @@ class CognitiveEngine(ABC):
                     self.before_step_hook(input_messages, **kwargs)
             except Exception as e:
                 logger.warning("before_step_hook failed", error=str(e))
+                if self.hooks_fail_fast:
+                    raise
     
     async def after_step(
         self,
@@ -368,6 +372,8 @@ class CognitiveEngine(ABC):
                     self.after_step_hook(input_messages, output, **kwargs)
             except Exception as e:
                 logger.warning("after_step_hook failed", error=str(e))
+                if self.hooks_fail_fast:
+                    raise
     
     async def on_error(
         self,
@@ -397,6 +403,25 @@ class CognitiveEngine(ABC):
                     self.on_error_hook(error, input_messages, **kwargs)
             except Exception as e:
                 logger.error("on_error_hook failed", error=str(e))
+                if self.hooks_fail_fast:
+                    raise
+
+    # ===== 轻量统计/指标辅助 =====
+    def record_step(self, duration: float, tokens: int = 0, had_error: bool = False) -> None:
+        """记录一次执行步骤的轻量统计（供子类在合适位置调用）。"""
+        if self.stats is not None:
+            try:
+                self.stats.add_step(duration, tokens=tokens, had_error=had_error)
+            except Exception:
+                logger.debug("Failed to update stats")
+
+    def record_tool_call(self) -> None:
+        """记录一次工具调用次数"""
+        if self.stats is not None:
+            try:
+                self.stats.add_tool_call()
+            except Exception:
+                logger.debug("Failed to increment tool call stat")
     
     # ====================== 工具方法 ======================
     

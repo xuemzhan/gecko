@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 from typing import Dict, List, Any, Optional
+import threading
 
 from gecko.core.message import Message
 from gecko.core.protocols import StreamChunk
@@ -33,6 +34,9 @@ class StreamBuffer:
         # tool_index -> tool_call_dict (处理并发或分片传输的工具调用)
         self.tool_calls_map: Dict[int, Dict[str, Any]] = {}
         self._max_tool_index: int = -1  # [P2-1 Fix] 跟踪最大工具索引
+        self._max_content_chars: int = 200_000  # 防止工具返回超大内容
+        # 使用可重入锁保护同步场景下的 add_chunk/构建操作
+        self._lock: threading.RLock = threading.RLock()
         
     def add_chunk(self, chunk: StreamChunk) -> Optional[str]:
         """
@@ -44,54 +48,80 @@ class StreamBuffer:
         
         [P2-1 Fix] 添加了索引验证和范围检查，防止稀疏索引导致的内存溢出。
         """
-        delta = chunk.delta
-        
-        # 1. 聚合文本内容
-        content = delta.get("content")
-        if content:
-            self.content_parts.append(content)
-            
-        # 2. 聚合工具调用 (处理 index 可能不连续或乱序的情况)
-        if delta.get("tool_calls"):
-            for tc in delta["tool_calls"]:
-                idx = tc.get("index")
-                if idx is None: 
-                    continue
-                
-                # [P2-1 Fix] 验证索引范围，防止稀疏索引导致内存溢出
-                # 例如：如果收到索引 1000000 而之前只有索引 0，这可能是错误
-                if idx < 0:
-                    logger.warning(f"Negative tool index received: {idx}, skipping")
-                    continue
-                
-                if idx > 1000:  # 合理的上限：最多允许 1000 个工具调用
-                    logger.warning(f"Excessive tool index: {idx}, likely malformed response")
-                    continue
-                
-                # 跟踪最大索引
-                if idx > self._max_tool_index:
-                    self._max_tool_index = idx
-                
-                # 初始化该索引的结构
-                if idx not in self.tool_calls_map:
-                    self.tool_calls_map[idx] = {
-                        "id": "", 
-                        "type": "function", 
-                        "function": {"name": "", "arguments": ""}
-                    }
-                
-                target = self.tool_calls_map[idx]
-                
-                # 增量拼接 ID
-                if tc.get("id"): 
-                    target["id"] += tc["id"]
-                
-                # 增量拼接函数名和参数
-                func = tc.get("function", {})
-                if func.get("name"): 
-                    target["function"]["name"] += func["name"]
-                if func.get("arguments"): 
-                    target["function"]["arguments"] += func["arguments"]
+        # add_chunk 可能并发调用（来自不同协程/线程），使用锁保证原子性
+        with self._lock:
+            delta = chunk.delta
+
+            # 1. 聚合文本内容
+            content = delta.get("content")
+            if content:
+                # 防止累计过长的 content 导致内存峰值
+                current_len = sum(len(p) for p in self.content_parts)
+                if current_len + len(content) > self._max_content_chars:
+                    logger.warning("Truncating incoming content to avoid memory blowup")
+                    # 仅追加能容纳的部分
+                    allowed = max(0, self._max_content_chars - current_len)
+                    if allowed > 0:
+                        self.content_parts.append(content[:allowed])
+                else:
+                    self.content_parts.append(content)
+
+            # 2. 聚合工具调用 (处理 index 可能不连续或乱序的情况)
+            if delta.get("tool_calls"):
+                for tc in delta["tool_calls"]:
+                    idx = tc.get("index")
+                    if idx is None:
+                        continue
+
+                    # [P2-1 Fix] 验证索引范围，防止稀疏索引导致内存溢出
+                    # 例如：如果收到索引 1000000 而之前只有索引 0，这可能是错误
+                    if idx < 0:
+                        logger.warning(f"Negative tool index received: {idx}, skipping")
+                        continue
+
+                    if idx > 1000:  # 合理的上限：最多允许 1000 个工具调用
+                        logger.warning(f"Excessive tool index: {idx}, likely malformed response")
+                        continue
+
+                    # 防止稀疏索引（例如之前最大索引为 0，却突然收到 100000），这通常是协议或模型错误。
+                    if self._max_tool_index >= 0 and (idx - self._max_tool_index) > 100:
+                        logger.warning(
+                            f"Sparse tool index gap detected: prev_max={self._max_tool_index} new_idx={idx}, skipping"
+                        )
+                        continue
+
+                    # 跟踪最大索引
+                    if idx > self._max_tool_index:
+                        self._max_tool_index = idx
+
+                    # 初始化该索引的结构
+                    if idx not in self.tool_calls_map:
+                        self.tool_calls_map[idx] = {
+                            "id": "",
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""}
+                        }
+
+                    target = self.tool_calls_map[idx]
+
+                    # 增量拼接 ID
+                    if tc.get("id"):
+                        target["id"] += tc["id"]
+
+                    # 增量拼接函数名和参数
+                    func = tc.get("function", {})
+                    if func.get("name"):
+                        target["function"]["name"] += func["name"]
+                    if func.get("arguments"):
+                        # 防止参数字符串过长
+                        if len(target["function"]["arguments"]) + len(func.get("arguments", "")) > 100_000:
+                            logger.warning("Truncating tool arguments due to excessive length")
+                            # 只保留前 100k 字符
+                            target["function"]["arguments"] = (
+                                target["function"]["arguments"] + func.get("arguments", "")
+                            )[:100_000]
+                        else:
+                            target["function"]["arguments"] += func["arguments"]
         
         return content
 
