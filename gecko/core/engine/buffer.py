@@ -50,6 +50,9 @@ class StreamBuffer:
         """
         # add_chunk 可能并发调用（来自不同协程/线程），使用锁保证原子性
         with self._lock:
+            if not hasattr(chunk, 'delta') or chunk.delta is None:
+                logger.warning("StreamChunk missing delta, skipping chunk")
+                return None
             delta = chunk.delta
 
             # 1. 聚合文本内容
@@ -73,22 +76,29 @@ class StreamBuffer:
                     if idx is None:
                         continue
 
-                    # [P2-1 Fix] 验证索引范围，防止稀疏索引导致内存溢出
-                    # 例如：如果收到索引 1000000 而之前只有索引 0，这可能是错误
+                    # [P2-1 Fix] 改进的索引验证 - 允许更大的间隙但记录警告
                     if idx < 0:
                         logger.warning(f"Negative tool index received: {idx}, skipping")
                         continue
 
-                    if idx > 1000:  # 合理的上限：最多允许 1000 个工具调用
+                    # 更现实的上限：允许 500+ 工具
+                    MAX_TOOL_INDEX = 1000
+                    if idx > MAX_TOOL_INDEX:
                         logger.warning(f"Excessive tool index: {idx}, likely malformed response")
                         continue
 
-                    # 防止稀疏索引（例如之前最大索引为 0，却突然收到 100000），这通常是协议或模型错误。
-                    if self._max_tool_index >= 0 and (idx - self._max_tool_index) > 100:
+                    # 改进的稀疏索引检测：警告但继续处理而不是跳过
+                    MAX_TOOL_INDEX_GAP = 500
+                    if self._max_tool_index >= 0 and (idx - self._max_tool_index) > MAX_TOOL_INDEX_GAP:
                         logger.warning(
-                            f"Sparse tool index gap detected: prev_max={self._max_tool_index} new_idx={idx}, skipping"
+                            f"Unusually large tool index gap detected",
+                            prev_max=self._max_tool_index,
+                            new_idx=idx,
+                            gap=idx - self._max_tool_index,
+                            action="accepting_with_monitoring",
+                            note="This may indicate model misconfiguration or concurrent requests"
                         )
-                        continue
+                        # 继续处理而不是跳过！
 
                     # 跟踪最大索引
                     if idx > self._max_tool_index:

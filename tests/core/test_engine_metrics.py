@@ -35,13 +35,14 @@ def test_execution_stats_cost_tracking():
     stats = ExecutionStats()
     # gpt-3.5-turbo pricing: 0.5 / 1M input, 1.5 / 1M output
     pricing = MODEL_PRICING["gpt-3.5-turbo"]
-    
+
     input_tokens = 1_000_000
     output_tokens = 500_000
-    
-    expected_cost = (input_tokens * pricing["input"]) + (output_tokens * pricing["output"])
+
+    # 计算美元成本（单位：USD）
+    expected_cost = (input_tokens * pricing["input"] / 1_000_000) + (output_tokens * pricing["output"] / 1_000_000)
     stats.add_cost(expected_cost)
-    
+
     assert abs(stats.estimated_cost - (0.5 + 0.75)) < 0.01  # $0.5 + $0.75 = $1.25
 
 

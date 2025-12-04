@@ -1,6 +1,6 @@
 # gecko/core/engine/react.py
 """
-ReAct 推理引擎 (Production Grade / 生产级)
+ReAct 推理 引擎 (Production Grade / 生产级)
 
 架构设计：
 1. 无状态设计 (Stateless): 
@@ -92,18 +92,34 @@ class ExecutionContext:
         self.last_tool_hashes: List[int] = []  # [P2-3 Fix] 最近 3 轮的工具调用哈希
 
     def add_message(self, message: Message) -> None:
-        """[P2-2 Fix] 追加消息到当前上下文历史，自动清理超出限制的旧消息"""
+        """追加消息，并在超过限制时进行智能清理。
+        
+        清理策略：
+        1. 保留所有 system 消息（必须保留，位于首位）
+        2. 保留最新的对话消息，确保对话连贯性
+        """
         self.messages.append(message)
         
-        # 如果消息数量超过限制，自动清理最老的非 system 消息
         if len(self.messages) > self.max_history:
-            # 保留所有 system 消息（这些是系统级提示）
+            # 分离 system 消息和对话消息
             system_msgs = [m for m in self.messages if m.role == "system"]
-            other_msgs = [m for m in self.messages if m.role != "system"]
+            conversation_msgs = [m for m in self.messages if m.role != "system"]
             
-            # 只保留最新的 max_history 条非 system 消息
-            self.messages = system_msgs + other_msgs[-self.max_history:]
-            logger.debug(f"Context messages trimmed to {len(self.messages)} (limit: {self.max_history})")
+            # 计算可保留的对话消息数量
+            # （总数 - system 消息数 = 对话消息的最大数量）
+            max_conversation = max(1, self.max_history - len(system_msgs))
+            
+            # 只保留最新的对话消息，维持连贯性
+            kept_conversation = conversation_msgs[-max_conversation:]
+            
+            # 重新组装：system 消息必须在最前面（OpenAI API 要求）
+            self.messages = system_msgs + kept_conversation
+            
+            logger.debug(
+                f"Context trimmed: system={len(system_msgs)}, "
+                f"conversation={len(kept_conversation)}, "
+                f"total={len(self.messages)}"
+            )
 
     @property
     def last_message(self) -> Message:
@@ -176,6 +192,15 @@ class ReActEngine(CognitiveEngine):
         # 将 response_model 放入 kwargs 传递给 step_stream，以便底层构建 Tool Schema
         kwargs['response_model'] = response_model
 
+        # [新增] 验证 response_model
+        if response_model is not None:
+            from inspect import isclass
+            if not (isclass(response_model) and issubclass(response_model, BaseModel)):
+                raise TypeError(
+                    f"response_model must be a Pydantic BaseModel subclass, "
+                    f"got {type(response_model).__name__}"
+                )
+
         # 内部闭包：执行一次完整的推理流程，直到产生结果或报错
         async def _run_once(msgs: List[Message]) -> Optional[AgentOutput]:
             final_res = None
@@ -187,7 +212,7 @@ class ReActEngine(CognitiveEngine):
                     elif event.type == "error":
                         # 遇到错误直接抛出，中断流程
                         logger.error(f"Engine step error: {event.content}")
-                        raise AgentError(event.content)
+                        raise AgentError(str(event.content))
             except Exception as e:
                 logger.exception("Stream processing failed in _run_once", error=str(e))
                 raise
@@ -280,9 +305,10 @@ class ReActEngine(CognitiveEngine):
         
         参数:
             input_messages: 输入消息列表
-            timeout: [P1-2 Fix] 整个执行的超时时间(秒)，默认 300s (5 分钟)
+            timeout: 整个执行的超时时间(秒)，默认 300s (5 分钟)
             **kwargs: 传递给引擎的其他参数
         """
+        import time
         import asyncio
         
         # 1. 基础校验与 Hook
@@ -291,36 +317,82 @@ class ReActEngine(CognitiveEngine):
 
         # 2. 构建执行上下文 (Context) - 这是线程安全的局部变量
         context = await self._build_execution_context(input_messages)
+        start_time = time.time()
         
         try:
-            # 3. [P1-2 Fix] 进入生命周期主循环，带超时保护
+            # 3. 生命周期主循环，带超时保护和优雅关闭
+            async for event in self._execute_lifecycle_with_timeout(context, timeout, **kwargs):
+                yield event
+        except AgentError as e:
+            logger.error(f"step_stream caught AgentError: {e}")
+            yield AgentStreamEvent(type="error", content=str(e))
+            raise
+        except asyncio.TimeoutError:
+            elapsed = time.time() - start_time
+            logger.error(
+                f"step_stream timeout",
+                elapsed_seconds=elapsed,
+                max_timeout=timeout,
+                current_turn=context.turn,
+                message_count=len(context.messages)
+            )
+            
+            # 尝试保存上下文（graceful shutdown）
             try:
-                # Python 3.11+ 使用原生 asyncio.timeout
-                if hasattr(asyncio, 'timeout'):
-                    async with asyncio.timeout(timeout):
-                        async for event in self._execute_lifecycle(context, **kwargs):
-                            yield event
-                else:
-                    # Python 3.10 及以下兼容方案
-                    async for event in asyncio.wait_for(
-                        self._execute_lifecycle(context, **kwargs),
-                        timeout=timeout
-                    ):
-                        yield event
-            except asyncio.TimeoutError:
-                logger.error(f"step_stream timeout after {timeout}s", 
-                            turn=context.turn, message_count=len(context.messages))
-                yield AgentStreamEvent(
-                    type="error", 
-                    content=f"Execution timeout after {timeout}s. Current turn: {context.turn}"
-                )
-                raise
-                
+                await self._save_context(context, force=True)
+                logger.debug(f"Context saved before timeout shutdown")
+            except Exception as save_error:
+                logger.warning(f"Failed to save context on timeout: {save_error}")
+            
+            # 向客户端报告
+            yield AgentStreamEvent(
+                type="error",
+                content=f"Execution timeout after {timeout}s at turn {context.turn}"
+            )
+            raise
+            
+        except asyncio.CancelledError:
+            logger.warning(
+                f"step_stream was cancelled",
+                current_turn=context.turn
+            )
+            # 也要保存上下文
+            try:
+                await self._save_context(context, force=True)
+            except Exception:
+                pass
+            raise
+            
         except Exception as e:
-            logger.exception("Lifecycle execution crashed", error=str(e))
+            logger.exception("Lifecycle execution failed", error=str(e))
             await self.on_error(e, input_messages, **kwargs)
             # 将未捕获的异常转换为 Error 事件抛出给前端
             yield AgentStreamEvent(type="error", content=str(e))
+            raise
+    
+    async def _execute_lifecycle_with_timeout(
+        self, 
+        context: ExecutionContext, 
+        timeout: float, 
+        **kwargs: Any
+    ) -> AsyncIterator[AgentStreamEvent]:
+        """生命周期执行，包含超时控制。"""
+        import asyncio
+        try:
+            # Python 3.11+ 使用原生 asyncio.timeout
+            if hasattr(asyncio, 'timeout'):
+                async with asyncio.timeout(timeout):
+                    async for event in self._execute_lifecycle(context, **kwargs):
+                        yield event
+            else:
+                # Python 3.10 及以下兼容方案
+                async for event in asyncio.wait_for(
+                    self._execute_lifecycle(context, **kwargs),
+                    timeout=timeout
+                ):
+                    yield event
+        except asyncio.TimeoutError:
+            # 重新抛出，让 step_stream 处理
             raise
 
     # ================= 生命周期主循环 (Lifecycle) =================
@@ -366,9 +438,9 @@ class ReActEngine(CognitiveEngine):
 
             # --- Safety Check: 死循环熔断 ---
             if self._detect_loop(context, assistant_msg):
-                err_msg = "Infinite loop detected."
+                err_msg = "Infinite loop detected"
                 yield AgentStreamEvent(type="error", content=err_msg)
-                break # 中断执行
+                raise AgentError(err_msg)
 
             # --- Decision: 检查是否调用了结构化输出工具 ---
             # 如果 LLM 调用了我们指定的结构化工具，说明它完成了任务
@@ -450,37 +522,83 @@ class ReActEngine(CognitiveEngine):
     ) -> AsyncIterator[StreamChunk]:
         """
         Thinking 阶段：构造 Prompt 并调用 LLM。
+        
+        负责：
+        1. 构造 LLM 调用参数
+        2. 流式接收模型响应
+        3. 追踪 token 使用和成本
         """
         messages_payload = [m.to_openai_format() for m in context.messages]
         
-        # 1. 构建参数
-        # 如果存在 response_model，_build_llm_params 会处理 tool_choice
+        # 1. 构造参数
         llm_params = self._build_llm_params(kwargs.get('response_model'), "auto")
         
-        # 2. 合并用户传入的 kwargs (移除 response_model 防止污染)
+        # 2. 合并用户传入的 kwargs
         safe_kwargs = {k: v for k, v in kwargs.items() if k not in ['response_model']}
         llm_params.update(safe_kwargs)
+        llm_params["stream"] = True
         
-        # 3. 强制开启流式
-        llm_params["stream"] = True 
+        # 3. Token 追踪变量
+        input_tokens = 0
+        output_tokens = 0
+        model_name = self._get_model_name()
         
-        # 4. [P1-3 Fix] 调用模型并处理流异常
         try:
             stream_gen = self.model.astream(messages=messages_payload, **llm_params) # type: ignore
             async for chunk in stream_gen:
-                # [P1-3 Fix] 验证块格式
+                # 验证块格式
                 if not isinstance(chunk, StreamChunk):
-                    logger.warning(f"Invalid StreamChunk received: {type(chunk)}")
+                    logger.warning(f"Invalid StreamChunk type: {type(chunk)}")
                     continue
+                
+                # 提取 usage 信息（通常在最后的 chunk 中）
+                if hasattr(chunk, 'usage') and chunk.usage:
+                    # 使用 max 避免 usage 被覆盖
+                    input_tokens = max(input_tokens, getattr(chunk.usage, 'prompt_tokens', 0))
+                    output_tokens = max(output_tokens, getattr(chunk.usage, 'completion_tokens', 0))
+                
                 yield chunk
+            
+            # 记录 token 使用到统计（关键！）
+            if input_tokens > 0 or output_tokens > 0:
+                # 直接更新 stats 中的 token 数
+                if self.stats:
+                    self.stats.input_tokens += input_tokens
+                    self.stats.output_tokens += output_tokens
+                
+                # 同时记录成本
+                self.record_cost(input_tokens, output_tokens, model_name)
+                
+                logger.debug(
+                    f"Tokens tracked in phase_think",
+                    input=input_tokens,
+                    output=output_tokens,
+                    model=model_name
+                )
+        
         except Exception as e:
             logger.error(f"Model streaming failed: {e}", error_type=type(e).__name__)
-            # [P1-3 Fix] 通知上游流处理已失败
+            # 通知上游流处理已失败
             yield AgentStreamEvent(
                 type="error",
                 content=f"Model API error: {e}"
             )
             raise
+    
+    def _get_model_name(self) -> str:
+        """安全地获取模型名称，包含多个备选方案。"""
+        # 优先级顺序：model_name > model > 默认值
+        model_name = (
+            getattr(self.model, 'model_name', None) or
+            getattr(self.model, 'model', None) or
+            'gpt-3.5-turbo'
+        )
+        
+        if not isinstance(model_name, str):
+            logger.warning(f"Model name is not a string: {type(model_name)}")
+            model_name = 'gpt-3.5-turbo'
+        
+        return model_name
 
     async def _phase_act(
         self, 
@@ -552,10 +670,12 @@ class ReActEngine(CognitiveEngine):
     # ================= 辅助方法 (Helpers) =================
 
     def _detect_loop(self, context: ExecutionContext, msg: Message) -> bool:
-        """
-        [P2-3 Fix] 改进的死循环检测：
-        - 使用 SHA256 而非 Python hash() 避免碰撞
-        - 检查最近 3 轮的工具调用，检测 A->B->A 类循环
+        """改进的死循环检测算法。
+        
+        策略：
+        1. 检测连续重复（A->A->A）
+        2. 检测振荡模式（A->B->A）
+        3. 避免合法的重复工具调用（带不同参数）
         """
         import hashlib
         
@@ -563,8 +683,7 @@ class ReActEngine(CognitiveEngine):
             return False
         
         try:
-            # 序列化工具调用以计算指纹 (Name + Args)
-            # sort_keys=True 确保字典顺序一致
+            # 计算当前工具调用的指纹
             calls_dump = json.dumps(
                 [
                     {
@@ -575,27 +694,44 @@ class ReActEngine(CognitiveEngine):
                 ],
                 sort_keys=True,
             )
-            # [P2-3 Fix] 使用 SHA256 替代 hash() 以避免碰撞
             current_hash = hashlib.sha256(calls_dump.encode()).hexdigest()
-
-            # [P2-3 Fix] 高级检测：检查最近 3 轮的工具调用
-            # 这可以检测 A->B->A 的循环模式
-            if current_hash in context.last_tool_hashes:
+            
+            # 策略 1: 检测严格的连续循环（同一工具调用重复 N 次）
+            consecutive_count = sum(
+                1 for h in reversed(context.last_tool_hashes) 
+                if h == current_hash
+            )
+            
+            if consecutive_count >= 3:  # 允许最多 3 次相同调用
                 logger.warning(
-                    "Loop pattern detected (cycle in recent 3 turns)",
-                    calls_dump=calls_dump[:100]
+                    f"Consecutive tool call loop detected ({consecutive_count} times)",
+                    tool_hash=current_hash[:16],
+                    advice="Consider adding early termination logic or changing tool parameters"
                 )
                 return True
-
-            # 只保留最近 3 轮的哈希
+            
+            # 策略 2: 检测振荡模式（A->B->A->B）
+            if len(context.last_tool_hashes) >= 2:
+                # 检查当前 hash 是否与倒数第 2 个相同（且与倒数第 1 个不同）
+                if (current_hash == context.last_tool_hashes[-2] and
+                    current_hash != context.last_tool_hashes[-1]):
+                    logger.warning(
+                        "Oscillation pattern detected (A-B-A pattern)",
+                        tool_hash=current_hash[:16],
+                        advice="Model is alternating between two tool calls. Consider rephrasing instructions."
+                    )
+                    return True
+            
+            # 添加当前哈希到历史（保留最近 5 轮）
             context.last_tool_hashes.append(current_hash)
-            context.last_tool_hashes = context.last_tool_hashes[-3:]
+            context.last_tool_hashes = context.last_tool_hashes[-5:]
             context.last_tool_hash = current_hash  # 保持向后兼容
-
+            
             return False
+            
         except Exception as e:
-            # [P2-3 Fix] 序列化失败时只记录警告，不触发熔断
-            logger.warning(f"Loop detection failed: {e}")
+            logger.warning(f"Loop detection failed: {e}", exc_info=True)
+            # 失败时不触发熔断，继续执行（fail-open）
             return False
 
     def _truncate_observation(self, content: str, tool_name: str) -> str:
@@ -656,7 +792,7 @@ class ReActEngine(CognitiveEngine):
             }
             try:
                 system_content = self.prompt_template.format_safe(**template_vars)
-                # [P1-5 Fix] 确保 system 消息在最前面（OpenAI API 要求）
+                # [P1-5 Fix] 确保 system 消消息在最前面（OpenAI API 要求）
                 all_messages.insert(0, Message.system(system_content))
             except Exception as e:
                 logger.warning(f"System prompt formatting failed: {e}")

@@ -23,10 +23,11 @@ from __future__ import annotations
 
 import asyncio
 import time
+import threading
 from abc import ABC, abstractmethod
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Type, TypeVar
 
-from pydantic import BaseModel
+from pydantic import BaseModel, PrivateAttr
 
 from gecko.core.events.bus import EventBus
 from gecko.core.exceptions import AgentError, ModelError
@@ -41,15 +42,15 @@ logger = get_logger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 
-# [P3 增强] 模型定价配置（单位：USD per token）
+# [P3 增强] 模型定价配置（单位：USD per 1M tokens）
 MODEL_PRICING = {
-    # OpenAI pricing (USD per 1M tokens, as of 2024)
-    "gpt-4": {"input": 30.0 / 1_000_000, "output": 60.0 / 1_000_000},
-    "gpt-4-turbo": {"input": 10.0 / 1_000_000, "output": 30.0 / 1_000_000},
-    "gpt-3.5-turbo": {"input": 0.5 / 1_000_000, "output": 1.5 / 1_000_000},
-    "claude-3-opus": {"input": 15.0 / 1_000_000, "output": 75.0 / 1_000_000},
-    "claude-3-sonnet": {"input": 3.0 / 1_000_000, "output": 15.0 / 1_000_000},
-    "claude-3-haiku": {"input": 0.25 / 1_000_000, "output": 1.25 / 1_000_000},
+    # OpenAI pricing (as of 2024)
+    "gpt-4": {"input": 30.0, "output": 60.0},          # $30, $60 per 1M tokens
+    "gpt-4-turbo": {"input": 10.0, "output": 30.0},    # $10, $30 per 1M tokens
+    "gpt-3.5-turbo": {"input": 0.5, "output": 1.5},    # $0.5, $1.5 per 1M tokens
+    "claude-3-opus": {"input": 15.0, "output": 75.0},   # $15, $75 per 1M tokens
+    "claude-3-sonnet": {"input": 3.0, "output": 15.0},  # $3, $15 per 1M tokens
+    "claude-3-haiku": {"input": 0.25, "output": 1.25},  # $0.25, $1.25 per 1M tokens
 }
 
 
@@ -70,24 +71,28 @@ class ExecutionStats(BaseModel):
     
     # [P3 增强] 成本跟踪
     estimated_cost: float = 0.0  # 估算成本（单位：美元）
-    
+    _lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
+
     def add_step(self, duration: float, input_tokens: int = 0, output_tokens: int = 0, had_error: bool = False):
         """记录一次步骤执行"""
-        self.total_steps += 1
-        self.total_time += duration
-        self.input_tokens += input_tokens
-        self.output_tokens += output_tokens
-        if had_error:
-            self.errors += 1
-    
+        with self._lock:
+            self.total_steps += 1
+            self.total_time += duration
+            self.input_tokens += input_tokens
+            self.output_tokens += output_tokens
+            if had_error:
+                self.errors += 1
+
     def add_tool_call(self):
         """记录一次工具调用"""
-        self.tool_calls += 1
-    
+        with self._lock:
+            self.tool_calls += 1
+
     def add_cost(self, cost: float):
         """累加成本估算（单位：美元）"""
-        self.estimated_cost += cost
-    
+        with self._lock:
+            self.estimated_cost += cost
+
     def get_avg_step_time(self) -> float:
         """获取平均步骤时间（秒）"""
         return self.total_time / self.total_steps if self.total_steps > 0 else 0.0
@@ -372,7 +377,7 @@ class CognitiveEngine(ABC):
                 else:
                     self.before_step_hook(input_messages, **kwargs)
             except Exception as e:
-                logger.warning("before_step_hook failed", error=str(e))
+                logger.warning("before_step_hook failed", error=str(e), exc_info=True)
                 if self.hooks_fail_fast:
                     raise
     
@@ -403,7 +408,7 @@ class CognitiveEngine(ABC):
                 else:
                     self.after_step_hook(input_messages, output, **kwargs)
             except Exception as e:
-                logger.warning("after_step_hook failed", error=str(e))
+                logger.warning("after_step_hook failed", error=str(e), exc_info=True)
                 if self.hooks_fail_fast:
                     raise
     
@@ -434,16 +439,16 @@ class CognitiveEngine(ABC):
                 else:
                     self.on_error_hook(error, input_messages, **kwargs)
             except Exception as e:
-                logger.error("on_error_hook failed", error=str(e))
+                logger.error("on_error_hook failed", error=str(e), exc_info=True)
                 if self.hooks_fail_fast:
                     raise
 
     # ===== 轻量统计/指标辅助 =====
-    def record_step(self, duration: float, tokens: int = 0, had_error: bool = False) -> None:
+    def record_step(self, duration: float, input_tokens: int = 0, output_tokens: int = 0, had_error: bool = False) -> None:
         """记录一次执行步骤的轻量统计（供子类在合适位置调用）。"""
         if self.stats is not None:
             try:
-                self.stats.add_step(duration, tokens=tokens, had_error=had_error)
+                self.stats.add_step(duration, input_tokens=input_tokens, output_tokens=output_tokens, had_error=had_error)
             except Exception:
                 logger.debug("Failed to update stats")
 
@@ -457,19 +462,29 @@ class CognitiveEngine(ABC):
 
     # ===== 成本与定价辅助 =====
     def record_cost(self, input_tokens: int = 0, output_tokens: int = 0, model_name: str = "") -> None:
-        """基于 token 数和模型名称记录估算成本。"""
+        """基于 token 数和模型名称记录估算成本。
+        
+        Args:
+            input_tokens: 输入 token 数
+            output_tokens: 输出 token 数  
+            model_name: 模型名称（用于查询定价表）
+        """
         if self.stats is None:
             return
         
-        # 获取模型定价（默认使用 gpt-3.5-turbo 价格如果未找到）
-        pricing = MODEL_PRICING.get(model_name, MODEL_PRICING.get("gpt-3.5-turbo"))
+        # 获取模型定价（默认使用 gpt-3.5-turbo）
+        pricing = MODEL_PRICING.get(model_name)
+        if not pricing:
+            pricing = MODEL_PRICING.get("gpt-3.5-turbo")
         
-        if pricing:
-            cost = (input_tokens * pricing["input"]) + (output_tokens * pricing["output"])
-            try:
-                self.stats.add_cost(cost)
-            except Exception:
-                logger.debug("Failed to record cost")
+        # 成本计算：从"每 1M tokens"转换为实际成本
+        # cost = tokens * (price_per_million_tokens / 1_000_000)
+        cost = (input_tokens * pricing["input"] / 1_000_000) + (output_tokens * pricing["output"] / 1_000_000)
+        
+        try:
+            self.stats.add_cost(cost)
+        except Exception:
+            logger.debug("Failed to record cost", error_tokens=(input_tokens, output_tokens))
     
     def get_stats_summary(self) -> Dict[str, Any]:
         """获取执行统计摘要"""
