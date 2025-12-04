@@ -178,6 +178,8 @@ tmp/
 temp/
 debug.log
 test_*.lock
+test_gecko.db.lock
+session_*.db
 
 # 示例生成的媒体文件（如果有多模态测试）
 media/

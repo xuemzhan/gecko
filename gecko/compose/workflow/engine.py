@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections import deque
+from contextlib import nullcontext
 from typing import Any, Callable, Dict, Optional, Set, Union, List
 
 import anyio
@@ -28,6 +29,73 @@ from gecko.plugins.storage.interfaces import SessionInterface
 
 # 导入子模块
 from gecko.compose.workflow.models import WorkflowContext, CheckpointStrategy, NodeStatus
+
+
+class _COWDict(dict):
+    """Lightweight Copy-On-Write dict wrapper.
+
+    - Reads consult the shared base dict unless overridden in local writes.
+    - First write creates local overlay without mutating the shared base.
+    - `get_diff()` returns the local overlay (keys written by this worker).
+    """
+    def __init__(self, base: Optional[dict] = None):
+        super().__init__()
+        self._base = base or {}
+        self._local = {}
+
+    def __getitem__(self, key):
+        if key in self._local:
+            return self._local[key]
+        return self._base[key]
+
+    def get(self, key, default=None):
+        if key in self._local:
+            return self._local.get(key, default)
+        return self._base.get(key, default)
+
+    def __contains__(self, key):
+        return key in self._local or key in self._base
+
+    def keys(self):
+        return set(self._base.keys()) | set(self._local.keys())
+
+    def items(self):
+        for k in self.keys():
+            yield (k, self.get(k))
+
+    def __setitem__(self, key, value):
+        self._local[key] = value
+
+    def pop(self, key, default=None):
+        """Pop key from dict, materializing from base if needed.
+        
+        防御编程: 确保 pop 语义正确
+        - 若 key 在 _local，直接 pop
+        - 若 key 仅在 _base，物化到 _local 后再 pop
+        - 若 key 都不存在，返回 default
+        """
+        if key in self._local:
+            return self._local.pop(key)
+        if key in self._base:
+            # 物化到本地后再 pop，以保证语义一致
+            self._local[key] = self._base[key]
+            return self._local.pop(key)
+        return default
+
+    def update(self, other=None, **kwargs):
+        if other:
+            try:
+                for k, v in dict(other).items():
+                    self._local[k] = v
+            except Exception:
+                pass
+        for k, v in kwargs.items():
+            self._local[k] = v
+
+    def get_diff(self) -> dict:
+        """Return the local overlay to be merged back into the main state."""
+        return dict(self._local)
+
 from gecko.compose.workflow.graph import WorkflowGraph
 from gecko.compose.workflow.executor import NodeExecutor
 from gecko.compose.workflow.persistence import PersistenceManager
@@ -191,7 +259,8 @@ class Workflow:
         input_data: Any, 
         session_id: Optional[str] = None, 
         start_node: Optional[str] = None,
-        _resume_context: Optional[WorkflowContext] = None
+        _resume_context: Optional[WorkflowContext] = None,
+        timeout: Optional[float] = None
     ) -> Any:
         """
         执行工作流 (主入口)
@@ -201,6 +270,7 @@ class Workflow:
             session_id: 会话 ID (可选，用于持久化)
             start_node: [v0.4] 指定起始节点 (可选，用于 Resume 或特定入口)
             _resume_context: [v0.4] 注入已恢复的上下文 (用于 Resume)
+            timeout: 超时时间 (秒)，None 表示无限制
         
         执行流程:
         1. 验证图结构 (强制启用并行支持)。
@@ -243,59 +313,69 @@ class Workflow:
 
         current_step = 0
         
+        # 创建超时管理器 (实时超时保护)
+        timeout_cm = anyio.move_on_after(timeout) if timeout is not None else nullcontext()
+        
         try:
-            # 4. 主执行循环
-            while execution_queue:
-                # 安全检查：防止无限循环
-                if current_step >= self.max_steps:
-                    raise WorkflowError(f"Exceeded max steps: {self.max_steps}")
+            # 4. 主执行循环 (带实时超时保护)
+            with timeout_cm:
+                while execution_queue:
+                    # 安全检查：防止无限循环
+                    if current_step >= self.max_steps:
+                        raise WorkflowError(f"Exceeded max steps: {self.max_steps}")
 
-                # 取出当前层 (Set[node_name])
-                layer = execution_queue.popleft()
+                    # 取出当前层 (Set[node_name])
+                    layer = execution_queue.popleft()
 
-                # 4.1 Pre-Commit (持久化 RUNNING 状态)
-                # 记录即将执行的层，以便 Crash 后知道是在哪一步挂的
-                if session_id:
-                    await self.persistence.save_checkpoint(
-                        session_id, current_step, list(layer), context, force=True # type: ignore
-                    )
+                    # 4.1 Pre-Commit (持久化 RUNNING 状态)
+                    # 记录即将执行的层，以便 Crash 后知道是在哪一步挂的
+                    if session_id:
+                        await self.persistence.save_checkpoint(
+                            session_id, current_step, list(layer), context, force=True # type: ignore
+                        )
 
-                # 4.2 [核心] 并行执行当前层
-                # 返回: {node_name: {"output": ..., "state_diff": ...}}
-                layer_results = await self._execute_layer_parallel(layer, context)
-                
-                # 4.3 合并结果与状态 (Merge)
-                # 将并行节点的输出和状态变更合并回主 Context
-                self._merge_layer_results(context, layer_results)
-                
-                # [P1-2 修复] 定期清理 history，防止无界增长
-                self._cleanup_history(context, max_steps=self.persistence.history_retention)
-                
-                # 4.4 处理动态跳转 (Next)
-                # 策略: 如果层中任何节点返回了 Next，则中断静态计划，优先处理跳转
-                jump_instruction = self._handle_dynamic_jump(layer_results, context)
-                
-                if jump_instruction:
-                    target_node = jump_instruction.node
-                    logger.info(f"Dynamic jump to '{target_node}', static plan interrupted.")
+                    # 4.2 [核心] 并行执行当前层
+                    # 返回: {node_name: {"output": ..., "state_diff": ...}}
+                    layer_results = await self._execute_layer_parallel(layer, context)
                     
-                    # 清空当前静态队列
-                    execution_queue.clear()
-                    # 将目标节点作为新的一层加入，转为动态执行模式
-                    execution_queue.append({target_node})
-                    # 清除上下文中的指针，防止污染
-                    context.clear_next_pointer()
-                
-                # 4.5 Post-Commit (持久化 SUCCESS 状态)
-                # 记录本层已完成
-                if session_id:
-                    await self.persistence.save_checkpoint(
-                        session_id, current_step, list(layer), context # type: ignore
-                    )
-                
-                current_step += 1
+                    # 4.3 合并结果与状态 (Merge)
+                    # 将并行节点的输出和状态变更合并回主 Context
+                    self._merge_layer_results(context, layer_results)
+                    
+                    # [P1-2 修复] 定期清理 history，防止无界增长
+                    self._cleanup_history(context, max_steps=self.persistence.history_retention)
+                    
+                    # 4.4 处理动态跳转 (Next)
+                    # 策略: 如果层中任何节点返回了 Next，则中断静态计划，优先处理跳转
+                    jump_instruction = self._handle_dynamic_jump(layer_results, context)
+                    
+                    if jump_instruction:
+                        target_node = jump_instruction.node
+                        logger.info(f"Dynamic jump to '{target_node}', static plan interrupted.")
+                        
+                        # 清空当前静态队列
+                        execution_queue.clear()
+                        # 将目标节点作为新的一层加入，转为动态执行模式
+                        execution_queue.append({target_node})
+                        # 清除上下文中的指针，防止污染
+                        context.clear_next_pointer()
 
-            # 5. 最终保存 (Strategy=FINAL)
+                    # 4.5 Post-Commit (持久化 SUCCESS 状态)
+                    # 记录本层已完成
+                    if session_id:
+                        await self.persistence.save_checkpoint(
+                            session_id, current_step, list(layer), context # type: ignore
+                        )
+                    
+                    current_step += 1
+
+            # 5. 超时检查
+            if timeout is not None and timeout_cm.cancel_called:  # type: ignore
+                raise WorkflowError(
+                    f"Workflow execution exceeded timeout: {timeout}s after {current_step} steps"
+                )
+            
+            # 6. 最终保存 (Strategy=FINAL)
             if self.persistence.strategy == CheckpointStrategy.FINAL:
                 await self.persistence.save_checkpoint(
                     session_id, 9999, None, context, force=True # type: ignore
@@ -303,8 +383,14 @@ class Workflow:
                 
             return context.get_last_output()
             
+        except TimeoutError as e:
+            # anyio 超时异常
+            logger.exception(f"Workflow execution timeout after {current_step} steps")
+            raise WorkflowError(
+                f"Workflow execution timed out after {current_step} steps (timeout={timeout}s)"
+            ) from e
         except Exception as e:
-            logger.exception("Workflow execution failed")
+            logger.exception(f"Workflow execution failed at step {current_step}")
             if not isinstance(e, WorkflowError):
                 raise WorkflowError(f"Workflow execution failed: {e}") from e
             raise
@@ -365,8 +451,8 @@ class Workflow:
                 # 并对 `state` 做一次浅复制以实现写时复制（Copy-On-Write）。
                 # history 保持共享引用以节省内存和拷贝成本（只读语义）。
                 node_context = context.model_copy(deep=False)
-                # 将 state 设置为主 state 的浅拷贝，写操作不会影响主 context
-                node_context.state = dict(context.state)
+                # 将 state 设置为一个 Copy-On-Write 包装器，写时复制
+                node_context.state = _COWDict(context.state)
                 # history 共享引用（只读），避免深拷贝开销
                 node_context.history = context.history
                 
@@ -442,9 +528,11 @@ class Workflow:
             output = await self.executor.execute_node(name, func, ctx)
             
             # 3. 计算 State Diff
-            # 简单策略：直接返回当前节点的所有 state，由 merge 负责更新 (Last Write Wins)
-            # 进阶策略：可以对比 ctx.state 和初始快照，只返回变更部分
-            state_diff = ctx.state 
+            # 如果 ctx.state 是 COWDict，提取本地改动 (get_diff)，否则采用整个 state
+            if hasattr(ctx.state, "get_diff"):
+                state_diff = ctx.state.get_diff()
+            else:
+                state_diff = dict(ctx.state)
             
             # 写入结果容器 (线程安全，因为是在协程回调中写入 dict)
             results[name] = {
@@ -452,8 +540,15 @@ class Workflow:
                 "state_diff": state_diff
             }
         except Exception as e:
-            # 异常冒泡，TaskGroup 会捕获并取消其他任务
-            raise e
+            # 在节点层记录丰富的上下文信息，便于排查
+            logger.exception(
+                f"Node worker failed: {name}",
+                node=name,
+                session=getattr(ctx, 'metadata', {}).get('session_id'),
+                entry_point=self.graph.entry_point,
+            )
+            # 包装为 WorkflowError 保留原始栈信息
+            raise WorkflowError(f"Node '{name}' execution error: {e}") from e
 
     def _merge_layer_results(self, context: WorkflowContext, results: Dict[str, Any]):
         """

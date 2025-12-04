@@ -78,11 +78,17 @@ class Team:
 
     # ========================= 接口协议 =========================
 
-    async def __call__(self, context_or_input: Any) -> List[MemberResult]:
-        return await self.run(context_or_input)
+    async def __call__(self, context_or_input: Any, timeout: Optional[float] = None) -> List[MemberResult]:
+        return await self.run(context_or_input, timeout=timeout)
 
-    async def run(self, context_or_input: Any) -> List[MemberResult]:
-        """执行 Team 逻辑"""
+    async def run(self, context_or_input: Any, timeout: Optional[float] = None) -> List[MemberResult]:
+        """
+        执行 Team 逻辑
+        
+        Args:
+            context_or_input: 上下文或输入数据
+            timeout: 超时时间 (秒)，None 表示无限制
+        """
         # 1. 解析原始输入
         raw_input = self._resolve_input(context_or_input)
         member_count = len(self.members)
@@ -111,18 +117,23 @@ class Team:
 
         # 3. 根据策略分发
         if self.strategy == ExecutionStrategy.RACE:
-            return await self._execute_race(inputs)
+            return await self._execute_race(inputs, timeout)
         else:
-            return await self._execute_all(inputs)
+            return await self._execute_all(inputs, timeout)
 
     # ========================= 核心执行模式 =========================
 
-    async def _execute_all(self, inputs: List[Any]) -> List[MemberResult]:
+    async def _execute_all(self, inputs: List[Any], timeout: Optional[float] = None) -> List[MemberResult]:
         """
-        [默认模式] 等待所有成员完成
+        [默认模式] 等待所有成员完成 (带超时保护)
         """
+        from contextlib import nullcontext
+        
         results: List[Optional[MemberResult]] = [None] * len(self.members)
         semaphore = anyio.Semaphore(self.max_concurrent) if self.max_concurrent > 0 else None
+        
+        # 创建超时管理器
+        timeout_cm = anyio.move_on_after(timeout) if timeout is not None else nullcontext()
 
         async def _worker(idx: int, member: Any, inp: Any):
             if semaphore:
@@ -134,19 +145,35 @@ class Team:
                 if semaphore:
                     semaphore.release()
 
-        async with anyio.create_task_group() as tg:
-            for i, member in enumerate(self.members):
-                tg.start_soon(_worker, i, member, inputs[i])
+        try:
+            with timeout_cm:
+                async with anyio.create_task_group() as tg:
+                    for i, member in enumerate(self.members):
+                        tg.start_soon(_worker, i, member, inputs[i])
+        except TimeoutError:
+            logger.warning(f"Team {self.name} execution timed out after {timeout}s")
+            raise
+        
+        # 检查超时是否触发
+        if timeout is not None and timeout_cm.cancel_called:  # type: ignore
+            logger.warning(f"Team {self.name} execution timed out")
+            # 返回已完成的结果或超时错误
+            final_results = [r for r in results if r is not None]
+            if not final_results:
+                raise RuntimeError(f"Team {self.name} execution timed out and no member completed")
+            return final_results
 
         # 整理结果
         final_results = [r for r in results if r is not None]
         self._log_completion(final_results)
         return final_results
 
-    async def _execute_race(self, inputs: List[Any]) -> List[MemberResult]:
+    async def _execute_race(self, inputs: List[Any], timeout: Optional[float] = None) -> List[MemberResult]:
         """
-        [赛马模式] 返回最快成功的那个，取消其他
+        [赛马模式] 返回最快成功的那个，取消其他 (带超时保护)
         """
+        from contextlib import nullcontext
+        
         # 用于存储获胜者的容器 (list 是可变的，闭包可写)
         winner: List[MemberResult] = []
 
@@ -154,29 +181,34 @@ class Team:
         # [P0-1 修复] 在调用之前创建 Lock，避免 None 导致的异常
         self._winner_lock = anyio.Lock()
         
-        # 使用 CancelScope 实现“一人成功，全员取消”
+        # 创建超时管理器
+        timeout_cm = anyio.move_on_after(timeout) if timeout is not None else nullcontext()
+        
+        # 使用 CancelScope 实现"一人成功，全员取消"
         # 注意：这里需要在外部包裹 try-except 处理取消异常
         try:
-            async with anyio.create_task_group() as tg:
-                for i, member in enumerate(self.members):
-                    
-                    async def _racer(idx: int, mem: Any, inp: Any):
-                        # 执行成员逻辑
-                        res = await self._safe_execute_member(idx, mem, inp)
-                        
-                        # [P0-1 修复] 使用原子 Lock 保护
-                        # 防止多个协程同时通过 "if not winner" 的检查
-                        async with self._winner_lock:
-                            if res.is_success and not winner:
-                                winner.append(res)
-                                # 核心：取消整个 TaskGroup 的 Scope
-                                tg.cancel_scope.cancel()
-                        
-                    tg.start_soon(_racer, i, member, inputs[i])
-                    
+            with timeout_cm:
+                async with anyio.create_task_group() as tg:
+                    for i, member in enumerate(self.members):
+
+                        async def _racer(idx: int, mem: Any, inp: Any):
+                            # 执行成员逻辑
+                            res = await self._safe_execute_member(idx, mem, inp)
+
+                            # [P0-1 修复] 使用原子 Lock 保护
+                            # 防止多个协程同时通过 "if not winner" 的检查
+                            async with self._winner_lock:
+                                if res.is_success and not winner:
+                                    winner.append(res)
+                                    # 核心：取消整个 TaskGroup 的 Scope
+                                    tg.cancel_scope.cancel()
+
+                        tg.start_soon(_racer, i, member, inputs[i])
         except anyio.get_cancelled_exc_class():
-            # 捕获取消异常是预期行为（因为我们主动 cancel 了）
+            # 捕获取消异常是预期行为（因为我们主动 cancel 了或超时了）
             pass
+        except TimeoutError:
+            logger.warning(f"Team {self.name} race timed out after {timeout}s")
         except Exception as e:
             logger.error("Race execution crashed", error=str(e))
         finally:
@@ -186,6 +218,10 @@ class Team:
         if winner:
             logger.info(f"Team {self.name} Race won by member {winner[0].member_index}")
             return winner
+        
+        # 检查是否超时
+        if timeout is not None and timeout_cm.cancel_called:  # type: ignore
+            raise RuntimeError(f"Team {self.name} race timed out after {timeout}s")
         
         # [P0-2 修复] 失败时返回有意义的结果，而不是空列表
         logger.warning(f"Team {self.name} Race failed: no winner")
@@ -207,7 +243,10 @@ class Team:
             processed = self._process_result(raw)
             return MemberResult(member_index=idx, result=processed, is_success=True)
         except Exception as e:
+            # 记录详细异常，便于后续聚合与监控
+            # 保持对旧接口的兼容性：先调用 error，再记录完整异常
             logger.error(f"Member {idx} failed", error=str(e))
+            logger.exception(f"Member {idx} execution failed", member_index=idx, error=str(e))
             return MemberResult(member_index=idx, error=str(e), is_success=False)
 
     def _resolve_input(self, context_or_input: Any) -> Any:
