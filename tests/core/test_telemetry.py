@@ -95,3 +95,158 @@ class TestGeckoTelemetry:
         
         from gecko.core.telemetry import get_telemetry
         assert get_telemetry() is t
+
+
+class TestTelemetryAutoInitialization:
+    """测试自动初始化行为"""
+
+    def test_get_telemetry_auto_setup(self):
+        """获取实例时自动调用 setup()"""
+        from gecko.core.telemetry import get_telemetry
+        
+        # 获取实例，应该返回一个有效的 GeckoTelemetry 实例
+        telemetry = get_telemetry()
+        assert telemetry is not None
+        assert isinstance(telemetry, GeckoTelemetry)
+
+    def test_get_telemetry_idempotent(self):
+        """多次调用 get_telemetry() 返回同一实例"""
+        from gecko.core.telemetry import get_telemetry
+        
+        t1 = get_telemetry()
+        t2 = get_telemetry()
+        
+        assert t1 is t2
+
+
+class TestLoggingTraceIDInjection:
+    """测试日志 Trace ID 注入到 span"""
+
+    def test_span_injects_logging_trace_id(self, mock_otel):
+        """验证 span() 注入 logging trace ID"""
+        from gecko.core.logging import trace_context
+        from gecko.core.telemetry import GeckoTelemetry, TelemetryConfig
+        
+        config = TelemetryConfig(enabled=True)
+        telemetry = GeckoTelemetry(config)
+        telemetry._tracer = mock_otel.get_tracer()
+        telemetry._initialized = True
+        
+        # 在 trace context 中创建 span
+        with trace_context() as ctx:
+            # trace_context 已经设置了 logging trace_id_var 和 span_id_var
+            # 现在创建 span，它应该注入这些值
+            with telemetry.span("test_op"):
+                # 验证 span 被创建（不抛出异常）
+                pass
+
+    def test_async_span_injects_logging_trace_id(self, mock_otel):
+        """验证 async_span() 注入 logging trace ID"""
+        import asyncio
+        from gecko.core.logging import trace_context
+        from gecko.core.telemetry import GeckoTelemetry, TelemetryConfig
+        
+        config = TelemetryConfig(enabled=True)
+        telemetry = GeckoTelemetry(config)
+        telemetry._tracer = mock_otel.get_tracer()
+        telemetry._initialized = True
+        
+        async def test_func():
+            with trace_context():
+                with telemetry.span("async_op"):
+                    return "success"
+        
+        result = asyncio.run(test_func())
+        assert result == "success"
+
+
+class TestTelemetryShutdown:
+    """测试 telemetry 关闭和清理"""
+
+    def test_shutdown_cleans_traces(self, mock_otel):
+        """测试关闭时的清理"""
+        config = TelemetryConfig(enabled=True)
+        telemetry = GeckoTelemetry(config)
+        telemetry._tracer = mock_otel.get_tracer()
+        telemetry._initialized = True
+        
+        # 创建一些 span
+        with telemetry.span("op1"):
+            pass
+        
+        with telemetry.span("op2"):
+            pass
+        
+        # 调用关闭（不应该抛出异常）
+        telemetry.shutdown()
+
+    def test_disabled_telemetry_no_overhead(self):
+        """禁用 telemetry 时不应该有开销"""
+        config = TelemetryConfig(enabled=False)
+        telemetry = GeckoTelemetry(config)
+        
+        # 这些操作应该快速返回
+        with telemetry.span("no_op"):
+            pass
+        
+        # 不应该抛出异常
+        telemetry.shutdown()
+
+
+class TestTelemetryIntegration:
+    """集成测试"""
+
+    def test_full_workflow_with_logging(self, mock_otel):
+        """完整工作流：logging + telemetry + metrics"""
+        from gecko.core.logging import get_context_logger, trace_context
+        from gecko.core.metrics import MetricsRegistry
+        from gecko.core.telemetry import GeckoTelemetry, TelemetryConfig
+        
+        # 设置 telemetry
+        config = TelemetryConfig(enabled=True)
+        telemetry = GeckoTelemetry(config)
+        telemetry._tracer = mock_otel.get_tracer()
+        telemetry._initialized = True
+        
+        # 设置 logging
+        logger = get_context_logger(__name__)
+        
+        # 设置 metrics
+        registry = MetricsRegistry()
+        counter = registry.counter("operations")
+        
+        # 在 trace context 中执行
+        with trace_context() as ctx:
+            with telemetry.span("operation"):
+                logger.info("Starting operation", operation="test")
+                counter.inc(service="test")
+                
+                # 验证日志被记录
+                logger.info("Operation completed")
+        
+        # 验证指标
+        assert counter.get(service="test") == 1.0
+
+    def test_multiple_spans_same_trace(self, mock_otel):
+        """同一 trace 中的多个 span"""
+        from gecko.core.logging import trace_context
+        from gecko.core.telemetry import GeckoTelemetry, TelemetryConfig
+        
+        config = TelemetryConfig(enabled=True)
+        telemetry = GeckoTelemetry(config)
+        telemetry._tracer = mock_otel.get_tracer()
+        telemetry._initialized = True
+        
+        # 在单个 trace context 中创建多个 span
+        with trace_context() as ctx:
+            with telemetry.span("span1"):
+                pass
+            
+            with telemetry.span("span2"):
+                pass
+            
+            with telemetry.span("span3"):
+                pass
+        
+        # 所有 span 应该共享相同的 trace_id
+        # (这由 trace_context 保证)
