@@ -19,6 +19,12 @@ from gecko.core.logging import get_logger
 
 logger = get_logger(__name__)
 
+# 导入 logging 的追踪上下文变量，用于与日志系统集成
+from gecko.core.logging import (
+    trace_id_var as logging_trace_id_var,
+    span_id_var as logging_span_id_var,
+)
+
 from opentelemetry import trace
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider as SDKTracerProvider
@@ -187,6 +193,16 @@ class GeckoTelemetry:
         with self._tracer.start_as_current_span( # type: ignore
             name, kind=span_kind, attributes=attributes or {}
         ) as span:
+            # 自动从 logging 上下文注入 trace_id，实现日志和追踪的关联
+            logging_trace_id = logging_trace_id_var.get()
+            if logging_trace_id:
+                span.set_attribute("gecko.logging.trace_id", logging_trace_id)
+            
+            # 自动从 logging 上下文注入 span_id（用于关联）
+            logging_span_id = logging_span_id_var.get()
+            if logging_span_id:
+                span.set_attribute("gecko.logging.span_id", logging_span_id)
+            
             # 注入请求 ID
             request_id = request_id_var.get()
             if request_id:
@@ -224,6 +240,16 @@ class GeckoTelemetry:
         with self._tracer.start_as_current_span( # type: ignore
             name, kind=span_kind, attributes=attributes or {}
         ) as span:
+            # 自动从 logging 上下文注入 trace_id
+            logging_trace_id = logging_trace_id_var.get()
+            if logging_trace_id:
+                span.set_attribute("gecko.logging.trace_id", logging_trace_id)
+            
+            # 自动从 logging 上下文注入 span_id
+            logging_span_id = logging_span_id_var.get()
+            if logging_span_id:
+                span.set_attribute("gecko.logging.span_id", logging_span_id)
+            
             request_id = request_id_var.get()
             if request_id:
                 span.set_attribute("gecko.request_id", request_id)
@@ -329,10 +355,17 @@ _telemetry: Optional[GeckoTelemetry] = None
 
 
 def get_telemetry() -> GeckoTelemetry:
-    """获取全局遥测实例"""
+    """
+    获取全局遥测实例。
+    
+    注意：此函数返回的实例会在首次调用时自动初始化（setup）。
+    如需自定义配置，请在首次调用之前使用 configure_telemetry() 函数。
+    """
     global _telemetry
     if _telemetry is None:
         _telemetry = GeckoTelemetry()
+        # 自动初始化，避免用户忘记调用 setup()
+        _telemetry.setup()
     return _telemetry
 
 

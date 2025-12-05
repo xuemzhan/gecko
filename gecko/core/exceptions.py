@@ -88,6 +88,16 @@ class StorageError(GeckoError):
     pass
 
 
+class ServiceNotRegisteredError(GeckoError):
+    """容器查找服务时，服务未注册的错误"""
+    pass
+
+
+class CircularDependencyError(GeckoError):
+    """检测到循环依赖时抛出"""
+    pass
+
+
 __all__ = [
     # 异常类
     "GeckoError",
@@ -99,6 +109,8 @@ __all__ = [
     "WorkflowError",
     "WorkflowCycleError",
     "StorageError",
+    "ServiceNotRegisteredError",
+    "CircularDependencyError",
     # 错误码相关（从 error_codes 复用）
     "ErrorCode",
     "ErrorCategory",

@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import sys
 from typing import (
     Any, Callable, Dict, Generic, Optional, Type, TypeVar, Union, 
-    get_type_hints, overload
+    get_type_hints, overload, get_origin, get_args
 )
+from threading import RLock
 from enum import Enum
 from contextlib import asynccontextmanager
 
@@ -47,10 +49,28 @@ class ServiceDescriptor(Generic[T]):
     
     def is_instance(self) -> bool:
         """是否是直接注册的实例"""
-        return not (
-            inspect.isclass(self.implementation) or 
-            callable(self.implementation)
-        )
+        impl = self.implementation
+        # 如果实现是类 -> 不是实例
+        if inspect.isclass(impl):
+            return False
+        # 如果实现是该服务类型的实例 -> 视为实例
+        try:
+            if isinstance(impl, self.service_type):
+                return True
+        except Exception:
+            # isinstance 可能因为 typing generics 等抛异常，忽略
+            pass
+        # 可调用对象通常是工厂/函数，不能视为已预创建的实例
+        if callable(impl):
+            return False
+        # 否则视为实例
+        return True
+
+
+from gecko.core.exceptions import (
+    ServiceNotRegisteredError,
+    CircularDependencyError,
+)
 
 
 class Container:
@@ -80,6 +100,12 @@ class Container:
         self._parent = parent
         self._scoped_instances: Dict[Type, Any] = {}
         self._is_scope = parent is not None
+        # 用于检测解析时的循环依赖（保存正在解析的服务类型）
+        self._resolving: set[Type] = set()
+        # 保护单例初始化的同步锁，防止并发创建多个单例
+        self._singleton_lock = RLock()
+        # 异步路径的锁（用于 async resolve）
+        self._async_lock = asyncio.Lock()
     
     # ==================== 注册方法 ====================
     
@@ -176,9 +202,17 @@ class Container:
         # 查找描述符
         descriptor = self._get_descriptor(service_type)
         if descriptor is None:
-            raise KeyError(f"Service not registered: {service_type.__name__}")
-        
-        return self._create_instance(descriptor)
+            raise ServiceNotRegisteredError(f"Service not registered: {service_type.__name__}")
+
+        # 循环依赖检测
+        if service_type in self._resolving:
+            raise CircularDependencyError(f"Circular dependency detected while resolving {service_type.__name__}")
+
+        try:
+            self._resolving.add(service_type)
+            return self._create_instance(descriptor)
+        finally:
+            self._resolving.discard(service_type)
     
     def resolve_optional(self, service_type: Type[T]) -> Optional[T]:
         """解析服务（未注册时返回 None）"""
@@ -190,9 +224,16 @@ class Container:
     def resolve_all(self, service_type: Type[T]) -> list[T]:
         """解析所有匹配的服务（包括子类）"""
         instances = []
+        # 遍历当前容器及父容器，收集所有匹配项
         for registered_type, descriptor in self._services.items():
-            if issubclass(registered_type, service_type):
-                instances.append(self._create_instance(descriptor))
+            try:
+                if inspect.isclass(registered_type) and issubclass(registered_type, service_type):
+                    instances.append(self._create_instance(descriptor))
+            except Exception:
+                # 若 registered_type 不是类或比较失败，则跳过
+                continue
+        if self._parent:
+            instances.extend(self._parent.resolve_all(service_type))
         return instances
     
     # ==================== 作用域 ====================
@@ -224,6 +265,29 @@ class Container:
                 except Exception as e:
                     logger.warning("Error closing scoped instance", error=str(e))
         self._scoped_instances.clear()
+
+    async def shutdown(self):
+        """
+        清理容器中所有单例实例的生命周期资源（如果有 close 或 aclose 方法）。
+        这是一个异步方法，适合在应用退出时调用，确保引用的资源被正确释放。
+        """
+        # 清理当前容器注册的单例实例
+        for descriptor in self._services.values():
+            inst = descriptor._instance
+            if not inst:
+                continue
+            try:
+                # 优先支持异步关闭方法 `aclose`
+                if hasattr(inst, "aclose"):
+                    res = inst.aclose()
+                    if asyncio.iscoroutine(res):
+                        await res
+                elif hasattr(inst, "close"):
+                    res = inst.close()
+                    if asyncio.iscoroutine(res):
+                        await res
+            except Exception as e:
+                logger.warning("Error shutting down singleton instance", error=str(e))
     
     # ==================== 内部方法 ====================
     
@@ -239,8 +303,10 @@ class Container:
         """创建服务实例"""
         # 单例：返回缓存的实例
         if descriptor.lifetime == Lifetime.SINGLETON:
-            if descriptor._instance is not None:
-                return descriptor._instance
+            # 使用锁保护单例创建，避免并发重复创建
+            with self._singleton_lock:
+                if descriptor._instance is not None:
+                    return descriptor._instance
         
         # 作用域：在当前作用域内缓存
         if descriptor.lifetime == Lifetime.SCOPED:
@@ -249,17 +315,20 @@ class Container:
         
         # 创建实例
         impl = descriptor.implementation
-        
+
         if descriptor.is_instance():
             # 直接注册的实例
             instance = impl
         elif callable(impl):
             if inspect.isclass(impl):
-                # 类：自动注入构造函数参数
+                # 类：自动注入构造函数参数（同步路径）
                 instance = self._create_with_injection(impl)
             else:
-                # 工厂函数
+                # 工厂函数，调用并允许工厂返回协程（但同步 resolve 不 await）
                 instance = impl(self)
+                # 如果工厂返回协程，提示使用 async resolve 更合适
+                if asyncio.iscoroutine(instance):
+                    raise RuntimeError("Factory returned a coroutine. Use 'resolve_async' for async factories.")
         else:
             raise TypeError(f"Cannot create instance from {impl}")
         
@@ -273,22 +342,113 @@ class Container:
     
     def _create_with_injection(self, cls: Type[T]) -> T:
         """创建实例并自动注入依赖"""
-        # 获取构造函数参数类型
+        # 获取构造函数参数类型，尽量在正确的模块命名空间解析前向引用
         try:
-            hints = get_type_hints(cls.__init__)
+            module = sys.modules.get(cls.__module__)
+            globalns = getattr(module, "__dict__", None)
+            hints = get_type_hints(cls.__init__, globalns=globalns)
         except Exception:
-            hints = {}
-        
+            # 若 get_type_hints 失败（例如局部/前向引用在当前全局命名空间不可解析），
+            # 回退到直接使用 __annotations__（可能包含字符串或 ForwardRef）
+            hints = getattr(cls.__init__, "__annotations__", {})
+
         # 排除 self 和 return
         hints.pop("return", None)
-        
-        # 解析依赖
+
+        # 解析依赖，支持 Optional[...] 等 typing 包装类型
         kwargs = {}
         for param_name, param_type in hints.items():
-            if param_type in self._services or (self._parent and param_type in self._parent._services):
-                kwargs[param_name] = self.resolve(param_type)
-        
+            origin = get_origin(param_type)
+            target_type = None
+            if origin is Union:
+                # 处理 Optional[T] => Union[T, NoneType]
+                args = get_args(param_type)
+                non_none = [a for a in args if a is not type(None)]  # noqa: E721
+                if len(non_none) == 1:
+                    target_type = non_none[0]
+            elif origin is not None:
+                # 其他泛型/容器类型，暂不支持注入
+                target_type = None
+            else:
+                target_type = param_type
+
+            # 如果 target_type 不是具体类型（例如字符串或 ForwardRef），尝试按名称匹配已注册类型
+            if not isinstance(target_type, type):
+                name = None
+                if isinstance(target_type, str):
+                    name = target_type
+                else:
+                    name = getattr(target_type, "__forward_arg__", None)
+
+                if name:
+                    for registered in self.get_registered_services():
+                        if getattr(registered, "__name__", None) == name:
+                            target_type = registered
+                            break
+                if not isinstance(target_type, type):
+                    # 仍然无法解析为类型，跳过注入
+                    continue
+
+            # 使用 _get_descriptor 支持父链查找
+            if self._get_descriptor(target_type) is not None:
+                kwargs[param_name] = self.resolve(target_type)
+
         return cls(**kwargs)
+
+    async def resolve_async(self, service_type: Type[T]) -> T:
+        """
+        异步解析服务实例，支持工厂返回协程或实例的异步初始化场景。
+        在遇到同步工厂/实现时也能正常工作（会在同步路径创建实例）。
+        """
+        descriptor = self._get_descriptor(service_type)
+        if descriptor is None:
+            raise ServiceNotRegisteredError(f"Service not registered: {service_type.__name__}")
+
+        # 循环依赖检测
+        if service_type in self._resolving:
+            raise CircularDependencyError(f"Circular dependency detected while resolving {service_type.__name__}")
+
+        try:
+            self._resolving.add(service_type)
+            return await self._create_instance_async(descriptor)
+        finally:
+            self._resolving.discard(service_type)
+
+    async def _create_instance_async(self, descriptor: ServiceDescriptor[T]) -> T:
+        """异步创建实例的实现，支持 async 工厂与 async 关闭"""
+        # 单例检查/创建在异步路径使用 async 锁
+        if descriptor.lifetime == Lifetime.SINGLETON:
+            async with self._async_lock:
+                if descriptor._instance is not None:
+                    return descriptor._instance
+
+        if descriptor.lifetime == Lifetime.SCOPED:
+            if descriptor.service_type in self._scoped_instances:
+                return self._scoped_instances[descriptor.service_type]
+
+        impl = descriptor.implementation
+
+        if descriptor.is_instance():
+            instance = impl
+        elif callable(impl):
+            if inspect.isclass(impl):
+                # 类构造为同步，复用同步注入路径
+                instance = self._create_with_injection(impl)
+            else:
+                # 工厂函数，可能返回协程
+                instance = impl(self)
+                if asyncio.iscoroutine(instance):
+                    instance = await instance
+        else:
+            raise TypeError(f"Cannot create instance from {impl}")
+
+        # 缓存
+        if descriptor.lifetime == Lifetime.SINGLETON:
+            descriptor._instance = instance # type: ignore
+        elif descriptor.lifetime == Lifetime.SCOPED:
+            self._scoped_instances[descriptor.service_type] = instance
+
+        return instance  # type: ignore
     
     # ==================== 工具方法 ====================
     

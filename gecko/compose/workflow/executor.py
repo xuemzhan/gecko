@@ -89,8 +89,15 @@ class NodeExecutor:
             # 5. 异常捕获
             execution.status = NodeStatus.FAILED
             execution.error = str(e)
-            # 异常向上冒泡，由 Engine 或 TaskGroup 处理 (取消并行任务)
-            raise e
+            # 记录详细日志，包含节点信息和简要上下文预览
+            logger.exception(
+                f"Node execution failed: {node_name}",
+                node=node_name,
+                status=execution.status,
+                preview=self._safe_preview(execution.output_data if execution.output_data else execution.error)
+            )
+            # 将异常包装为 WorkflowError 以便上层识别并保留原始 traceback
+            raise WorkflowError(f"Node '{node_name}' execution failed: {e}") from e
         finally:
             execution.end_time = time.time()
 

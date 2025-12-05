@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+from collections import ChainMap
 import logging
 import sys
 import uuid
@@ -307,31 +308,48 @@ class ContextLogger:
         """
         构造完整的上下文字段字典。
 
+        改进：使用 ChainMap 避免深 copy，降低 GC 压力。
+        但对 structlog 和标准 logging，最终仍需转换为普通 dict。
+
         合并顺序：
             1. trace_id / span_id
             2. extra_context_var 中保存的额外上下文
             3. 调用方传入的业务字段（kwargs）
         """
-        enriched: Dict[str, Any] = {}
+        # 使用 ChainMap 避免深 copy（读操作时不分配新内存）
+        maps_list: list[Dict[str, Any]] = []
 
-        # 1. 追踪信息
+        # 1. 追踪信息（创建新 dict 避免修改原 ContextVar）
+        trace_info: Dict[str, Any] = {}
         trace_id = trace_id_var.get()
         if trace_id:
-            enriched["trace_id"] = trace_id
+            trace_info["trace_id"] = trace_id
 
         span_id = span_id_var.get()
         if span_id:
-            enriched["span_id"] = span_id
+            trace_info["span_id"] = span_id
+
+        if trace_info:
+            maps_list.append(trace_info)
 
         # 2. 额外上下文
         extra_ctx = extra_context_var.get()
         if extra_ctx:
-            enriched.update(extra_ctx)
+            maps_list.append(extra_ctx)
 
-        # 3. 调用方字段（后者覆盖前者）
-        enriched.update(kwargs)
+        # 3. 调用方字段
+        if kwargs:
+            maps_list.append(kwargs)
 
-        return enriched
+        # 使用 ChainMap 组合所有层级（避免 copy），最后转换为 dict
+        if not maps_list:
+            return {}
+        elif len(maps_list) == 1:
+            return maps_list[0].copy() if maps_list[0] else {}
+        else:
+            # 多层时使用 ChainMap，最后再转为 dict
+            chain = ChainMap(*maps_list)
+            return dict(chain)
 
     def _log(self, method_name: str, message: str, **kwargs: Any) -> None:
         """
