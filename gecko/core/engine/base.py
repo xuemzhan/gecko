@@ -23,10 +23,11 @@ from __future__ import annotations
 
 import asyncio
 import time
+import threading
 from abc import ABC, abstractmethod
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Type, TypeVar
 
-from pydantic import BaseModel
+from pydantic import BaseModel, PrivateAttr
 
 from gecko.core.events.bus import EventBus
 from gecko.core.exceptions import AgentError, ModelError
@@ -41,6 +42,17 @@ logger = get_logger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 
+# [P3 增强] 模型定价配置（单位：USD per 1M tokens）
+MODEL_PRICING = {
+    # OpenAI pricing (as of 2024)
+    "gpt-4": {"input": 30.0, "output": 60.0},          # $30, $60 per 1M tokens
+    "gpt-4-turbo": {"input": 10.0, "output": 30.0},    # $10, $30 per 1M tokens
+    "gpt-3.5-turbo": {"input": 0.5, "output": 1.5},    # $0.5, $1.5 per 1M tokens
+    "claude-3-opus": {"input": 15.0, "output": 75.0},   # $15, $75 per 1M tokens
+    "claude-3-sonnet": {"input": 3.0, "output": 15.0},  # $3, $15 per 1M tokens
+    "claude-3-haiku": {"input": 0.25, "output": 1.25},  # $0.25, $1.25 per 1M tokens
+}
+
 
 # ====================== 执行统计 ======================
 
@@ -48,29 +60,50 @@ class ExecutionStats(BaseModel):
     """
     引擎执行统计
     
-    用于性能监控和调试。
+    用于性能监控和调试。支持 token 成本跟踪和模型定价。
     """
     total_steps: int = 0
-    total_time: float = 0.0
-    total_tokens: int = 0
+    total_time: float = 0.0  # 总执行时间（秒）
+    input_tokens: int = 0
+    output_tokens: int = 0
     tool_calls: int = 0
     errors: int = 0
     
-    def add_step(self, duration: float, tokens: int = 0, had_error: bool = False):
+    # [P3 增强] 成本跟踪
+    estimated_cost: float = 0.0  # 估算成本（单位：美元）
+    _lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
+
+    def add_step(self, duration: float, input_tokens: int = 0, output_tokens: int = 0, had_error: bool = False):
         """记录一次步骤执行"""
-        self.total_steps += 1
-        self.total_time += duration
-        self.total_tokens += tokens
-        if had_error:
-            self.errors += 1
-    
+        with self._lock:
+            self.total_steps += 1
+            self.total_time += duration
+            self.input_tokens += input_tokens
+            self.output_tokens += output_tokens
+            if had_error:
+                self.errors += 1
+
     def add_tool_call(self):
         """记录一次工具调用"""
-        self.tool_calls += 1
-    
+        with self._lock:
+            self.tool_calls += 1
+
+    def add_cost(self, cost: float):
+        """累加成本估算（单位：美元）"""
+        with self._lock:
+            self.estimated_cost += cost
+
     def get_avg_step_time(self) -> float:
-        """获取平均步骤时间"""
+        """获取平均步骤时间（秒）"""
         return self.total_time / self.total_steps if self.total_steps > 0 else 0.0
+    
+    def get_total_tokens(self) -> int:
+        """获取总 token 数"""
+        return self.input_tokens + self.output_tokens
+    
+    def get_error_rate(self) -> float:
+        """获取错误率（0.0 - 1.0）"""
+        return self.errors / self.total_steps if self.total_steps > 0 else 0.0
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
@@ -78,9 +111,13 @@ class ExecutionStats(BaseModel):
             "total_steps": self.total_steps,
             "total_time": self.total_time,
             "avg_step_time": self.get_avg_step_time(),
-            "total_tokens": self.total_tokens,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "total_tokens": self.get_total_tokens(),
             "tool_calls": self.tool_calls,
             "errors": self.errors,
+            "error_rate": self.get_error_rate(),
+            "estimated_cost": self.estimated_cost,
         }
 
 
@@ -168,6 +205,8 @@ class CognitiveEngine(ABC):
         
         # 存储额外的配置
         self._config = kwargs
+        # hooks 出错时是否立即 fail-fast（默认 False，作为 P3 优化可开启）
+        self.hooks_fail_fast: bool = bool(kwargs.get("hooks_fail_fast", False))
         
         logger.debug(
             "Engine initialized",
@@ -338,7 +377,9 @@ class CognitiveEngine(ABC):
                 else:
                     self.before_step_hook(input_messages, **kwargs)
             except Exception as e:
-                logger.warning("before_step_hook failed", error=str(e))
+                logger.warning("before_step_hook failed", error=str(e), exc_info=True)
+                if self.hooks_fail_fast:
+                    raise
     
     async def after_step(
         self,
@@ -367,7 +408,9 @@ class CognitiveEngine(ABC):
                 else:
                     self.after_step_hook(input_messages, output, **kwargs)
             except Exception as e:
-                logger.warning("after_step_hook failed", error=str(e))
+                logger.warning("after_step_hook failed", error=str(e), exc_info=True)
+                if self.hooks_fail_fast:
+                    raise
     
     async def on_error(
         self,
@@ -396,7 +439,58 @@ class CognitiveEngine(ABC):
                 else:
                     self.on_error_hook(error, input_messages, **kwargs)
             except Exception as e:
-                logger.error("on_error_hook failed", error=str(e))
+                logger.error("on_error_hook failed", error=str(e), exc_info=True)
+                if self.hooks_fail_fast:
+                    raise
+
+    # ===== 轻量统计/指标辅助 =====
+    def record_step(self, duration: float, input_tokens: int = 0, output_tokens: int = 0, had_error: bool = False) -> None:
+        """记录一次执行步骤的轻量统计（供子类在合适位置调用）。"""
+        if self.stats is not None:
+            try:
+                self.stats.add_step(duration, input_tokens=input_tokens, output_tokens=output_tokens, had_error=had_error)
+            except Exception:
+                logger.debug("Failed to update stats")
+
+    def record_tool_call(self) -> None:
+        """记录一次工具调用次数"""
+        if self.stats is not None:
+            try:
+                self.stats.add_tool_call()
+            except Exception:
+                logger.debug("Failed to increment tool call stat")
+
+    # ===== 成本与定价辅助 =====
+    def record_cost(self, input_tokens: int = 0, output_tokens: int = 0, model_name: str = "") -> None:
+        """基于 token 数和模型名称记录估算成本。
+        
+        Args:
+            input_tokens: 输入 token 数
+            output_tokens: 输出 token 数  
+            model_name: 模型名称（用于查询定价表）
+        """
+        if self.stats is None:
+            return
+        
+        # 获取模型定价（默认使用 gpt-3.5-turbo）
+        pricing = MODEL_PRICING.get(model_name)
+        if not pricing:
+            pricing = MODEL_PRICING.get("gpt-3.5-turbo")
+        
+        # 成本计算：从"每 1M tokens"转换为实际成本
+        # cost = tokens * (price_per_million_tokens / 1_000_000)
+        cost = (input_tokens * pricing["input"] / 1_000_000) + (output_tokens * pricing["output"] / 1_000_000)
+        
+        try:
+            self.stats.add_cost(cost)
+        except Exception:
+            logger.debug("Failed to record cost", error_tokens=(input_tokens, output_tokens))
+    
+    def get_stats_summary(self) -> Dict[str, Any]:
+        """获取执行统计摘要"""
+        if self.stats is None:
+            return {}
+        return self.stats.to_dict()
     
     # ====================== 工具方法 ======================
     
