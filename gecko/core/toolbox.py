@@ -131,11 +131,14 @@ class ToolBox:
         self._execution_count: Dict[str, int] = defaultdict(int)
         self._error_count: Dict[str, int] = defaultdict(int)
         self._total_time: Dict[str, float] = defaultdict(float)
+
+        # 缓存
+        self._schema_cache: Optional[List[Dict[str, Any]]] = None
         
         # 注册初始工具
         if tools:
             for item in tools:
-                self.add_tool(item)
+                self.add_tool(item)        
     
     # ====================== 工具管理 ======================
     
@@ -185,13 +188,16 @@ class ToolBox:
             raise ValueError(f"Tool '{tool.name}' already registered.")
         
         self._tools[tool.name] = tool
-        
+
+        # 注册新工具时失效缓存
+        self._schema_cache = None # invalid cache
         # 初始化统计
         with self._stats_lock:
             if tool.name not in self._execution_count:
                 self._execution_count[tool.name] = 0
                 self._error_count[tool.name] = 0
                 self._total_time[tool.name] = 0.0
+        
         
         logger.debug("Tool registered", tool_name=tool.name)
         return self
@@ -200,6 +206,8 @@ class ToolBox:
         """注销工具"""
         if tool_name in self._tools:
             del self._tools[tool_name]
+            # 注销工具时失效缓存
+            self._schema_cache = None 
             logger.info("Tool unregistered", tool_name=tool_name)
         return self
     
@@ -219,11 +227,15 @@ class ToolBox:
     
     def to_openai_schema(self) -> List[Dict[str, Any]]:
         """
-        生成 OpenAI Function Calling Schema
-        
-        直接调用 BaseTool.openai_schema 属性
+        生成 OpenAI Function Calling Schema (带缓存)
         """
-        return [t.openai_schema for t in self._tools.values()]
+        # [优化] 优先返回缓存
+        if self._schema_cache is not None:
+            return self._schema_cache
+            
+        # 重新生成并缓存
+        self._schema_cache = [t.openai_schema for t in self._tools.values()]
+        return self._schema_cache
     
     # ====================== 执行逻辑 ======================
     

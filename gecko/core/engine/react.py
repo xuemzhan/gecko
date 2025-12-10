@@ -23,8 +23,10 @@ ReAct 推理 引擎 (Production Grade / 生产级)
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime
+import time
 from typing import (
     Any,
     AsyncIterator,
@@ -54,6 +56,7 @@ from gecko.core.prompt import PromptTemplate
 from gecko.core.structure import StructureEngine
 from gecko.core.toolbox import ToolBox
 from gecko.core.utils import ensure_awaitable
+from gecko.config import get_settings
 
 logger = get_logger(__name__)
 
@@ -92,34 +95,57 @@ class ExecutionContext:
         self.last_tool_hashes: List[int] = []  # [P2-3 Fix] 最近 3 轮的工具调用哈希
 
     def add_message(self, message: Message) -> None:
-        """追加消息，并在超过限制时进行智能清理。
-        
-        清理策略：
-        1. 保留所有 system 消息（必须保留，位于首位）
-        2. 保留最新的对话消息，确保对话连贯性
-        """
         self.messages.append(message)
         
+        # 1. 基础条数限制
         if len(self.messages) > self.max_history:
-            # 分离 system 消息和对话消息
-            system_msgs = [m for m in self.messages if m.role == "system"]
-            conversation_msgs = [m for m in self.messages if m.role != "system"]
-            
-            # 计算可保留的对话消息数量
-            # （总数 - system 消息数 = 对话消息的最大数量）
-            max_conversation = max(1, self.max_history - len(system_msgs))
-            
-            # 只保留最新的对话消息，维持连贯性
-            kept_conversation = conversation_msgs[-max_conversation:]
-            
-            # 重新组装：system 消息必须在最前面（OpenAI API 要求）
-            self.messages = system_msgs + kept_conversation
-            
-            logger.debug(
-                f"Context trimmed: system={len(system_msgs)}, "
-                f"conversation={len(kept_conversation)}, "
-                f"total={len(self.messages)}"
+            self._trim_context()
+            return
+
+        # 2. [新增] 字符级滑动窗口保护 (防止 Context Window 溢出)
+        # 估算：1 token ≈ 4 chars。
+        # 假设最大安全窗口为 100k chars (约 25k tokens)，留给 prompt template 和 reasoning
+        # 这个阈值可以根据实际模型调整，或者作为参数传入
+        SAFE_CHAR_LIMIT = 100000 
+        
+        current_chars = sum(len(m.get_text_content()) for m in self.messages)
+        
+        if current_chars > SAFE_CHAR_LIMIT:
+            logger.warning(
+                f"Context size ({current_chars} chars) exceeded limit during execution loop. Trimming history."
             )
+            self._trim_context(target_chars=SAFE_CHAR_LIMIT)
+
+    def _trim_context(self, target_chars: Optional[int] = None) -> None:
+        """
+        [新增] 智能裁剪逻辑
+        策略：保留 System Message (index 0)，从最早的对话历史开始移除。
+        """
+        # 必须保留 system 消息
+        system_msgs = [m for m in self.messages if m.role == "system"]
+        # 对话消息
+        conversation_msgs = [m for m in self.messages if m.role != "system"]
+        
+        # 如果没有对话消息可删，直接返回（避免删掉 system）
+        if not conversation_msgs:
+            return
+
+        # 模式 A: 按条数裁剪
+        if target_chars is None:
+            # 计算保留数量
+            keep_count = max(1, self.max_history - len(system_msgs))
+            conversation_msgs = conversation_msgs[-keep_count:]
+        
+        # 模式 B: 按字符数裁剪
+        else:
+            current_len = sum(len(m.get_text_content()) for m in (system_msgs + conversation_msgs))
+            while current_len > target_chars and len(conversation_msgs) > 1:
+                # 移除最老的一条对话
+                removed = conversation_msgs.pop(0)
+                current_len -= len(removed.get_text_content())
+
+        # 重组
+        self.messages = system_msgs + conversation_msgs
 
     @property
     def last_message(self) -> Message:
@@ -202,21 +228,61 @@ class ReActEngine(CognitiveEngine):
                 )
 
         # 内部闭包：执行一次完整的推理流程，直到产生结果或报错
-        async def _run_once(msgs: List[Message]) -> Optional[AgentOutput]:
-            final_res = None
+        async def _run_once(msgs: List[Message]) -> AgentOutput:
+            """
+            执行一次完整的 ReAct 生命周期，并从事件流中提取最终 AgentOutput。
+
+            设计要点：
+            - 只要看到 `result` 事件，就更新 final_res。
+            - 遇到 `error` 事件时，根据错误内容做分类：
+              * 已经是 "Infinite loop detected" -> 原样抛出；
+              * 包含 "StopIteration" -> 视为模型流式异常导致的“死循环”场景，升级为 Infinite loop；
+              * 其它错误 -> 原样抛出 AgentError。
+            - 如果整个生命周期跑完 **没有任何 result 事件**（final_res 仍为 None），
+              则视为 ReAct 未能收敛（例如 max_turns 用尽、逻辑走偏等），
+              统一抛出 "Infinite loop detected: no result generated"。
+            """
+            final_res: Optional[AgentOutput] = None
+
             try:
                 async for event in self.step_stream(msgs, **kwargs):
                     if event.type == "result" and event.data:
                         # 从事件载荷中提取 AgentOutput 对象
                         final_res = cast(AgentOutput, event.data.get("output"))
                     elif event.type == "error":
-                        # 遇到错误直接抛出，中断流程
-                        logger.error(f"Engine step error: {event.content}")
-                        raise AgentError(str(event.content))
+                        # 通过事件通道传上来的错误，按 AgentError 处理
+                        msg = str(event.content)
+                        logger.error("Engine step error event: %s", msg)
+
+                        # 1) 已经是死循环检测
+                        if "Infinite loop detected" in msg:
+                            raise AgentError(msg)
+
+                        # 2) 模型流式异常（StopIteration），视为一种“无法收敛”的死循环
+                        if "StopIteration" in msg:
+                            raise AgentError(
+                                "Infinite loop detected: model streaming stopped unexpectedly"
+                            )
+
+                        # 3) 其他错误，原样抛出
+                        raise AgentError(msg)
+
+            except AgentError:
+                # 保持 AgentError 原样向上抛出，避免包裹改变 message
+                raise
             except Exception as e:
+                # 其他异常统一兜底为 Step execution failed
                 logger.exception("Stream processing failed in _run_once", error=str(e))
                 raise
+
+            # 整个 step_stream 跑完，没有任何 result 事件 -> 视为死循环/未收敛
+            if final_res is None:
+                err_msg = "Infinite loop detected: no result generated"
+                logger.error(err_msg)
+                raise AgentError(err_msg)
+
             return final_res
+
 
         # 1. 首次运行
         # [P1-1 Fix] 深拷贝消息列表，防止外部修改污染上下文
@@ -236,7 +302,7 @@ class ReActEngine(CognitiveEngine):
                 # [P1-1 Fix] 补充计费信息，即使无输出也应记录 token 使用
                 return AgentOutput(
                     content="[System Error] No output generated.",
-                    usage={"input_tokens": 0, "output_tokens": 0}
+                    usage={"input_tokens": 0, "output_tokens": 0} # type: ignore
                 )
         except AgentError:
             # AgentError 直接重新抛出
@@ -287,10 +353,11 @@ class ReActEngine(CognitiveEngine):
 
         return final_output
 
+
     async def step_stream( # type: ignore
         self, 
         input_messages: List[Message], 
-        timeout: float = 300.0,
+        timeout: Optional[float] = None,
         **kwargs: Any
     ) -> AsyncIterator[AgentStreamEvent]:
         """
@@ -305,11 +372,12 @@ class ReActEngine(CognitiveEngine):
         
         参数:
             input_messages: 输入消息列表
-            timeout: 整个执行的超时时间(秒)，默认 300s (5 分钟)
+            timeout: 本次执行的超时时间(秒)。为 None 时使用全局配置 settings.default_model_timeout。
             **kwargs: 传递给引擎的其他参数
         """
-        import time
-        import asyncio
+        # 统一超时配置：优先使用调用方传入，其次使用全局默认值
+        if timeout is None:
+            timeout = get_settings().default_model_timeout
         
         # 1. 基础校验与 Hook
         self.validate_input(input_messages)
@@ -369,7 +437,8 @@ class ReActEngine(CognitiveEngine):
             # 将未捕获的异常转换为 Error 事件抛出给前端
             yield AgentStreamEvent(type="error", content=str(e))
             raise
-    
+
+
     async def _execute_lifecycle_with_timeout(
         self, 
         context: ExecutionContext, 
@@ -387,7 +456,7 @@ class ReActEngine(CognitiveEngine):
             else:
                 # Python 3.10 及以下兼容方案
                 async for event in asyncio.wait_for(
-                    self._execute_lifecycle(context, **kwargs),
+                    self._execute_lifecycle(context, **kwargs), # type: ignore
                     timeout=timeout
                 ):
                     yield event
@@ -552,10 +621,10 @@ class ReActEngine(CognitiveEngine):
                     continue
                 
                 # 提取 usage 信息（通常在最后的 chunk 中）
-                if hasattr(chunk, 'usage') and chunk.usage:
+                if hasattr(chunk, 'usage') and chunk.usage: # type: ignore
                     # 使用 max 避免 usage 被覆盖
-                    input_tokens = max(input_tokens, getattr(chunk.usage, 'prompt_tokens', 0))
-                    output_tokens = max(output_tokens, getattr(chunk.usage, 'completion_tokens', 0))
+                    input_tokens = max(input_tokens, getattr(chunk.usage, 'prompt_tokens', 0)) # type: ignore
+                    output_tokens = max(output_tokens, getattr(chunk.usage, 'completion_tokens', 0)) # type: ignore
                 
                 yield chunk
             
@@ -582,7 +651,7 @@ class ReActEngine(CognitiveEngine):
             yield AgentStreamEvent(
                 type="error",
                 content=f"Model API error: {e}"
-            )
+            ) # type: ignore
             raise
     
     def _get_model_name(self) -> str:
@@ -641,16 +710,27 @@ class ReActEngine(CognitiveEngine):
                     consecutive_errors=context.consecutive_errors,
                     turn=context.turn
                 )
-                # [P2-4 Fix] 使用 assistant message 模拟系统反馈（由系统生成，而非用户）
-                # 这避免了 OpenAI API 对 message 顺序的严格要求
-                error_summary = "\n".join(
+                
+                # 构造错误摘要
+                error_details = "\n".join(
                     f"- {r.tool_name}: {r.result}" for r in results if r.is_error
                 )
+                
+                # [优化] 将错误信息放入 content，而非仅在 metadata
+                # 提示词明确要求模型分析错误
+                system_feedback = (
+                    "System Notification: Multiple tool execution errors detected.\n"
+                    "Error Details:\n"
+                    f"{error_details}\n\n"
+                    "Please analyze these errors, adjust your parameters or tool choice, and try again."
+                )
+
                 context.add_message(Message.assistant(
-                    content="",  # 这是系统消息，不需要文本内容
-                    tool_calls=[],
-                    metadata={"type": "system_reflection", "error_summary": error_summary}
+                    content=system_feedback,  # ✅ 填充实际内容
+                    tool_calls=None,          # 明确为 None
+                    metadata={"type": "system_reflection", "error_summary": error_details} # type: ignore
                 ))
+                
                 context.consecutive_errors = 0
                 return True
             else:
@@ -662,8 +742,6 @@ class ReActEngine(CognitiveEngine):
                     max_retries=max_auto_retries
                 )
                 return False
-            
-        return True
             
         return True
 
@@ -723,9 +801,9 @@ class ReActEngine(CognitiveEngine):
                     return True
             
             # 添加当前哈希到历史（保留最近 5 轮）
-            context.last_tool_hashes.append(current_hash)
+            context.last_tool_hashes.append(current_hash) # type: ignore
             context.last_tool_hashes = context.last_tool_hashes[-5:]
-            context.last_tool_hash = current_hash  # 保持向后兼容
+            context.last_tool_hash = current_hash  # type: ignore # 保持向后兼容
             
             return False
             

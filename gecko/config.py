@@ -21,11 +21,23 @@ class GeckoSettings(BaseSettings):
     default_api_key: str = Field(default="", description="默认 API Key")
     default_base_url: Optional[str] = Field(default=None, description="自定义 API Base URL")
     default_temperature: float = Field(default=0.7, ge=0.0, le=2.0)
-    default_model_timeout: float = Field(default=30.0, ge=5.0, description="LLM 请求超时(秒)")
+    default_model_timeout: float = Field(default=30.0, ge=5.0, description="LLM 请求超时(秒)，Agent 与 Engine 默认使用该值")
 
     # ================= 2. Agent Execution (智能体运行时) =================
     max_turns: int = Field(default=10, ge=1, le=100, description="最大对话轮数")
     max_context_tokens: int = Field(default=4000, ge=100, description="上下文窗口限制")
+    # Agent 级全局并发限制（0 表示不限制）
+    agent_max_concurrent: int = Field(
+        default=0,
+        ge=0,
+        description="单 Agent 最大并发请求数（0 = 不限制）",
+    )
+    # 模型级全局并发限制（可选，在 Driver 中使用）
+    model_max_concurrent: int = Field(
+        default=0,
+        ge=0,
+        description="单模型最大并发请求数（0 = 不限制）",
+    )
 
     # ================= 3. Workflow Engine (工作流引擎) =================
     workflow_checkpoint_strategy: Literal["always", "final", "manual"] = Field(
@@ -59,6 +71,11 @@ class GeckoSettings(BaseSettings):
     # [新增]
     telemetry_service_name: str = Field(default="gecko-app", description="Trace 服务名称")
 
+    telemetry_environment: str = Field(
+        default="production",
+        description="Telemetry 环境标识，如 dev / test / prod",
+    )
+
     # ================= 7. System (系统层) =================
     log_level: str = Field(default="INFO", description="日志级别")
     log_format: Literal["text", "json"] = Field(default="text", description="日志格式")
@@ -80,6 +97,13 @@ class GeckoSettings(BaseSettings):
         if v.upper() not in valid:
             raise ValueError(f"log_level must be one of {valid}")
         return v.upper()
+    
+    @field_validator("default_model_timeout")
+    @classmethod
+    def _validate_timeout(cls, v: float) -> float:
+        if v < 5.0:
+            raise ValueError("default_model_timeout 不应小于 5 秒")
+        return v
 
 
 # Singleton

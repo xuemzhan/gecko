@@ -411,3 +411,65 @@ async def test_observation_truncation_logic(engine):
     res = engine._truncate_observation("A" * 20, "tool")
     assert len(res) > 10 
     assert "truncated" in res
+
+@pytest.mark.asyncio
+async def test_step_stream_uses_settings_default_timeout(
+    monkeypatch, mock_model, mock_toolbox, mock_memory
+):
+    from gecko.config import configure_settings, get_settings
+    from gecko.core.engine.react import ReActEngine
+    from gecko.core.events.types import AgentStreamEvent
+    from gecko.core.message import Message
+    from gecko.core.output import AgentOutput
+
+    # 1. 指定一个非常规值，方便检测
+    configure_settings(default_model_timeout=123.0)
+    settings = get_settings()
+
+    engine = ReActEngine(mock_model, mock_toolbox, mock_memory)
+
+    seen_timeout: dict[str, float] = {}
+
+    async def fake_exec(ctx, timeout: float, **kwargs):
+        # 记录 timeout，产出一个 result 事件快速结束
+        seen_timeout["value"] = timeout
+        yield AgentStreamEvent(
+            type="result",
+            data={"output": AgentOutput(content="ok")},
+            content="ok",  # ✅ 必须是 str，不能是 None
+        )
+
+    # 替换 _execute_lifecycle_with_timeout，避免跑真正生命周期
+    monkeypatch.setattr(engine, "_execute_lifecycle_with_timeout", fake_exec)
+
+    # 调用 step（不显式传 timeout）
+    await engine.step([Message.user("hello")])
+
+    assert seen_timeout["value"] == settings.default_model_timeout == 123.0
+
+
+@pytest.mark.asyncio
+async def test_step_stream_respects_explicit_timeout(monkeypatch, mock_model, mock_toolbox, mock_memory):
+    from gecko.core.engine.react import ReActEngine
+    from gecko.core.events.types import AgentStreamEvent
+    from gecko.core.output import AgentOutput
+
+    engine = ReActEngine(mock_model, mock_toolbox, mock_memory)
+
+    seen_timeout = {}
+
+    async def fake_exec(ctx, timeout: float, **kwargs):
+        seen_timeout["value"] = timeout
+        yield AgentStreamEvent(
+            type="result",
+            data={"output": AgentOutput(content="ok")},
+            content=None, # type: ignore
+        )
+
+    monkeypatch.setattr(engine, "_execute_lifecycle_with_timeout", fake_exec)
+
+    # 显式传入 timeout，应覆盖默认配置
+    await engine.step_stream([Message.user("hi")], timeout=42.0).__anext__()
+
+    assert seen_timeout["value"] == 42.0
+

@@ -13,7 +13,7 @@ from __future__ import annotations
 import functools
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
-from typing import Any, Callable, Dict, Optional, TypeVar, Union
+from typing import Any, Callable, Dict, Optional, TypeVar
 
 from gecko.core.logging import get_logger
 
@@ -360,11 +360,20 @@ def get_telemetry() -> GeckoTelemetry:
     
     注意：此函数返回的实例会在首次调用时自动初始化（setup）。
     如需自定义配置，请在首次调用之前使用 configure_telemetry() 函数。
+     - respect settings.telemetry_enabled / telemetry_service_name / telemetry_environment
+    - 仅在第一次调用时初始化 OTel 对象和导出器
     """
+    from gecko.config import settings as _settings  # 延迟导入，避免循环引用
+
     global _telemetry
     if _telemetry is None:
-        _telemetry = GeckoTelemetry()
-        # 自动初始化，避免用户忘记调用 setup()
+        cfg = TelemetryConfig(
+            service_name=_settings.telemetry_service_name,
+            service_version="0.4.0",
+            environment=_settings.telemetry_environment,
+            enabled=_settings.telemetry_enabled,
+        )
+        _telemetry = GeckoTelemetry(cfg)
         _telemetry.setup()
     return _telemetry
 
@@ -375,6 +384,7 @@ def configure_telemetry(config: TelemetryConfig) -> GeckoTelemetry:
     _telemetry = GeckoTelemetry(config)
     _telemetry.setup()
     return _telemetry
+    
 
 
 # ==================== 预置 Span 名称 ====================

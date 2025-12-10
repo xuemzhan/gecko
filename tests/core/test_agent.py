@@ -1,5 +1,6 @@
 # tests/core/test_agent.py
 import asyncio
+from typing import Any
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 from gecko.core.agent import Agent, AgentRunEvent
@@ -91,3 +92,56 @@ async def test_agent_event_bus_wiring(mock_llm, toolbox, memory):
     agent_default = Agent(model=mock_llm, toolbox=toolbox, memory=memory)
     assert agent_default.engine.event_bus is not None
     assert isinstance(agent_default.engine.event_bus, EventBus)
+
+
+@pytest.mark.asyncio
+async def test_agent_run_uses_global_concurrency_limiter(
+    monkeypatch,
+    mock_llm,
+    toolbox,
+    memory,
+    event_bus,
+):
+    from gecko.config import configure_settings
+    from gecko.core.agent import Agent
+    from gecko.core.limits import global_limiter
+    from gecko.core.output import AgentOutput
+
+    # 1. 设置 agent_max_concurrent = 1
+    configure_settings(agent_max_concurrent=1)
+
+    agent = Agent(model=mock_llm, toolbox=toolbox, memory=memory, event_bus=event_bus)
+
+    # 2. Mock engine.step，避免跑 ReAct 逻辑
+    step_calls = {}
+
+    async def fake_step(messages, **kwargs):
+        step_calls["called"] = True
+        return AgentOutput(content="ok")
+
+    agent.engine.step = AsyncMock(side_effect=fake_step)
+
+    # 3. Mock global_limiter.limit，记录调用参数 & 确认被用作 async context manager
+    limit_calls: dict[str, Any] = {}
+
+    class DummyCM:
+        async def __aenter__(self):
+            limit_calls["entered"] = True
+
+        async def __aexit__(self, exc_type, exc, tb):
+            pass
+
+    def fake_limit(scope: str, name: str, limit: int):
+        # 注意：这是普通函数，不是 async def
+        limit_calls["args"] = (scope, name, limit)
+        return DummyCM()
+
+    monkeypatch.setattr(global_limiter, "limit", fake_limit)
+
+    # 4. 执行 Agent.run
+    await agent.run("hello")
+
+    # 5. 断言：Limiter 被调用 & 按 agent 维度限流
+    assert limit_calls["args"] == ("agent", agent.name, 1)
+    assert limit_calls["entered"] is True
+    assert step_calls["called"] is True
