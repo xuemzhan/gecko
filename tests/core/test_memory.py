@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from typing import Any, List
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -865,3 +865,29 @@ async def test_hybrid_memory_archive_skips_short_message():
     
     await memory.archive_message(Message.user("short")) # < 10 chars
     mock_vec.upsert.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_summary_memory_aclose_cancels_background_task():
+    mock_model = MagicMock()
+    async def slow_completion(*args, **kwargs):
+        await asyncio.sleep(0.2)
+        mock_resp = MagicMock()
+        mock_resp.choices[0].message.get.return_value = "New Summary"
+        return mock_resp
+    mock_model.acompletion = AsyncMock(side_effect=slow_completion)
+    mock_model.count_tokens.return_value = 10
+
+    memory = SummaryTokenMemory(
+        session_id="test",
+        model=mock_model,
+        max_tokens=50,
+        summary_reserve_tokens=10,
+        min_update_interval=0.0,
+        background_update=True
+    )
+
+    msgs = [{"role": "user", "content": "msg"}] * 10
+    await memory.get_history(msgs)
+
+    # 立刻关闭，应取消后台任务且不抛异常
+    await memory.aclose()

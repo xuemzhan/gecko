@@ -75,6 +75,14 @@ class SummaryTokenMemory(TokenMemory):
 
         self._summary_lock: Optional[asyncio.Lock] = None
 
+        # [新增] 保存后台任务句柄，便于：
+        # 1) 避免重复创建任务
+        # 2) 支持取消/关闭（工业级生命周期治理）
+        self._update_task: Optional[asyncio.Task] = None
+
+        # [新增] pending：当锁占用时不丢更新意图，只保留最后一份（last-write-wins）
+        self._pending_messages: Optional[List[Message]] = None
+
     def _get_summary_lock(self) -> asyncio.Lock:
         if self._summary_lock is None:
             self._summary_lock = asyncio.Lock()
@@ -141,9 +149,21 @@ class SummaryTokenMemory(TokenMemory):
         recent.reverse()
         to_summarize.reverse()
 
-        # 5. [核心优化] 触发摘要更新
+        # 5. [核心] 触发摘要更新（to_summarize 是本次需要摘要的内容）
         if to_summarize:
             await self._trigger_summary_update(to_summarize)
+
+        # [二次加固] 如果之前因为 lock/task 占用产生了 pending，
+        # 在本次 get_history 中“顺手尝试”消费。
+        # 注意：必须仍经过 debounce，避免破坏现有单元测试语义。
+        if self._pending_messages:
+            now = time.time()
+            lock = self._get_summary_lock()
+            task_running = self._update_task is not None and not self._update_task.done()
+            if self._should_update_summary(now) and (not lock.locked()) and (not task_running):
+                pending = self._pending_messages
+                self._pending_messages = None
+                await self._trigger_summary_update(pending)
 
         # 6. 组装结果
         result: List[Message] = []
@@ -166,39 +186,55 @@ class SummaryTokenMemory(TokenMemory):
 
     async def _trigger_summary_update(self, messages: List[Message]) -> None:
         """
-        触发摘要更新逻辑 (含防抖与后台执行)
+        触发摘要更新（含防抖 + 后台执行 + pending 合并）
+
+        改进点：
+        1) debounce：未到时间直接跳过（保持原有语义）
+        2) 若 lock/task 正在运行：不丢弃，而是把 messages 记为 pending（保留最新）
+        3) background_update：保存 Task 句柄，避免重复创建且支持取消
+        4) 二次加固：在“调度/启动更新”时写入 _last_update_time，防失败时反复重试
         """
         now = time.time()
-        
-        # 1. 防抖检查
-        if now - self._last_update_time < self.min_update_interval:
+
+        # 1) 防抖检查
+        if not self._should_update_summary(now):
             logger.debug("Summary update skipped (debounce)")
             return
 
-        # 2. 锁状态检查 (如果已有任务在跑，直接跳过，不做排队，避免堆积)
         lock = self._get_summary_lock()
-        if lock.locked():
-            logger.debug("Summary update skipped (locked)")
+
+        # 2) 如果锁占用或已有后台任务在跑：合并 pending（last-write-wins）
+        task_running = self._update_task is not None and not self._update_task.done()
+        if lock.locked() or task_running:
+            logger.debug("Summary update deferred (locked/task running)")
+            self._pending_messages = messages
             return
 
-        # 3. 执行策略
+        # 3) 准备执行：在调度时更新 last_update_time（避免失败时被频繁重试）
+        self._last_update_time = now
+
         if self.background_update:
-            # 后台执行，不阻塞主流程
-            # 创建 Task 会自动开始运行
-            asyncio.create_task(self._update_summary_task(messages))
+            # 4) 后台执行：保存任务句柄，便于关闭时 cancel/drain
+            self._update_task = asyncio.create_task(self._update_summary_task(messages))
         else:
-            # 阻塞执行 (旧行为)
+            # 5) 同步执行：保持旧行为
             await self._update_summary_task(messages)
 
+
     async def _update_summary_task(self, messages: List[Message]) -> None:
-        """实际执行摘要更新的逻辑"""
+        """
+        实际执行摘要更新。
+
+        重要约束（与单元测试语义一致）：
+        - 不在任务结束时自动触发 pending（否则会绕过 debounce，导致额外 LLM 调用）
+        - pending 仅在后续 get_history() 中、且 debounce 通过时才会被消费
+        """
         lock = self._get_summary_lock()
-        
-        # 使用锁确保安全
+
         async with lock:
             try:
                 logger.debug(f"Updating summary for {len(messages)} messages...")
-                
+
                 history_text = "\n".join(
                     f"{m.role}: {m.get_text_content()}" for m in messages
                 )
@@ -212,15 +248,55 @@ class SummaryTokenMemory(TokenMemory):
                     [{"role": "user", "content": prompt}]
                 )
                 content = response.choices[0].message.get("content", "")
-                
+
                 if content:
                     self.current_summary = content
-                    self._last_update_time = time.time()
                     logger.info(f"Summary updated successfully, length: {len(content)}")
-                    
-            except Exception as e:
+
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"Failed to update summary: {e}")
+
+            finally:
+                # 清理 task 句柄：避免引用悬挂（并为下一次调度做准备）
+                # 注意：这里不触发 pending，保持 debounce + 触发式更新模型
+                if self._update_task is not None and self._update_task.done():
+                    self._update_task = None
+
 
     def clear_summary(self) -> None:
         self.current_summary = ""
         self._last_update_time = 0.0
+
+    def _should_update_summary(self, now: Optional[float] = None) -> bool:
+        """
+        判断是否允许触发摘要更新（防抖）。
+
+        设计说明：
+        - 使用 min_update_interval 控制更新频率，防止高频触发导致成本/延迟暴涨
+        - now 参数用于测试或减少重复 time.time() 调用
+        """
+        if now is None:
+            now = time.time()
+        return (now - self._last_update_time) >= self.min_update_interval
+    
+    async def aclose(self) -> None:
+        """
+        关闭 Memory（工业级生命周期治理）。
+
+        场景：
+        - 服务退出 / 会话结束时，取消后台摘要任务，避免 pending task 泄漏
+        """
+        task = self._update_task
+        if task is None:
+            return
+
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                # 关闭阶段不应再抛异常影响主流程
+                pass
+        self._update_task = None

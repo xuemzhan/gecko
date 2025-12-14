@@ -30,6 +30,7 @@ from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Type, Typ
 from pydantic import BaseModel, PrivateAttr
 
 from gecko.core.events.bus import EventBus
+from gecko.core.events.types import AgentStreamEvent
 from gecko.core.exceptions import AgentError, ModelError
 from gecko.core.logging import get_logger
 from gecko.core.memory import TokenMemory
@@ -270,18 +271,24 @@ class CognitiveEngine(ABC):
         self, 
         input_messages: List[Message],
         **kwargs
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[AgentStreamEvent]:
         """
         流式推理（可选实现）
         
-        如果引擎支持流式输出，应该重写此方法。
+        统一契约：step_stream 输出 AgentStreamEvent，而非纯文本 token。
+        原因：
+        - ReAct 需要输出 tool_input/tool_output/result/error 等结构化事件；
+        - Agent.stream / Agent.stream_events 也以事件为核心；
+        - 工业级系统（WebSocket/SSE/调试面板）更需要“事件流”而不是仅 token。
+
+        若引擎不支持流式输出，抛 NotImplementedError。
         
         参数:
             input_messages: 输入消息列表
             **kwargs: 额外参数
         
         返回:
-            AsyncIterator[str]: 文本流
+            AsyncIterator[AgentStreamEvent]: 文本流
         
         异常:
             NotImplementedError: 引擎不支持流式输出
@@ -300,9 +307,26 @@ class CognitiveEngine(ABC):
             ```
         """
         raise NotImplementedError(
-            f"{self.__class__.__name__} does not support streaming. "
+            f"{self.__class__.__name__} does not support streaming events. "
             f"Override step_stream() to enable this feature."
         )
+    
+    async def step_text_stream(
+        self,
+        input_messages: List[Message],
+        **kwargs
+    ) -> AsyncIterator[str]:
+        """
+        纯文本 token 流（兼容层/简化层）
+
+        默认实现：从 step_stream 事件流中过滤 token 事件并 yield。
+        - 这样 Agent.stream 可以稳定依赖该方法；
+        - Engine 作者若只想输出 token，可直接 override step_text_stream；
+        - Engine 作者若输出完整事件，则只需实现 step_stream。
+        """
+        async for ev in self.step_stream(input_messages, **kwargs): # type: ignore
+            if ev.type == "token" and ev.content is not None:
+                yield str(ev.content)
     
     async def step_structured(
         self,
@@ -479,7 +503,7 @@ class CognitiveEngine(ABC):
         
         # 成本计算：从"每 1M tokens"转换为实际成本
         # cost = tokens * (price_per_million_tokens / 1_000_000)
-        cost = (input_tokens * pricing["input"] / 1_000_000) + (output_tokens * pricing["output"] / 1_000_000)
+        cost = (input_tokens * pricing["input"] / 1_000_000) + (output_tokens * pricing["output"] / 1_000_000) # type: ignore
         
         try:
             self.stats.add_cost(cost)

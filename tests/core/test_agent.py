@@ -145,3 +145,30 @@ async def test_agent_run_uses_global_concurrency_limiter(
     assert limit_calls["args"] == ("agent", agent.name, 1)
     assert limit_calls["entered"] is True
     assert step_calls["called"] is True
+
+# tests/core/test_agent.py
+
+@pytest.mark.asyncio
+async def test_agent_timeout_zero_does_not_fallback(mock_llm, toolbox, memory, event_bus):
+    """
+    验证：timeout=0 时不应使用默认超时（以前因为 `timeout or default` 会回落）。
+    这里不定义 timeout=0 的“业务语义”（立即超时还是快速失败），
+    只验证参数透传的正确性：Engine 应收到 timeout=0。
+    """
+    from gecko.core.agent import Agent
+    from gecko.core.output import AgentOutput
+
+    agent = Agent(model=mock_llm, toolbox=toolbox, memory=memory, event_bus=event_bus)
+
+    seen = {}
+
+    async def fake_step(messages, **kwargs):
+        # 捕获透传下来的 timeout
+        seen["timeout"] = kwargs.get("timeout")
+        return AgentOutput(content="ok")
+
+    agent.engine.step = AsyncMock(side_effect=fake_step)
+
+    await agent.run("hello", timeout=0)
+
+    assert seen["timeout"] == 0.0

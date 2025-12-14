@@ -107,7 +107,7 @@ class Agent:
         )
 
         # 统一超时：优先使用调用者传入，其次使用全局配置
-        effective_timeout = timeout or get_settings().default_model_timeout
+        effective_timeout = self._resolve_timeout(timeout)
         agent_label = self.name
 
         async def _do_run() -> AgentOutput | BaseModel:
@@ -190,7 +190,7 @@ class Agent:
             )
         )
 
-        effective_timeout = timeout or get_settings().default_model_timeout
+        effective_timeout = self._resolve_timeout(timeout)
         agent_label = self.name
 
         async def _gen() -> AsyncIterator[str]:
@@ -265,7 +265,7 @@ class Agent:
         - 高级编排框架，把 tool_input/tool_output 事件接入其它系统。
         """
         input_msgs = self._normalize_messages(messages)
-        effective_timeout = timeout or get_settings().default_model_timeout
+        effective_timeout = self._resolve_timeout(timeout)
 
         agent_label = self.name
 
@@ -371,3 +371,23 @@ class Agent:
         if hasattr(output, "model_dump"):
             return output.model_dump()  # type: ignore[return-value]
         return {"content": str(output)}
+
+    def _resolve_timeout(self, timeout: Optional[float]) -> float:
+        """
+        [稳定性修复] 统一解析超时时间
+        1. 允许 timeout=0 (表示立即超时/极短超时，用于测试或特殊控制)
+        2. None 时才使用默认配置
+        3. 增加类型检查，防止传入非数字
+        """
+        if timeout is None:
+            return get_settings().default_model_timeout
+        
+        # 确保是数字
+        if not isinstance(timeout, (int, float)):
+            raise ValueError(f"Timeout must be a number, got {type(timeout)}")
+            
+        # 工业级防御：负数超时通常是逻辑错误
+        if timeout < 0:
+            raise ValueError(f"Timeout cannot be negative: {timeout}")
+            
+        return float(timeout)

@@ -15,6 +15,9 @@ from gecko.plugins.tools.base import BaseTool
 from gecko.core.events import EventBus, AgentRunEvent
 from gecko.plugins.models.presets.zhipu import ZhipuChat
 
+from gecko.plugins.tools.standard.calculator import CalculatorTool as SafeCalculatorTool
+
+
 # ==========================================
 # 1. 定义简单的工具 (保持不变)
 # ==========================================
@@ -45,11 +48,21 @@ class CalculatorTool(BaseTool):
         expression: str
     args_schema: type[BaseModel] = Args
 
-    async def _run(self, args: Args) -> str: # type: ignore
-        expression = args.expression
+    async def _run(self, args: Args) -> str:  # type: ignore
+        """
+        安全计算：严禁 eval。
+        这里复用 Gecko 标准工具的 AST 安全求值能力，避免 Demo 与生产逻辑分叉。
+        """
+        expr = (args.expression or "").strip()
         try:
-            # 注意：eval 在生产环境中是不安全的，仅用于演示
-            return str(eval(expression))
+            safe = SafeCalculatorTool(
+                name=self.name,
+                description=self.description,
+                args_schema=self.args_schema
+            )
+            # 直接调用标准工具内部安全求值（AST 白名单）
+            result = safe._safe_eval(expr) # type: ignore
+            return str(result)
         except Exception as e:
             return f"Error: {str(e)}"
 

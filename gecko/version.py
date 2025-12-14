@@ -7,7 +7,7 @@
 - 方便在打包/CI 时统一维护
 """
 
-__version__: str = "0.3.1"  # 请根据真实发布版本号修改
+__version__: str = "0.4.0"  # 请根据真实发布版本号修改
 __author__: str = "Xuemzhan"
 __email__: str = "zxm0813@gmail.com"
 __license__: str = "MIT"
