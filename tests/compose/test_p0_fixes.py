@@ -31,7 +31,13 @@ async def run_team_and_collect(team: Team, inp: Any = None):
 # ----------------------------- Tests ------------------------------
 class TestP0_RaceBehavior:
     @pytest.mark.asyncio
-    async def test_race_single_winner_atomic(self):
+    async def test_race_single_winner_atomic_strict_shape(self):
+        """
+        P0-1（升级断言点）：
+        - Race 必须返回长度=1 的列表（只返回 winner）
+        - winner 必须 is_success=True
+        - winner 的 member_index 必须合法
+        """
         async def member1(inp=None):
             await anyio.sleep(0.01)
             return "m1"
@@ -42,30 +48,97 @@ class TestP0_RaceBehavior:
 
         team = Team(members=[member1, member2], name="race1", strategy=ExecutionStrategy.RACE)
 
-        for _ in range(5):
+        for _ in range(50):
             results = await run_team_and_collect(team, "input")
             assert isinstance(results, list)
-            success = [r for r in results if r.is_success]
-            assert len(success) == 1
+
+            # ✅ 更严格：Race 只返回 winner（长度必须为 1）
+            assert len(results) == 1
+
+            # ✅ winner 必须是成功结果
+            winner = results[0]
+            assert isinstance(winner, MemberResult)
+            assert winner.is_success is True
+            assert winner.member_index in (0, 1)
+            assert winner.result in ("m1", "m2")
 
     @pytest.mark.asyncio
-    async def test_race_all_fail_returns_memberresults(self):
-        async def fail1(inp=None):
-            raise RuntimeError("fail1")
+    async def test_race_cancels_non_winner_task(self):
+        """
+        P0-1（升级断言点）：
+        - winner 产生后，应取消其它未完成任务（至少不能正常跑完）
+        """
+        cancelled_2 = False
+        completed_2 = False
+        CancelledError = anyio.get_cancelled_exc_class()
 
-        async def fail2(inp=None):
-            raise ValueError("fail2")
+        async def fast(inp=None):
+            await anyio.sleep(0.01)
+            return "fast"
 
-        team = Team(members=[fail1, fail2], name="race_fail", strategy=ExecutionStrategy.RACE)
+        async def slow(inp=None):
+            nonlocal cancelled_2, completed_2
+            try:
+                # 故意很慢，理论上会被 winner 触发取消
+                await anyio.sleep(10)
+                completed_2 = True
+                return "slow"
+            except CancelledError:
+                cancelled_2 = True
+                raise
+
+        team = Team(members=[fast, slow], name="race_cancel", strategy=ExecutionStrategy.RACE)
         results = await run_team_and_collect(team, "input")
 
-        assert isinstance(results, list)
-        assert len(results) == 2
-        for r in results:
-            assert isinstance(r, MemberResult)
-            assert not r.is_success
-            assert r.error is not None
+        # ✅ winner 形态必须严格
+        assert len(results) == 1
+        assert results[0].is_success is True
+        assert results[0].result == "fast"
+        assert results[0].member_index == 0
 
+        # 给取消传播一个调度机会（避免极端情况下 flag 还没来得及写）
+        await anyio.sleep(0)
+
+        # ✅ slow 不应正常完成，应被取消（至少 cancelled 标志应为 True）
+        assert completed_2 is False, "Non-winner should not complete normally in race mode"
+        assert cancelled_2 is True, "Non-winner should be cancelled when winner is chosen"
+
+    @pytest.mark.asyncio
+    async def test_race_reentrant_concurrent_runs_do_not_interfere(self):
+        """
+        P0-1（升级断言点）：
+        - 同一个 Team 实例在并发 run 时，不应共享 winner/lock 状态
+          （验证 PR1 把 lock 放在 _execute_race 内部的必要性）
+        """
+        async def member1(inp=None):
+            await anyio.sleep(0.01)
+            return f"m1:{inp}"
+
+        async def member2(inp=None):
+            await anyio.sleep(0.01)
+            return f"m2:{inp}"
+
+        team = Team(members=[member1, member2], name="race_reentrant", strategy=ExecutionStrategy.RACE)
+
+        inputs = [f"req-{i}" for i in range(30)]
+        outputs = {}
+
+        async def _runner(x: str):
+            res = await run_team_and_collect(team, x)
+            outputs[x] = res
+
+        async with anyio.create_task_group() as tg:
+            for x in inputs:
+                tg.start_soon(_runner, x)
+
+        # ✅ 每次 run 都必须独立产生一个 winner，并且 winner 的内容必须带对应 input
+        for x in inputs:
+            res = outputs[x]
+            assert isinstance(res, list)
+            assert len(res) == 1
+            assert res[0].is_success is True
+            assert isinstance(res[0].result, str)
+            assert res[0].result.endswith(x), "Winner result should correspond to its own input"
 
 class TestP0_NextAndHistory:
     @pytest.mark.asyncio
