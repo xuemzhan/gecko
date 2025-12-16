@@ -505,23 +505,24 @@ class CognitiveEngine(ABC):
 
     # ====================== 事件发布（更稳健的 awaitable 处理）======================
 
+    # gecko/core/engine/base.py
+
     async def _maybe_await(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         """
         统一处理：
         - async def 函数
         - sync 函数
         - sync 函数但返回 awaitable（某些库会这样写）
+
+        ⚠️ 重要修复（P0）：
+        - 不再捕获 TypeError 并“重试调用”，避免 hook / publish 等副作用被执行两次
+        （TypeError 也可能是函数内部逻辑抛出，而不只是参数绑定错误）
         """
-        try:
-            result = func(*args, **kwargs)
-            if inspect.isawaitable(result):
-                return await result
-            return result
-        except TypeError:
-            # 兼容某些对象的 __call__ / 方法绑定行为
-            if asyncio.iscoroutinefunction(func):
-                return await func(*args, **kwargs)
-            return func(*args, **kwargs)
+        result = func(*args, **kwargs)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
 
     async def _publish_event(self, event_type: str, data: Dict[str, Any]) -> None:
         """

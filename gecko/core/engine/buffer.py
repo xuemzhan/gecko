@@ -101,26 +101,12 @@ class StreamBuffer:
         """
         接收一个流式块，更新内部状态
 
-        参数：
-            chunk: StreamChunk（通常包含 delta 字段：content/tool_calls）
-
-        返回：
-            Optional[str]：本次 chunk 新增的文本内容（用于“边接收边回显”）
-                          如果本次 chunk 没有文本增量，返回 None
-
-        说明：
-            - 防御性处理：chunk/delta/tool_calls 结构异常时静默跳过
-            - 线程安全：内部加锁保护
+        ✅ P1：delta 提取改为多协议兼容
         """
         with self._lock:
-            # ---- 防御性校验：chunk 必须有 delta ----
-            if not hasattr(chunk, "delta") or chunk.delta is None:
-                logger.debug("StreamChunk 缺少 delta 字段，跳过")
-                return None
-
-            delta = chunk.delta
-            if not isinstance(delta, dict):
-                logger.debug("StreamChunk.delta 非 dict，跳过", delta_type=type(delta).__name__)
+            delta = self._extract_delta(chunk)
+            if delta is None:
+                logger.debug("StreamChunk 无法提取 delta，跳过", chunk_type=type(chunk).__name__)
                 return None
 
             new_content: Optional[str] = None
@@ -129,7 +115,6 @@ class StreamBuffer:
             content = delta.get("content")
             if isinstance(content, str) and content:
                 added = self._add_content(content)
-                # 如果被截断到空字符串，也不回显
                 if added:
                     new_content = added
 
@@ -139,6 +124,45 @@ class StreamBuffer:
                 self._add_tool_calls(tool_calls)
 
             return new_content
+
+    def _extract_delta(self, chunk: Any) -> Optional[Dict[str, Any]]:
+        """
+        ✅ P1：从不同实现的 chunk 结构中提取 delta（防兼容性坑）
+
+        兼容顺序：
+        1) chunk.delta（你当前实现）
+        2) chunk.choices[0].delta（部分 SDK）
+        3) chunk.choices[0]["delta"]（dict 风格）
+        4) chunk["choices"][0]["delta"]（纯 dict）
+        """
+        # 1) chunk.delta
+        delta = getattr(chunk, "delta", None)
+        if isinstance(delta, dict):
+            return delta
+
+        # 2/3) chunk.choices[0].delta or ["delta"]
+        choices = getattr(chunk, "choices", None)
+        if isinstance(choices, list) and choices:
+            c0 = choices[0]
+            if isinstance(c0, dict):
+                d = c0.get("delta")
+                if isinstance(d, dict):
+                    return d
+            else:
+                d = getattr(c0, "delta", None)
+                if isinstance(d, dict):
+                    return d
+
+        # 4) chunk is dict
+        if isinstance(chunk, dict):
+            choices = chunk.get("choices")
+            if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                d = choices[0].get("delta")
+                if isinstance(d, dict):
+                    return d
+
+        return None
+
 
     # ---------------------------------------------------------------------
     # 内容聚合（修复 O(n²)）
