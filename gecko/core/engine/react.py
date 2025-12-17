@@ -1,38 +1,4 @@
 # gecko/core/engine/react.py
-"""
-ReAct 推理引擎（Production Grade / 生产级）
-
-ReAct (Reasoning + Acting) 是经典的 Agent 推理范式：
-通过 Think(思考) -> Act(行动/工具调用) -> Observe(观察/反思) 的循环完成复杂任务。
-
-本文件在“保持原有对外接口/语义兼容”的前提下，对原实现做了工业级修复与增强：
-================================================================================
-
-✅ [P0] 流式 chunk 兼容性修复：
-- 不再依赖 `isinstance(chunk, StreamChunk)`（不同实现/Mock/Protocol 下可能失败）
-- 改为“鸭子类型”：只要 chunk 有 delta / usage 等字段即可处理
-
-✅ [P0] step_stream 生命周期完善：
-- 在 step_stream 内部捕获最终 result，统一调用 base.after_step()（发布 step_completed 事件等）
-- 异常路径统一调用 base.on_error()（发布 step_error 事件等）
-- 在无异常但出现 error 事件（如 max_turns 耗尽）的情况下：保持对 step_stream 直接调用者友好（只 yield error，不强制 raise）
-
-✅ [P1] 统计与成本记录更稳健：
-- 记录 token 使用量时避免野蛮直接修改（保留容错，避免 stats 不存在/结构不同导致崩溃）
-- 成本估算通过 base.record_cost() 统一入口
-
-✅ [P1] 自动重试/反思注入逻辑更合理：
-- 连续工具错误达到阈值时，优先注入“system_reflection”消息引导模型修复
-- 若超过可控重试阈值则停止，避免无限回圈
-
-✅ [P1] 运行时上下文裁剪更稳健：
-- 保证 tool_call 与 tool_result 成对删除，减少“断对”导致的上下文异常
-
-备注：
-- 依赖的类/函数（Message/ToolBox/StructureEngine/PromptTemplate/TokenMemory 等）可认为正确合理。
-- 本引擎坚持“Engine 本身无单次请求状态”，单次运行状态全部封装在 ExecutionContext 中。
-
-"""
 
 from __future__ import annotations
 
@@ -40,14 +6,17 @@ import asyncio
 import copy
 import hashlib
 import json
+import random
 import time
+import uuid
+from collections import deque
 from datetime import datetime
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Set, Type, TypeVar, Union, cast
 
 from pydantic import BaseModel
 
 from gecko.config import get_settings
-from gecko.core.engine.base import CognitiveEngine
+from gecko.core.engine.base import CognitiveEngine, get_pricing_for_model
 from gecko.core.engine.buffer import StreamBuffer
 from gecko.core.events.types import AgentStreamEvent
 from gecko.core.exceptions import AgentError
@@ -64,7 +33,6 @@ logger = get_logger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 
-# 结构化输出工具名称前缀（保留常量：避免与用户工具冲突；具体命名由 StructureEngine 决定）
 STRUCTURE_TOOL_PREFIX = "__gecko_structured_output_"
 
 DEFAULT_REACT_TEMPLATE = """You are a helpful AI assistant.
@@ -79,76 +47,101 @@ Answer the user's request. Use tools if necessary.
 If you use a tool, just output the tool call format.
 """
 
+MAX_TOOL_INDEX_GAP = 500
+MAX_RETRY_DELAY_SECONDS = 5.0
+DEFAULT_MAX_HISTORY = 50
+DEFAULT_MAX_CONTEXT_CHARS = 100_000
+TOOL_HASH_DEQUE_SIZE = 5
 
-# =============================================================================
-# 执行上下文：承载单次请求的所有运行时状态（Engine 自身保持无状态）
-# =============================================================================
+
+class ReActConfig(BaseModel):
+    max_reflections: int = 2
+    tool_error_threshold: int = 3
+    loop_repeat_threshold: int = 2
+    max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS
+
 
 class ExecutionContext:
-    """
-    执行上下文（Runtime Context）
+    __slots__ = (
+        "messages", "max_history", "max_chars", "turn", "metadata",
+        "consecutive_errors", "reflection_attempts", "last_tool_hash",
+        "last_tool_hashes", "message_metadata", "_msg_lengths_cache"
+    )
 
-    说明：
-    - 每次 engine.step/step_stream 都创建一个新的 ExecutionContext
-    - 用于保存 messages、轮次 turn、连续错误计数、死循环检测指纹等
-    - Engine 实例可并发复用（只要 Model/ToolBox/Memory 本身支持）
-
-    安全策略：
-    - max_history：最大消息条数
-    - SAFE_CHAR_LIMIT：字符级滑动窗口（粗略控制上下文大小）
-    """
-
-    SAFE_CHAR_LIMIT: int = 100_000  # 约等于 25k tokens（非常粗略估计）
-
-    def __init__(self, messages: List[Message], max_history: int = 50):
-        # 浅拷贝，避免污染调用者传入列表
-        self.messages: List[Message] = messages.copy()
+    def __init__(
+        self,
+        messages: List[Message],
+        max_history: int = DEFAULT_MAX_HISTORY,
+        max_chars: Optional[int] = None,
+    ):
+        self.messages: List[Message] = list(messages)
         self.max_history: int = max_history
+        self.max_chars: int = max_chars or DEFAULT_MAX_CONTEXT_CHARS
         self.turn: int = 0
         self.metadata: Dict[str, Any] = {}
 
-        # 连续工具错误计数（用于熔断/反思）
         self.consecutive_errors: int = 0
-
-        # ✅ P0：反思注入次数（独立于 turn，避免条件不可达）
         self.reflection_attempts: int = 0
 
-        # 死循环检测：记录最近 N 轮工具调用 hash
         self.last_tool_hash: Optional[str] = None
-        self.last_tool_hashes: List[str] = []
+        self.last_tool_hashes: deque = deque(maxlen=TOOL_HASH_DEQUE_SIZE)
+
+        self.message_metadata: Dict[str, Dict[str, Any]] = {}
+        self._msg_lengths_cache: Dict[int, int] = {}
 
     def add_message(self, message: Message) -> None:
-        """添加消息，并在必要时触发上下文裁剪。"""
         self.messages.append(message)
+        self._msg_lengths_cache[id(message)] = self._get_message_length(message)
 
-        # 条数保护
         if len(self.messages) > self.max_history:
             self._trim_context()
             return
 
-        # 字符保护（粗略 token 保护）
-        current_chars = 0
-        try:
-            current_chars = sum(len(m.get_text_content()) for m in self.messages)
-        except Exception:
-            # 防御：个别消息实现异常时不影响主流程
-            current_chars = 0
+        current_chars = self._calculate_total_chars()
 
-        if current_chars > self.SAFE_CHAR_LIMIT:
+        if current_chars > self.max_chars:
             logger.warning(
                 "Context size exceeded limit, trimming",
                 current_chars=current_chars,
-                limit=self.SAFE_CHAR_LIMIT,
+                limit=self.max_chars,
             )
-            self._trim_context(target_chars=self.SAFE_CHAR_LIMIT)
+            self._trim_context(target_chars=self.max_chars)
+
+    def add_message_with_metadata(
+        self,
+        message: Message,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        msg_id = str(uuid.uuid4())
+        self.messages.append(message)
+        self._msg_lengths_cache[id(message)] = self._get_message_length(message)
+
+        if metadata:
+            self.message_metadata[msg_id] = metadata
+
+        try:
+            object.__setattr__(message, "_gecko_msg_id", msg_id)
+        except Exception:
+            pass
+
+        if len(self.messages) > self.max_history:
+            self._trim_context()
+
+        return msg_id
+
+    def _calculate_total_chars(self) -> int:
+        total = 0
+        for m in self.messages:
+            msg_id = id(m)
+            if msg_id in self._msg_lengths_cache:
+                total += self._msg_lengths_cache[msg_id]
+            else:
+                length = self._get_message_length(m)
+                self._msg_lengths_cache[msg_id] = length
+                total += length
+        return total
 
     def _trim_context(self, target_chars: Optional[int] = None) -> None:
-        """
-        智能裁剪上下文：
-
-        ✅ P1 修复：
-        - target_chars=None（按条数裁剪）也要“成对删除”工具调用链，避免断对
-        """
         system_msgs = [m for m in self.messages if m.role == "system"]
         conversation_msgs = [m for m in self.messages if m.role != "system"]
 
@@ -156,97 +149,129 @@ class ExecutionContext:
             self.messages = system_msgs
             return
 
-        def msg_len(msg: Message) -> int:
-            try:
-                return len(msg.get_text_content())
-            except Exception:
-                return 0
-
-        def remove_with_tool_pairing(start_index: int) -> None:
-            """
-            从 conversation_msgs 删除一条消息；
-            若该消息是 assistant 且包含 tool_calls，则同时删除后续连续 tool_result。
-            """
-            msg = conversation_msgs[start_index]
-
-            if getattr(msg, "role", None) == "assistant" and getattr(msg, "tool_calls", None):
-                tool_ids: Set[str] = {
-                    tc.get("id", "")
-                    for tc in (msg.tool_calls or [])
-                    if isinstance(tc, dict) and tc.get("id")
-                }
-
-                indices_to_remove = [start_index]
-                for j in range(start_index + 1, len(conversation_msgs)):
-                    check_msg = conversation_msgs[j]
-                    if getattr(check_msg, "role", None) == "tool":
-                        tool_call_id = getattr(check_msg, "tool_call_id", None)
-                        if tool_call_id in tool_ids:
-                            indices_to_remove.append(j)
-                        else:
-                            break
-                    else:
-                        break
-
-                for idx in reversed(indices_to_remove):
-                    conversation_msgs.pop(idx)
-                return
-
-            conversation_msgs.pop(start_index)
-
-        # ---- 模式 A：按条数裁剪（也要成对删除）----
         if target_chars is None:
-            keep_count = max(1, self.max_history - len(system_msgs))
+            self._trim_by_count(system_msgs, conversation_msgs)
+        else:
+            self._trim_by_size(system_msgs, conversation_msgs, target_chars)
 
-            # 从最老开始删，直到满足条数要求
-            while len(conversation_msgs) > keep_count:
-                remove_with_tool_pairing(0)
-
+    def _trim_by_count(self, system_msgs: List[Message], conversation_msgs: List[Message]) -> None:
+        keep_count = max(1, self.max_history - len(system_msgs))
+        
+        remove_count = len(conversation_msgs) - keep_count
+        if remove_count <= 0:
             self.messages = system_msgs + conversation_msgs
             return
 
-        # ---- 模式 B：按字符数裁剪（保留你原有逻辑）----
-        current_len = sum(msg_len(m) for m in (system_msgs + conversation_msgs))
+        remove_indices: Set[int] = set()
+        i = 0
+        
+        while len(remove_indices) < remove_count and i < len(conversation_msgs):
+            if i in remove_indices:
+                i += 1
+                continue
+                
+            msg = conversation_msgs[i]
+            
+            if self._is_assistant_with_tools(msg):
+                tool_ids = self._extract_tool_ids(msg)
+                chain_indices = self._find_tool_chain(conversation_msgs, i, tool_ids)
+                for idx in chain_indices:
+                    remove_indices.add(idx)
+            else:
+                remove_indices.add(i)
+            
+            i += 1
+
+        remaining = [m for idx, m in enumerate(conversation_msgs) if idx not in remove_indices]
+        self.messages = system_msgs + remaining
+
+    def _trim_by_size(
+        self, 
+        system_msgs: List[Message], 
+        conversation_msgs: List[Message], 
+        target_chars: int
+    ) -> None:
+        msg_lengths = []
+        for m in conversation_msgs:
+            msg_id = id(m)
+            if msg_id in self._msg_lengths_cache:
+                msg_lengths.append(self._msg_lengths_cache[msg_id])
+            else:
+                length = self._get_message_length(m)
+                self._msg_lengths_cache[msg_id] = length
+                msg_lengths.append(length)
+
+        system_len = sum(self._get_message_length(m) for m in system_msgs)
+        total_len = system_len + sum(msg_lengths)
+
+        remove_indices: Set[int] = set()
         i = 0
 
-        while current_len > target_chars and i < len(conversation_msgs):
-            msg = conversation_msgs[i]
-
-            if getattr(msg, "role", None) == "assistant" and getattr(msg, "tool_calls", None):
-                tool_ids: Set[str] = {
-                    tc.get("id", "")
-                    for tc in (msg.tool_calls or [])
-                    if isinstance(tc, dict) and tc.get("id")
-                }
-
-                indices_to_remove = [i]
-                for j in range(i + 1, len(conversation_msgs)):
-                    check_msg = conversation_msgs[j]
-                    if getattr(check_msg, "role", None) == "tool":
-                        tool_call_id = getattr(check_msg, "tool_call_id", None)
-                        if tool_call_id in tool_ids:
-                            indices_to_remove.append(j)
-                        else:
-                            break
-                    else:
-                        break
-
-                for idx in reversed(indices_to_remove):
-                    removed = conversation_msgs.pop(idx)
-                    current_len -= msg_len(removed)
+        while total_len > target_chars and i < len(conversation_msgs):
+            if i in remove_indices:
+                i += 1
                 continue
 
-            removed = conversation_msgs.pop(i)
-            current_len -= msg_len(removed)
+            msg = conversation_msgs[i]
 
-        self.messages = system_msgs + conversation_msgs
+            if self._is_assistant_with_tools(msg):
+                tool_ids = self._extract_tool_ids(msg)
+                chain_indices = self._find_tool_chain(conversation_msgs, i, tool_ids)
+
+                chain_len = sum(msg_lengths[idx] for idx in chain_indices if idx < len(msg_lengths))
+                for idx in chain_indices:
+                    remove_indices.add(idx)
+                total_len -= chain_len
+            else:
+                remove_indices.add(i)
+                total_len -= msg_lengths[i]
+
+            i += 1
+
+        remaining = [m for idx, m in enumerate(conversation_msgs) if idx not in remove_indices]
+        self.messages = system_msgs + remaining
 
         logger.debug(
             "Context trimmed",
             remaining_messages=len(self.messages),
-            remaining_chars=sum(msg_len(m) for m in self.messages),
+            removed_count=len(remove_indices),
         )
 
+    def _is_assistant_with_tools(self, msg: Message) -> bool:
+        return getattr(msg, "role", None) == "assistant" and bool(getattr(msg, "tool_calls", None))
+
+    def _extract_tool_ids(self, msg: Message) -> Set[str]:
+        tool_calls = getattr(msg, "tool_calls", None) or []
+        return {
+            tc.get("id", "")
+            for tc in tool_calls
+            if isinstance(tc, dict) and tc.get("id")
+        }
+
+    def _find_tool_chain(
+        self, 
+        msgs: List[Message], 
+        start_index: int, 
+        tool_ids: Set[str]
+    ) -> List[int]:
+        indices = [start_index]
+        for j in range(start_index + 1, len(msgs)):
+            check_msg = msgs[j]
+            if getattr(check_msg, "role", None) == "tool":
+                tool_call_id = getattr(check_msg, "tool_call_id", None)
+                if tool_call_id in tool_ids:
+                    indices.append(j)
+                else:
+                    break
+            else:
+                break
+        return indices
+
+    def _get_message_length(self, msg: Message) -> int:
+        try:
+            return len(msg.get_text_content())
+        except Exception:
+            return 0
 
     @property
     def last_message(self) -> Message:
@@ -255,20 +280,7 @@ class ExecutionContext:
         return self.messages[-1]
 
 
-# =============================================================================
-# ReAct Engine
-# =============================================================================
-
 class ReActEngine(CognitiveEngine):
-    """
-    生产级 ReAct 引擎实现
-
-    外部最常用 API：
-    - step(...) -> AgentOutput 或结构化模型实例
-    - step_stream(...) -> AsyncIterator[AgentStreamEvent]
-    - step_structured(...) -> 结构化模型实例（类型安全版）
-    """
-
     def __init__(
         self,
         model: Any,
@@ -279,6 +291,7 @@ class ReActEngine(CognitiveEngine):
         system_prompt: Union[str, PromptTemplate, None] = None,
         on_turn_start: Optional[Callable[[ExecutionContext], Any]] = None,
         on_turn_end: Optional[Callable[[ExecutionContext], Any]] = None,
+        config: Optional[ReActConfig] = None,
         **kwargs: Any,
     ):
         super().__init__(model, toolbox, memory, **kwargs)
@@ -287,8 +300,8 @@ class ReActEngine(CognitiveEngine):
         self.max_observation_length = int(max_observation_length)
         self.on_turn_start = on_turn_start
         self.on_turn_end = on_turn_end
+        self.config = config or ReActConfig()
 
-        # 系统提示词模板
         if system_prompt is None:
             self.prompt_template = PromptTemplate(template=DEFAULT_REACT_TEMPLATE)
         elif isinstance(system_prompt, str):
@@ -296,7 +309,6 @@ class ReActEngine(CognitiveEngine):
         else:
             self.prompt_template = system_prompt
 
-        # 模型是否支持 Function Calling（保守：默认 True）
         self._supports_functions: bool = bool(getattr(self.model, "_supports_function_calling", True))
 
         logger.debug(
@@ -305,25 +317,30 @@ class ReActEngine(CognitiveEngine):
             supports_functions=self._supports_functions,
         )
 
-    # ---------------------------------------------------------------------
-    # Public API：step / step_structured / step_stream
-    # ---------------------------------------------------------------------
+    def _safe_deep_copy_messages(self, messages: List[Message]) -> List[Message]:
+        result: List[Message] = []
+        for m in messages:
+            try:
+                if hasattr(m, "model_copy"):
+                    result.append(m.model_copy(deep=True))
+                else:
+                    result.append(copy.deepcopy(m))
+            except Exception as e:
+                logger.warning(
+                    "Message copy failed, using original reference",
+                    error=str(e),
+                    message_type=type(m).__name__,
+                )
+                result.append(m)
+        return result
 
-    async def step(  # type: ignore[override]
+    async def step(
         self,
         input_messages: List[Message],
         response_model: Optional[Type[T]] = None,
         max_retries: int = 0,
         **kwargs: Any,
     ) -> Union[AgentOutput, T]:
-        """
-        同步执行入口（对调用者表现为“一次性拿到最终结果”）
-
-        当 response_model 不为空时：
-        - 会执行完整 ReAct 流程拿到 AgentOutput
-        - 再进行结构化解析（tool_calls 优先，其次 content）
-        - 解析失败时可按 max_retries 自动反馈重试
-        """
         if response_model is not None:
             from inspect import isclass
 
@@ -334,13 +351,11 @@ class ReActEngine(CognitiveEngine):
 
             output = await self._execute_step(input_messages, response_model=response_model, **kwargs)
 
-            # 结构化解析 + 自动重试
             current_messages = list(input_messages)
             attempts = 0
 
             while True:
                 try:
-                    # A：优先从 tool_calls 解析（Function Calling 场景）
                     if output.tool_calls:
                         return await StructureEngine.parse(
                             content="",
@@ -348,7 +363,6 @@ class ReActEngine(CognitiveEngine):
                             raw_tool_calls=output.tool_calls,
                         )
 
-                    # B：回退从 content 解析（纯 JSON/文本场景）
                     return await StructureEngine.parse(output.content, response_model)
 
                 except Exception as e:
@@ -363,7 +377,6 @@ class ReActEngine(CognitiveEngine):
                         error=str(e),
                     )
 
-                    # 将错误反馈给模型，促使其纠正格式
                     current_messages.append(
                         Message.assistant(content=output.content, tool_calls=output.tool_calls)
                     )
@@ -377,7 +390,6 @@ class ReActEngine(CognitiveEngine):
                         current_messages, response_model=response_model, **kwargs
                     )
 
-        # 非结构化输出：直接返回 AgentOutput
         return await self._execute_step(input_messages, **kwargs)
 
     async def step_structured(
@@ -387,50 +399,32 @@ class ReActEngine(CognitiveEngine):
         max_retries: int = 0,
         **kwargs: Any,
     ) -> T:
-        """结构化输出入口（类型安全版本）。"""
         result = await self.step(
             input_messages, response_model=response_model, max_retries=max_retries, **kwargs
         )
         return cast(T, result)
 
-    async def step_stream(  # type: ignore[override]
+    async def step_stream(
         self,
         input_messages: List[Message],
         timeout: Optional[float] = None,
         **kwargs: Any,
     ) -> AsyncIterator[AgentStreamEvent]:
-        """
-        流式执行入口：输出 AgentStreamEvent 事件流
-
-        事件类型：
-        - token：实时文本片段
-        - tool_input：工具调用意图（tool_calls 列表）
-        - tool_output：工具执行结果
-        - result：最终结果（data={"output": AgentOutput}）
-        - error：错误提示（content 为错误信息）
-
-        超时策略：
-        - timeout=None 时使用全局配置 get_settings().default_model_timeout
-        """
         if timeout is None:
             timeout = get_settings().default_model_timeout
 
-        # 输入校验与前置 hook（会发布 step_started 事件）
         self.validate_input(input_messages)
         await self.before_step(input_messages, **kwargs)
 
         context = await self._build_execution_context(input_messages)
         start_time = time.time()
 
-        # 用于在流式过程中捕获最终输出，以便统一调用 after_step
         final_output: Optional[AgentOutput] = None
         saw_error_event: bool = False
 
         try:
-            # 兼容测试：此方法可被 monkeypatch 替换
             async for event in self._execute_lifecycle_with_timeout(context, float(timeout), **kwargs):
                 if event.type == "result" and event.data:
-                    # 记录最终输出，稍后 after_step 需要
                     try:
                         final_output = cast(AgentOutput, event.data.get("output"))
                     except Exception:
@@ -450,14 +444,12 @@ class ReActEngine(CognitiveEngine):
                 current_turn=context.turn,
             )
 
-            # 超时尽量保存上下文（强制重试）
             await self._save_context(context, force=True)
 
             yield AgentStreamEvent(
                 type="error",
                 content=f"Execution timeout after {timeout}s at turn {context.turn}",
             )
-            # 对 step_stream 调用者：超时属于硬异常，继续抛出
             raise
 
         except asyncio.CancelledError:
@@ -466,38 +458,33 @@ class ReActEngine(CognitiveEngine):
             raise
 
         except AgentError as e:
-            # AgentError：对 step_stream 调用者仍是异常，但会先 yield error 事件
             logger.error("step_stream caught AgentError", error=str(e))
             yield AgentStreamEvent(type="error", content=str(e))
             await self.on_error(e, input_messages, **kwargs)
             raise
 
         except Exception as e:
-            # 未知异常：同样先 yield error，再抛出
             logger.exception("Lifecycle execution failed", error=str(e))
             yield AgentStreamEvent(type="error", content=str(e))
             await self.on_error(e, input_messages, **kwargs)
             raise
 
         finally:
-            # 无论如何都尽量保存上下文（非强制）
             try:
                 await self._save_context(context)
             except Exception as save_error:
                 logger.warning("Final context save failed", error=str(save_error))
 
-            # ✅ 成功完成并产出 final_output 时，调用 after_step（发布 step_completed 等）
-            # 注意：如果生命周期仅产生 error 事件（如 max_turns 耗尽），这里不强制 after_step，
-            # 以保持 step_stream 对直接调用者“只发 error 事件就结束”的友好语义。
             if final_output is not None and not saw_error_event:
                 try:
-                    await self.after_step(input_messages, final_output, **kwargs)
+                    await self.after_step(
+                        context.messages,
+                        final_output,
+                        original_input=input_messages,
+                        **kwargs
+                    )
                 except Exception as hook_err:
-                    # after_step 的异常默认不影响主流程（是否 fail-fast 由 base 配置）
                     logger.warning("after_step failed", error=str(hook_err), exc_info=True)
-
-            # 记录整体耗时（可选：这里不强行把 step_stream 当作一步；由上层需要决定）
-            _ = time.time() - start_time
 
     async def _execute_lifecycle_with_timeout(
         self,
@@ -505,7 +492,6 @@ class ReActEngine(CognitiveEngine):
         timeout: float,
         **kwargs: Any,
     ) -> AsyncIterator[AgentStreamEvent]:
-        """带超时控制的生命周期执行（用于兼容单元测试 monkeypatch）。"""
         async with asyncio.timeout(timeout):
             async for event in self._execute_lifecycle(context, **kwargs):
                 yield event
@@ -516,26 +502,7 @@ class ReActEngine(CognitiveEngine):
         response_model: Optional[Type[T]] = None,
         **kwargs: Any,
     ) -> AgentOutput:
-        """
-        step() 的内部实现：消费 step_stream 事件，提取 result 为 AgentOutput。
-
-        注意：
-        - step() 语义上是“要么拿到最终结果，要么抛出异常”
-        - 因此当 step_stream 产出 error 事件时，这里会抛出 AgentError
-        """
-        # 尽量深拷贝，避免污染调用者消息（兼容 pydantic v2 / v1 / 普通对象）
-        try:
-            current_messages: List[Message] = []
-            for m in input_messages:
-                if hasattr(m, "model_copy"):  # Pydantic v2
-                    current_messages.append(m.model_copy(deep=True))  # type: ignore
-                elif hasattr(m, "copy"):  # Pydantic v1 或其他
-                    current_messages.append(m.copy(deep=True))  # type: ignore
-                else:
-                    current_messages.append(copy.deepcopy(m))
-        except Exception as e:
-            logger.warning("Message deep copy failed, using shallow copy", error=str(e))
-            current_messages = list(input_messages)
+        current_messages = self._safe_deep_copy_messages(input_messages)
 
         stream_kwargs: Dict[str, Any] = dict(kwargs)
         stream_kwargs["response_model"] = response_model
@@ -548,11 +515,8 @@ class ReActEngine(CognitiveEngine):
                     final_result = cast(AgentOutput, event.data.get("output"))
 
                 elif event.type == "error":
-                    # step() 语义：error 事件等价于失败
                     error_msg = str(event.content)
                     logger.error("Received error event during execution", error=error_msg)
-
-                    # 对齐单测：包含 "Infinite loop detected" 时抛 AgentError
                     raise AgentError(error_msg)
 
         except AgentError:
@@ -562,27 +526,14 @@ class ReActEngine(CognitiveEngine):
             raise AgentError(f"Step execution failed: {e}") from e
 
         if final_result is None:
-            # 对齐单测：没有 result 也视为无限循环/失败
             raise AgentError("Infinite loop detected: no result generated")
 
         return final_result
 
-    # ---------------------------------------------------------------------
-    # Lifecycle：Think -> Act -> Observe
-    # ---------------------------------------------------------------------
-
     async def _execute_lifecycle(self, context: ExecutionContext, **kwargs: Any) -> AsyncIterator[AgentStreamEvent]:
-        """
-        ReAct 核心循环：
-            while turn < max_turns:
-                Think: LLM 流式输出 -> buffer 聚合
-                Act:   执行工具
-                Observe: 根据工具结果决定继续/停止
-        """
         response_model = kwargs.get("response_model")
         structure_tool_name: Optional[str] = None
 
-        # 若启用结构化输出且模型支持函数调用，则将结构化工具纳入工具集合，并强制 tool_choice
         if response_model and self._supports_functions:
             schema = StructureEngine.to_openai_tool(response_model)
             structure_tool_name = schema["function"]["name"]
@@ -591,35 +542,21 @@ class ReActEngine(CognitiveEngine):
             context.turn += 1
             logger.debug("Starting turn", turn=context.turn)
 
-            # turn start hook（允许同步或异步）
             if self.on_turn_start:
                 await ensure_awaitable(self.on_turn_start, context)
 
-            # =========================
-            # Phase 1: Think（调用模型）
-            # =========================
-            buffer = StreamBuffer()
-            async for chunk in self._phase_think(context, **kwargs):
-                # StreamBuffer 内部会做防御性校验
-                text_delta = buffer.add_chunk(chunk)  # type: ignore[arg-type]
-                if text_delta:
-                    yield AgentStreamEvent(type="token", content=text_delta)
+            async for event in self._think_phase(context, **kwargs):
+                yield event
 
-            assistant_msg = buffer.build_message()
-            context.add_message(assistant_msg)
+            assistant_msg = context.last_message
 
-            # 死循环检测
             if self._detect_loop(context, assistant_msg):
                 error_msg = "Infinite loop detected"
                 yield AgentStreamEvent(type="error", content=error_msg)
-                # 在生命周期内部不强制 raise（让 step_stream 直接调用者可仅消费 error 事件）
                 return
 
             tool_calls = assistant_msg.safe_tool_calls
 
-            # =========================
-            # 结构化输出：若模型直接产出结构化 tool call，则短路返回
-            # =========================
             if structure_tool_name and tool_calls:
                 target_call = next(
                     (
@@ -637,50 +574,24 @@ class ReActEngine(CognitiveEngine):
                     yield AgentStreamEvent(type="result", data={"output": final_output})
                     return
 
-            # 没有工具调用：直接认为完成
             if not tool_calls:
                 final_output = AgentOutput(content=str(assistant_msg.content or ""), tool_calls=[])
                 yield AgentStreamEvent(type="result", data={"output": final_output})
                 return
 
-            # =========================
-            # Phase 2: Act（执行工具）
-            # =========================
             yield AgentStreamEvent(type="tool_input", data={"tools": tool_calls})
 
-            # 统计：工具调用次数
             for _ in tool_calls:
                 self.record_tool_call()
 
-            tool_results = await self._phase_act(tool_calls)
+            async for event in self._act_phase(context, tool_calls):
+                yield event
 
-            # 将工具结果写入 context，并对外发送 tool_output 事件
-            for result in tool_results:
-                truncated_content = self._truncate_observation(result.result, result.tool_name)
-
-                context.add_message(
-                    Message.tool_result(
-                        result.call_id,
-                        truncated_content,
-                        result.tool_name,
-                    )
-                )
-
-                yield AgentStreamEvent(
-                    type="tool_output",
-                    content=result.result,
-                    data={"tool_name": result.tool_name, "is_error": result.is_error},
-                )
-
-            # =========================
-            # Phase 3: Observe（观察/反思）
-            # =========================
-            should_continue = await self._phase_observe(context, tool_results)
+            should_continue = await self._observe_phase(context)
 
             if self.on_turn_end:
                 await ensure_awaitable(self.on_turn_end, context)
 
-            # 每轮尽量保存一次（可用于断点恢复/调试）
             await self._save_context(context)
 
             if not should_continue:
@@ -688,60 +599,14 @@ class ReActEngine(CognitiveEngine):
                 yield AgentStreamEvent(type="result", data={"output": stop_output})
                 return
 
-        # max_turns 耗尽：对 step_stream 直接调用者只 yield error，不强制 raise
         logger.warning("Reached max turns limit, treating as infinite loop", max_turns=self.max_turns)
         yield AgentStreamEvent(type="error", content="Infinite loop detected")
         return
 
-    # ---------------------------------------------------------------------
-    # Phase Implementations
-    # ---------------------------------------------------------------------
-
-    async def _phase_think(self, context: ExecutionContext, **kwargs: Any) -> AsyncIterator[Any]:
-        """
-        Think 阶段：构造 LLM 参数并调用 model.astream 流式生成
-
-        ✅ 修复点：
-        - 构造 messages_payload 时强制把 reflection metadata 写进 dict，满足单测探测
-        - token 统计统一走 record_tokens（你前面 P1 修复点）
-        """
-        # ✅ 从 context 取出“message_id -> metadata”的映射
-        meta_map = {}
-        try:
-            meta_map = context.metadata.get("_gecko_msg_metadata", {}) or {}
-        except Exception:
-            meta_map = {}
-
-        messages_payload: List[Dict[str, Any]] = []
-        for m in context.messages:
-            payload = m.to_openai_format()
-
-            # 1) 如果 Message 自身带 metadata（可选）
-            md = None
-            try:
-                if hasattr(m, "metadata"):
-                    v = getattr(m, "metadata", None)
-                    if isinstance(v, dict) and v:
-                        md = v
-            except Exception:
-                md = None
-
-            # 2) 关键：从 context 映射里补齐（必达）
-            if md is None:
-                try:
-                    v2 = meta_map.get(id(m))
-                    if isinstance(v2, dict) and v2:
-                        md = v2
-                except Exception:
-                    md = None
-
-            if md:
-                # ✅ 单测就是在这里找 m.get('metadata', {}).get('type')
-                payload["metadata"] = md
-
-            messages_payload.append(payload)
-
+    async def _think_phase(self, context: ExecutionContext, **kwargs: Any) -> AsyncIterator[AgentStreamEvent]:
+        messages_payload = self._build_messages_payload(context)
         llm_params = self._build_llm_params(kwargs.get("response_model"), strategy="auto")
+        
         safe_kwargs = {k: v for k, v in kwargs.items() if k not in ["response_model"]}
         llm_params.update(safe_kwargs)
         llm_params["stream"] = True
@@ -750,75 +615,62 @@ class ReActEngine(CognitiveEngine):
         output_tokens = 0
         model_name = self._get_model_name()
 
-        stream_gen = self.model.astream(messages=messages_payload, **llm_params)  # type: ignore
+        buffer = StreamBuffer()
+        stream_gen = self.model.astream(messages=messages_payload, **llm_params)
 
-        async for chunk in stream_gen:
-            if not hasattr(chunk, "delta"):
-                logger.warning("Received chunk without delta, skipping", chunk_type=type(chunk).__name__)
-                continue
+        try:
+            async for chunk in stream_gen:
+                if not hasattr(chunk, "delta"):
+                    delta = getattr(chunk, "choices", [{}])
+                    if not delta:
+                        logger.warning("Received chunk without delta, skipping", chunk_type=type(chunk).__name__)
+                        continue
 
-            usage = getattr(chunk, "usage", None)
-            if usage:
-                input_tokens = max(input_tokens, int(getattr(usage, "prompt_tokens", 0) or 0))
-                output_tokens = max(output_tokens, int(getattr(usage, "completion_tokens", 0) or 0))
+                usage = getattr(chunk, "usage", None)
+                if usage:
+                    input_tokens = max(input_tokens, int(getattr(usage, "prompt_tokens", 0) or 0))
+                    output_tokens = max(output_tokens, int(getattr(usage, "completion_tokens", 0) or 0))
 
-            yield chunk
+                text_delta = buffer.add_chunk(chunk)
+                if text_delta:
+                    yield AgentStreamEvent(type="token", content=text_delta)
+        finally:
+            if input_tokens > 0 or output_tokens > 0:
+                self.record_tokens(input_tokens=input_tokens, output_tokens=output_tokens)
+                self.record_cost(input_tokens, output_tokens, model_name)
 
-        if input_tokens > 0 or output_tokens > 0:
-            self.record_tokens(input_tokens=input_tokens, output_tokens=output_tokens)
-            self.record_cost(input_tokens, output_tokens, model_name)
+        assistant_msg = buffer.build_message()
+        context.add_message(assistant_msg)
 
-
-    async def _phase_act(self, tool_calls: List[Dict[str, Any]]) -> List[ToolExecutionResult]:
-        """Act 阶段：标准化 tool_calls 并并发执行。"""
+    async def _act_phase(
+        self, 
+        context: ExecutionContext, 
+        tool_calls: List[Dict[str, Any]]
+    ) -> AsyncIterator[AgentStreamEvent]:
         normalized_calls = [self._normalize_tool_call(tc) for tc in tool_calls]
-        return await self.toolbox.execute_many(normalized_calls)
-    
+        tool_results = await self.toolbox.execute_many(normalized_calls)
 
-    def _attach_metadata_safe(self, msg: Message, metadata: Dict[str, Any]) -> None:
-        """
-        ✅ 兼容 Message.assistant() 不支持 metadata 参数的情况。
+        for result in tool_results:
+            truncated_content = self._truncate_observation(result.result, result.tool_name)
 
-        目标：
-        - 不修改 Message.assistant 的签名调用
-        - 尽最大可能把 metadata 挂到 msg 上
-        - 若 Message 是 pydantic 且 extra=forbid，常规赋值可能失败，因此做多级兜底
-        """
-        if not metadata:
-            return
+            context.add_message(
+                Message.tool_result(
+                    result.call_id,
+                    truncated_content,
+                    result.tool_name,
+                )
+            )
 
-        # 1) 常规方式：如果 Message 有 metadata 字段，直接赋值
-        try:
-            if hasattr(msg, "metadata"):
-                try:
-                    current = getattr(msg, "metadata", None)
-                    if isinstance(current, dict):
-                        current.update(metadata)
-                    else:
-                        setattr(msg, "metadata", dict(metadata))
-                    return
-                except Exception:
-                    pass
-        except Exception:
-            pass
+            yield AgentStreamEvent(
+                type="tool_output",
+                content=result.result,
+                data={"tool_name": result.tool_name, "is_error": result.is_error},
+            )
 
-        # 2) 兜底：强行挂属性（绕过 pydantic 的 __setattr__ 限制）
-        try:
-            object.__setattr__(msg, "metadata", dict(metadata))
-            return
-        except Exception:
-            # 最终兜底失败：不影响主流程（但单测可能无法探测到 reflection）
-            logger.debug("Failed to attach metadata to message (ignored)", error=True)
+        context.metadata["last_tool_results"] = tool_results
 
-    async def _phase_observe(self, context: ExecutionContext, results: List[ToolExecutionResult]) -> bool:
-        """
-        Observe 阶段：根据工具执行结果决定是否继续
-
-        ✅ 修复点：
-        - 用 reflection_attempts 控制注入次数
-        - 不依赖 Message.assistant(metadata=...)（该签名不支持）
-        - metadata 通过 context.metadata 映射，在 _phase_think 序列化时强制透传
-        """
+    async def _observe_phase(self, context: ExecutionContext) -> bool:
+        results = context.metadata.get("last_tool_results", [])
         error_count = sum(1 for r in results if r.is_error)
 
         if error_count > 0:
@@ -832,75 +684,55 @@ class ReActEngine(CognitiveEngine):
         else:
             context.consecutive_errors = 0
 
-        max_reflections = int(self.get_config("max_reflections", 2))
-        error_threshold = int(self.get_config("tool_error_threshold", 3))
-
-        if context.consecutive_errors >= error_threshold:
-            if getattr(context, "reflection_attempts", 0) < max_reflections:
-                error_details = "\n".join(
-                    f"- {r.tool_name}: {r.result}" for r in results if r.is_error
-                )
-
-                system_feedback = (
-                    "System Notification: Multiple tool execution errors detected.\n"
-                    "Error Details:\n"
-                    f"{error_details}\n\n"
-                    "Please analyze these errors, adjust parameters or tool choice, and retry."
-                )
-
-                # 1) 创建消息（不传 metadata 参数）
-                reflection_msg = Message.assistant(content=system_feedback, tool_calls=None)
-
-                # 2) 构造 metadata（供单测/可观测用）
-                meta = {
-                    "type": "system_reflection",
-                    "error_summary": error_details,
-                    "reflection_attempt": getattr(context, "reflection_attempts", 0) + 1,
-                }
-
-                # 3) 尝试挂到 msg 上（可选，不强依赖）
-                try:
-                    self._attach_metadata_safe(reflection_msg, meta)  # 若你已有此函数则保留
-                except Exception:
-                    pass
-
-                # ✅ 4) 强制写入 context 级别映射（关键：不依赖 Message.to_openai_format）
-                store = context.metadata.setdefault("_gecko_msg_metadata", {})
-                store[id(reflection_msg)] = meta
-
-                context.add_message(reflection_msg)
-
-                context.reflection_attempts = getattr(context, "reflection_attempts", 0) + 1
+        if context.consecutive_errors >= self.config.tool_error_threshold:
+            if context.reflection_attempts < self.config.max_reflections:
+                self._inject_reflection_message(context, results)
+                context.reflection_attempts += 1
                 context.consecutive_errors = 0
                 return True
 
             logger.error(
                 "Tool error threshold exceeded, stopping",
                 consecutive_errors=context.consecutive_errors,
-                reflection_attempts=getattr(context, "reflection_attempts", 0),
+                reflection_attempts=context.reflection_attempts,
                 turn=context.turn,
             )
             return False
 
         return True
 
+    def _inject_reflection_message(
+        self, 
+        context: ExecutionContext, 
+        results: List[ToolExecutionResult]
+    ) -> None:
+        error_details = "\n".join(
+            f"- {r.tool_name}: {r.result}" for r in results if r.is_error
+        )
 
-    # ---------------------------------------------------------------------
-    # Helpers
-    # ---------------------------------------------------------------------
+        system_feedback = (
+            "System Notification: Multiple tool execution errors detected.\n"
+            "Error Details:\n"
+            f"{error_details}\n\n"
+            "Please analyze these errors, adjust parameters or tool choice, and retry."
+        )
+
+        reflection_msg = Message.assistant(content=system_feedback, tool_calls=None)
+
+        meta = {
+            "type": "system_reflection",
+            "error_summary": error_details,
+            "reflection_attempt": context.reflection_attempts + 1,
+        }
+
+        self._attach_metadata_safe(reflection_msg, meta)
+
+        store = context.metadata.setdefault("_gecko_msg_metadata", {})
+        store[id(reflection_msg)] = meta
+
+        context.add_message(reflection_msg)
 
     def _detect_loop(self, context: ExecutionContext, msg: Message) -> bool:
-        """
-        死循环检测算法（工业级偏保守，但需与单测契约一致）
-
-        触发策略：
-        1) 连续重复：同一工具调用指纹连续出现 >= N 次（默认 N=2，与测试契约一致）
-        2) 振荡模式：A->B->A 交替调用
-
-        说明：
-        - 这里的 “连续出现次数” 包含当前轮（即第二次相同就视为循环）
-        - N 可通过 engine kwargs 传入 loop_repeat_threshold 进行调整
-        """
         if not msg.safe_tool_calls:
             return False
 
@@ -915,27 +747,22 @@ class ReActEngine(CognitiveEngine):
             calls_dump = json.dumps(calls_data, sort_keys=True, ensure_ascii=False)
             current_hash = hashlib.sha256(calls_dump.encode("utf-8")).hexdigest()
 
-            # ====== 策略 1：连续重复检测（包含当前轮）======
-            # 默认阈值为 2：第二次相同就触发（满足 test_infinite_loop_detection）
-            repeat_threshold = int(self.get_config("loop_repeat_threshold", 2))
-
-            repeat_run = 1  # 当前轮计为 1
+            repeat_run = 1
             for h in reversed(context.last_tool_hashes):
                 if h == current_hash:
                     repeat_run += 1
                 else:
                     break
 
-            if repeat_run >= repeat_threshold:
+            if repeat_run >= self.config.loop_repeat_threshold:
                 logger.warning(
                     "Consecutive tool call loop detected",
                     repeat_run=repeat_run,
-                    threshold=repeat_threshold,
+                    threshold=self.config.loop_repeat_threshold,
                     tool_hash=current_hash[:16],
                 )
                 return True
 
-            # ====== 策略 2：振荡模式检测（A-B-A）======
             if len(context.last_tool_hashes) >= 2:
                 if (current_hash == context.last_tool_hashes[-2] and
                     current_hash != context.last_tool_hashes[-1]):
@@ -945,9 +772,7 @@ class ReActEngine(CognitiveEngine):
                     )
                     return True
 
-            # 维护最近 5 轮历史
             context.last_tool_hashes.append(current_hash)
-            context.last_tool_hashes = context.last_tool_hashes[-5:]
             context.last_tool_hash = current_hash
 
             return False
@@ -956,13 +781,7 @@ class ReActEngine(CognitiveEngine):
             logger.warning("Loop detection failed (fail-open)", error=str(e), exc_info=True)
             return False
 
-
     def _truncate_observation(self, content: str, tool_name: str) -> str:
-        """
-        截断工具输出，防止上下文爆炸。
-
-        注意：单元测试要求包含英文 "truncated"
-        """
         if len(content) > self.max_observation_length:
             logger.info(
                 "Truncating output for tool",
@@ -974,10 +793,6 @@ class ReActEngine(CognitiveEngine):
         return content
 
     def _normalize_tool_call(self, tool_call: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        将 OpenAI 格式 tool_call 转换为 ToolBox 所需扁平格式：
-            {"id": "...", "name": "...", "arguments": dict}
-        """
         func_block = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
         name = func_block.get("name", "") if isinstance(func_block, dict) else ""
         raw_args = func_block.get("arguments", "{}") if isinstance(func_block, dict) else "{}"
@@ -992,7 +807,6 @@ class ReActEngine(CognitiveEngine):
             else:
                 parsed_args = {}
         except json.JSONDecodeError as e:
-            # 传递特殊标记给 ToolBox，便于产生友好错误
             parsed_args = {
                 "__gecko_parse_error__": (
                     f"JSON format error: {str(e)}. "
@@ -1004,7 +818,6 @@ class ReActEngine(CognitiveEngine):
         return {"id": tool_call.get("id", ""), "name": name, "arguments": parsed_args}
 
     def _get_model_name(self) -> str:
-        """尽量安全获取模型名，用于成本估算等。"""
         model_name = getattr(self.model, "model_name", None) or getattr(self.model, "model", None) or "gpt-3.5-turbo"
         if not isinstance(model_name, str):
             logger.warning("Model name type unexpected", model_name_type=type(model_name).__name__)
@@ -1012,63 +825,100 @@ class ReActEngine(CognitiveEngine):
         return model_name
 
     def _build_llm_params(self, response_model: Any, strategy: str = "auto") -> Dict[str, Any]:
-        """
-        构建 LLM 调用参数（tools/tool_choice 等）。
-
-        说明：
-        - strategy 参数保留用于未来扩展（auto/required/none），当前实现以兼容为主。
-        """
         params: Dict[str, Any] = {}
         tools_schema = self.toolbox.to_openai_schema()
 
-        # 结构化输出：追加结构化工具并强制 tool_choice
         if response_model and self._supports_functions:
             structure_tool = StructureEngine.to_openai_tool(response_model)
             combined_tools = tools_schema + [structure_tool]
             params["tools"] = combined_tools
             params["tool_choice"] = {"type": "function", "function": {"name": structure_tool["function"]["name"]}}
 
-        # 标准 ReAct：允许自动选择工具
         elif tools_schema and self._supports_functions:
             params["tools"] = tools_schema
             params["tool_choice"] = "auto"
 
         return params
 
+    def _build_messages_payload(self, context: ExecutionContext) -> List[Dict[str, Any]]:
+        meta_map = context.metadata.get("_gecko_msg_metadata", {}) or {}
+        messages_payload: List[Dict[str, Any]] = []
+
+        for m in context.messages:
+            payload = m.to_openai_format()
+            md = self._extract_message_metadata(m, meta_map, context)
+
+            if md:
+                payload["metadata"] = md
+
+            messages_payload.append(payload)
+
+        return messages_payload
+
+    def _extract_message_metadata(
+        self, 
+        msg: Message, 
+        meta_map: Dict[int, Dict[str, Any]], 
+        context: ExecutionContext
+    ) -> Optional[Dict[str, Any]]:
+        md = None
+
+        try:
+            if hasattr(msg, "metadata"):
+                v = getattr(msg, "metadata", None)
+                if isinstance(v, dict) and v:
+                    md = v
+        except Exception:
+            pass
+
+        if md is None:
+            try:
+                v2 = meta_map.get(id(msg))
+                if isinstance(v2, dict) and v2:
+                    md = v2
+            except Exception:
+                pass
+
+        if md is None:
+            try:
+                msg_id = getattr(msg, "_gecko_msg_id", None)
+                if msg_id and msg_id in context.message_metadata:
+                    md = context.message_metadata[msg_id]
+            except Exception:
+                pass
+
+        return md
+
     async def _build_execution_context(self, input_messages: List[Message]) -> ExecutionContext:
-        """
-        构建执行上下文：
-        1) load history
-        2) merge input
-        3) inject system prompt if missing
-        """
         history = await self._load_history()
         all_messages = history + input_messages
 
         has_system_msg = any(m.role == "system" for m in all_messages)
         if not has_system_msg:
-            template_vars = {
-                "tools": self.toolbox.to_openai_schema(),
-                "current_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-            try:
-                system_content = self.prompt_template.format_safe(**template_vars)
-            except Exception as e:
-                logger.warning("System prompt formatting failed", error=str(e))
-                system_content = "You are a helpful AI assistant."
-
+            system_content = self._render_system_prompt()
             all_messages.insert(0, Message.system(system_content))
         else:
             logger.debug("Using user-specified system message")
 
-        return ExecutionContext(all_messages)
+        max_context_chars = self.config.max_context_chars
+        return ExecutionContext(all_messages, max_chars=max_context_chars)
+
+    def _render_system_prompt(self) -> str:
+        template_vars = {
+            "tools": self.toolbox.to_openai_schema(),
+            "current_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        try:
+            return self.prompt_template.format_safe(**template_vars)
+        except Exception as e:
+            logger.warning("System prompt formatting failed", error=str(e))
+            return "You are a helpful AI assistant."
 
     async def _load_history(self) -> List[Message]:
-        """从 memory.storage 加载历史（失败则返回空）。"""
         if not getattr(self.memory, "storage", None):
             return []
         try:
-            data = await self.memory.storage.get(self.memory.session_id) # type: ignore
+            data = await self.memory.storage.get(self.memory.session_id)
             if data and "messages" in data:
                 return await self.memory.get_history(data["messages"])
         except Exception as e:
@@ -1076,7 +926,6 @@ class ReActEngine(CognitiveEngine):
         return []
 
     async def _save_context(self, context: ExecutionContext, force: bool = False, max_retries: int = 3) -> None:
-        """保存上下文到 memory.storage（force 模式可重试）。"""
         if not getattr(self.memory, "storage", None):
             return
 
@@ -1085,7 +934,7 @@ class ReActEngine(CognitiveEngine):
         retries = max_retries if force else 1
         for attempt in range(retries):
             try:
-                await self.memory.storage.set(self.memory.session_id, {"messages": messages_data}) # type: ignore
+                await self.memory.storage.set(self.memory.session_id, {"messages": messages_data})
                 return
             except Exception as e:
                 if not force or attempt >= retries - 1:
@@ -1093,12 +942,41 @@ class ReActEngine(CognitiveEngine):
                     if force:
                         raise
                     return
-                await asyncio.sleep(0.1 * (attempt + 1))
+
+                base_delay = min(0.1 * (2 ** attempt), MAX_RETRY_DELAY_SECONDS)
+                jitter = random.uniform(0, base_delay * 0.5)
+                await asyncio.sleep(base_delay + jitter)
+
+    def _attach_metadata_safe(self, msg: Message, metadata: Dict[str, Any]) -> None:
+        if not metadata:
+            return
+
+        try:
+            if hasattr(msg, "metadata"):
+                current = getattr(msg, "metadata", None)
+                if isinstance(current, dict):
+                    current.update(metadata)
+                    return
+                else:
+                    try:
+                        setattr(msg, "metadata", dict(metadata))
+                        return
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        try:
+            object.__setattr__(msg, "metadata", dict(metadata))
+        except Exception:
+            logger.debug("Failed to attach metadata to message (ignored)")
 
 
 __all__ = [
     "ReActEngine",
     "ExecutionContext",
+    "ReActConfig",
     "DEFAULT_REACT_TEMPLATE",
     "STRUCTURE_TOOL_PREFIX",
+    "MAX_RETRY_DELAY_SECONDS",
 ]

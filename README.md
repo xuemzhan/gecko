@@ -1,6 +1,15 @@
 # 🦎 Gecko Agent Framework (v0.4.0)
 
 > **工业级、异步优先、协议驱动的 Python AI 智能体开发框架**
+> Gecko is an async-first, production-grade AI agent framework for Python.  
+It provides:
+
+- ReAct-style reasoning engines with structured output
+- Workflow orchestration with DAG, parallel execution, Next-based control flow, and checkpointing
+- RAG pipelines with pluggable vector stores (Chroma, LanceDB, etc.)
+- Hybrid memory (short-term token memory + long-term vector memory)
+- Multi-agent Team execution (ALL/RACE strategies, sharding, timeouts)
+- Built-in observability via logging, metrics, and OpenTelemetry tracing
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
@@ -271,23 +280,23 @@ if __name__ == "__main__":
 
 在 v0.4.0 中，架构继续沿用 v0.3.1 的分层设计，并强化了 Compose 层的并发执行能力：
 
-| 层级          | 模块           | 功能描述                                                       |
-| :---------- | :----------- | :--------------------------------------------------------- |
-| **Compose** | `Workflow`   | DAG 编排，支持并行层级执行、条件分支、循环、动态跳转、状态持久化与断点恢复                    |
-|             | `Team`       | 多智能体并行执行，支持 ALL/RACE 策略、并发控制、超时、输入分片                       |
-|             | `nodes`      | `step` 装饰器（统一同步/异步函数），`Next` 控制流指令（含 `update_state`）       |
-| **Core**    | `Agent`      | 智能体门面，组装 Model / Memory / Tools                            |
-|             | `Engine`     | ReAct 推理循环，流式缓冲，死循环熔断                                      |
-|             | `Memory`     | `TokenMemory` (LRU缓存), `SummaryTokenMemory` (异步摘要 & 并发锁保护) |
-|             | `Structure`  | 结构化输出解析，Schema 生成，多策略解析与自动修复                               |
-|             | `Prompt`     | 模板管理，组合器 (Composer)，注册表 (Registry)，静态验证                    |
-| **Support** | `ToolBox`    | 工具注册与执行，并发控制，参数校验                                          |
-|             | `Events`     | 异步事件总线，支持中间件拦截                                             |
-|             | `Telemetry`  | OpenTelemetry 链路追踪，Context 传播                              |
-| **Plugins** | `Models`     | 基于 LiteLLM 适配 OpenAI, Zhipu, Ollama 等                      |
-|             | `Storage`    | SQLite (FileLock), Redis, ChromaDB, LanceDB                |
-|             | `Knowledge`  | RAG 流水线，文档加载、切分、向量化                                        |
-|             | `Guardrails` | 输入清洗，Prompt Injection 防御                                   |
+| 层级        | 模块         | 功能描述                                                                   |
+| :---------- | :----------- | :------------------------------------------------------------------------- |
+| **Compose** | `Workflow`   | DAG 编排，支持并行层级执行、条件分支、循环、动态跳转、状态持久化与断点恢复 |
+|             | `Team`       | 多智能体并行执行，支持 ALL/RACE 策略、并发控制、超时、输入分片             |
+|             | `nodes`      | `step` 装饰器（统一同步/异步函数），`Next` 控制流指令（含 `update_state`） |
+| **Core**    | `Agent`      | 智能体门面，组装 Model / Memory / Tools                                    |
+|             | `Engine`     | ReAct 推理循环，流式缓冲，死循环熔断                                       |
+|             | `Memory`     | `TokenMemory` (LRU缓存), `SummaryTokenMemory` (异步摘要 & 并发锁保护)      |
+|             | `Structure`  | 结构化输出解析，Schema 生成，多策略解析与自动修复                          |
+|             | `Prompt`     | 模板管理，组合器 (Composer)，注册表 (Registry)，静态验证                   |
+| **Support** | `ToolBox`    | 工具注册与执行，并发控制，参数校验                                         |
+|             | `Events`     | 异步事件总线，支持中间件拦截                                               |
+|             | `Telemetry`  | OpenTelemetry 链路追踪，Context 传播                                       |
+| **Plugins** | `Models`     | 基于 LiteLLM 适配 OpenAI, Zhipu, Ollama 等                                 |
+|             | `Storage`    | SQLite (FileLock), Redis, ChromaDB, LanceDB                                |
+|             | `Knowledge`  | RAG 流水线，文档加载、切分、向量化                                         |
+|             | `Guardrails` | 输入清洗，Prompt Injection 防御                                            |
 
 顶层包 `gecko/__init__.py` 暴露了 v1.0 核心稳定 API（L1）：
 
@@ -316,12 +325,12 @@ from gecko import (
 
 存储层继续复用 v0.3.1 的 URL Scheme 设计：
 
-| Scheme       | 后端       | 类型     | 用途                 | 特性                 |
-| :----------- | :------- | :----- | :----------------- | :----------------- |
-| `sqlite://`  | SQLite   | KV     | Session / Workflow | WAL 模式，跨进程文件锁，无依赖  |
-| `redis://`   | Redis    | KV     | Session / Cache    | 高性能，TTL 支持，分布式锁    |
+| Scheme       | 后端     | 类型   | 用途               | 特性                           |
+| :----------- | :------- | :----- | :----------------- | :----------------------------- |
+| `sqlite://`  | SQLite   | KV     | Session / Workflow | WAL 模式，跨进程文件锁，无依赖 |
+| `redis://`   | Redis    | KV     | Session / Cache    | 高性能，TTL 支持，分布式锁     |
 | `chroma://`  | ChromaDB | Vector | RAG                | 元数据过滤，本地/远程模式      |
-| `lancedb://` | LanceDB  | Vector | RAG                | 基于 Arrow 的高性能文件向量库 |
+| `lancedb://` | LanceDB  | Vector | RAG                | 基于 Arrow 的高性能文件向量库  |
 
 ---
 
