@@ -1,20 +1,23 @@
 # gecko/compose/workflow/executor.py
 """
-节点执行器 (Node Executor) - v0.4 Enhanced
+节点执行器 (Node Executor) - v0.5 Optimized
 
 职责：
 1. 负责单个节点（Function / Agent / Team）的调度与执行。
 2. 实现“智能参数绑定” (Smart Binding)：根据函数签名或类型提示自动注入 Context 或 Input。
 3. 处理重试逻辑 (Retries) 与 异常捕获。
-4. [v0.4 关键修复] 识别并透传 Next 控制流指令，防止被错误序列化。
+4. [Fix P0-6] 识别并透传 Next 控制流指令，防止被错误序列化。
+5. [Fix P1-3] 自动卸载同步阻塞函数到线程池。
 """
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 import time
-from typing import Any, Callable, Dict, Optional, Union
+from typing import Any, Callable, Dict, Optional, Union, Tuple
 
+import anyio.to_thread  # [New Import] 用于线程卸载
 from pydantic import BaseModel
 
 from gecko.core.exceptions import WorkflowError
@@ -25,6 +28,19 @@ from gecko.compose.nodes import Next
 from gecko.compose.workflow.models import WorkflowContext, NodeExecution, NodeStatus
 
 logger = get_logger(__name__)
+
+def is_async_callable(obj: Any) -> bool:
+    """
+    检查对象是否为异步可调用。
+    覆盖：
+    1. async def func(...)
+    2. class AsyncObj: async def __call__(...)
+    """
+    if inspect.iscoroutinefunction(obj):
+        return True
+    if hasattr(obj, "__call__") and inspect.iscoroutinefunction(obj.__call__):
+        return True
+    return False
 
 
 class NodeExecutor:
@@ -67,7 +83,7 @@ class NodeExecutor:
             else:
                 result = await self._dispatch_call(node_func, context)
             
-            # 3. [v0.4 关键修复] 处理控制流指令 (Next)
+            # 3. [Fix P0-6] 处理控制流指令 (Next)
             # 如果返回值是 Next 对象，必须原样返回给 Engine，
             # 绝不能进行 _normalize_result，否则 Engine 无法识别跳转意图。
             if isinstance(result, Next):
@@ -183,10 +199,28 @@ class NodeExecutor:
         运行普通函数 (参数注入核心逻辑)
         
         策略：
-        1. 分析函数签名。
-        2. [v0.4 新增] 优先检查 Type Hint：如果参数类型是 WorkflowContext，注入 Context。
-        3. 其次检查参数名：如果包含 `context` 或 `workflow_context`，注入 Context。
-        4. 如果还有其他位置参数未被填充，注入当前 Input 数据。
+        1. 分析函数签名，准备参数 (kwargs, args)。
+        2. [Fix P1-3] 区分同步/异步函数：
+           - 异步函数：直接 await
+           - 同步函数：卸载到 Worker Thread，防止阻塞 Event Loop
+        """
+        args, kwargs = self._prepare_args(func, context)
+        
+        # [Fix P1-3] 核心修改：检测是否为协程
+        if is_async_callable(func): # type: ignore
+            # 是异步函数，直接运行
+            return await func(*args, **kwargs)
+        else:
+            # 是同步函数 (如 requests, pandas, time.sleep)
+            # 使用 run_sync 卸载到线程池
+            # functools.partial 用于处理 **kwargs
+            return await anyio.to_thread.run_sync(
+                functools.partial(func, *args, **kwargs)
+            )
+
+    def _prepare_args(self, func: Callable, context: WorkflowContext) -> Tuple[list, dict]:
+        """
+        [Refactor] 准备函数参数
         """
         sig = inspect.signature(func)
         kwargs = {}
@@ -198,7 +232,7 @@ class NodeExecutor:
         else:
             current_input = context.get_last_output()
 
-        # 遍历参数寻找 Context 注入点
+        # 2. 遍历参数寻找 Context 注入点
         params_to_skip = set(["self"])
         
         for name, param in sig.parameters.items():
@@ -223,7 +257,7 @@ class NodeExecutor:
                 kwargs[name] = context
                 params_to_skip.add(name)
 
-        # 重新扫描以注入 Input (排除已注入 Context 的参数)
+        # 3. 重新扫描以注入 Input (排除已注入 Context 的参数)
         # 简化逻辑：排除掉 kwargs 中的参数后，剩下的第一个参数给 Input
         remaining_params = [
             p for name, p in sig.parameters.items()
@@ -234,5 +268,4 @@ class NodeExecutor:
             # 将 current_input 作为第一个剩余的位置参数传入
             args.append(current_input)
             
-        # 4. 执行 (ensure_awaitable 兼容同步/异步函数)
-        return await ensure_awaitable(func, *args, **kwargs)
+        return args, kwargs

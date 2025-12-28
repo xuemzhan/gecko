@@ -1,19 +1,24 @@
 # gecko/compose/workflow/engine.py
 """
-Workflow 引擎主入口 (v0.4 Stable / 2025-12-03 Optimized)
+Workflow 引擎主入口 (v0.5 Stable / 2025-12-28 Optimized)
 
 核心职责：
 1. **并行执行调度 (Phase 2 Core)**: 将 DAG 解析为执行层级 (Layers)，利用 TaskGroup 并行执行。
 2. **状态管理 (State Management)**:
    - 隔离: 使用 Copy-On-Write (COW) 机制防止并行节点污染主上下文。
-   - 合并: 基于 Diff 的状态合并策略 (Last Write Wins)。
+   - 合并: 基于 Diff 的状态合并策略 (Last Write Wins)，支持增量更新与删除。
 3. **动态流控制 (Dynamic Flow)**: 支持 Next 指令动态跳转，可中断静态 DAG 计划。
 4. **断点恢复 (Resume Support)**: 支持从存储加载状态并从指定节点继续执行。
 5. **持久化 (Persistence)**: 细粒度的 Step 级状态保存 (Pre-Commit / Post-Commit)。
+
+优化日志：
+- [Refactor] 将 _COWDict 移至 state.py，实现关注点分离
+- [Fix P0-1] 修复状态删除操作在合并时失效的问题 (Tombstone Support)
+- [Fix P0-6] 修复 Team 嵌套结构导致 Next 控制流指令被忽略的问题
+- [Fix P1-5] 移除运行时历史强制清理，防止长距离依赖断裂
 """
 from __future__ import annotations
 
-import asyncio
 import inspect
 from collections import deque
 from contextlib import nullcontext
@@ -29,76 +34,10 @@ from gecko.plugins.storage.interfaces import SessionInterface
 
 # 导入子模块
 from gecko.compose.workflow.models import WorkflowContext, CheckpointStrategy, NodeStatus
-
-
-class _COWDict(dict):
-    """Lightweight Copy-On-Write dict wrapper.
-
-    - Reads consult the shared base dict unless overridden in local writes.
-    - First write creates local overlay without mutating the shared base.
-    - `get_diff()` returns the local overlay (keys written by this worker).
-    """
-    def __init__(self, base: Optional[dict] = None):
-        super().__init__()
-        self._base = base or {}
-        self._local = {}
-
-    def __getitem__(self, key):
-        if key in self._local:
-            return self._local[key]
-        return self._base[key]
-
-    def get(self, key, default=None):
-        if key in self._local:
-            return self._local.get(key, default)
-        return self._base.get(key, default)
-
-    def __contains__(self, key):
-        return key in self._local or key in self._base
-
-    def keys(self):
-        return set(self._base.keys()) | set(self._local.keys())
-
-    def items(self):
-        for k in self.keys():
-            yield (k, self.get(k))
-
-    def __setitem__(self, key, value):
-        self._local[key] = value
-
-    def pop(self, key, default=None):
-        """Pop key from dict, materializing from base if needed.
-        
-        防御编程: 确保 pop 语义正确
-        - 若 key 在 _local，直接 pop
-        - 若 key 仅在 _base，物化到 _local 后再 pop
-        - 若 key 都不存在，返回 default
-        """
-        if key in self._local:
-            return self._local.pop(key)
-        if key in self._base:
-            # 物化到本地后再 pop，以保证语义一致
-            self._local[key] = self._base[key]
-            return self._local.pop(key)
-        return default
-
-    def update(self, other=None, **kwargs):
-        if other:
-            try:
-                for k, v in dict(other).items():
-                    self._local[k] = v
-            except Exception:
-                pass
-        for k, v in kwargs.items():
-            self._local[k] = v
-
-    def get_diff(self) -> dict:
-        """Return the local overlay to be merged back into the main state."""
-        return dict(self._local)
-
 from gecko.compose.workflow.graph import WorkflowGraph
 from gecko.compose.workflow.executor import NodeExecutor
 from gecko.compose.workflow.persistence import PersistenceManager
+from gecko.compose.workflow.state import COWDict  # [Refactor] 引入独立的状态管理
 from gecko.compose.nodes import Next
 
 logger = get_logger(__name__)
@@ -268,8 +207,8 @@ class Workflow:
         Args:
             input_data: 初始输入数据
             session_id: 会话 ID (可选，用于持久化)
-            start_node: [v0.4] 指定起始节点 (可选，用于 Resume 或特定入口)
-            _resume_context: [v0.4] 注入已恢复的上下文 (用于 Resume)
+            start_node: 指定起始节点 (可选，用于 Resume 或特定入口)
+            _resume_context: 注入已恢复的上下文 (用于 Resume)
             timeout: 超时时间 (秒)，None 表示无限制
         
         执行流程:
@@ -335,18 +274,21 @@ class Workflow:
                         )
 
                     # 4.2 [核心] 并行执行当前层
-                    # 返回: {node_name: {"output": ..., "state_diff": ...}}
+                    # 返回: {node_name: {"output": ..., "updates": ..., "deletions": ..., "status": ...}}
                     layer_results = await self._execute_layer_parallel(layer, context)
                     
                     # 4.3 合并结果与状态 (Merge)
                     # 将并行节点的输出和状态变更合并回主 Context
+                    # [Fix P0-1] 处理状态删除
                     self._merge_layer_results(context, layer_results)
                     
-                    # [P1-2 修复] 定期清理 history，防止无界增长
-                    self._cleanup_history(context, max_steps=self.persistence.history_retention)
+                    # [Fix P1-5] 移除运行时 _cleanup_history
+                    # 原有的清理策略会导致长流程中依赖断裂 (KeyError)。
+                    # 现在仅在持久化层 (PersistenceManager) 进行历史裁剪，运行时保留完整历史。
                     
                     # 4.4 处理动态跳转 (Next)
                     # 策略: 如果层中任何节点返回了 Next，则中断静态计划，优先处理跳转
+                    # [Fix P0-6] 支持解包 Team 内部的 Next 指令
                     jump_instruction = self._handle_dynamic_jump(layer_results, context)
                     
                     if jump_instruction:
@@ -370,7 +312,7 @@ class Workflow:
                     current_step += 1
 
             # 5. 超时检查
-            if timeout is not None and timeout_cm.cancel_called:  # type: ignore
+            if timeout is not None and getattr(timeout_cm, "cancel_called", False):  # type: ignore[attr-defined]
                 raise WorkflowError(
                     f"Workflow execution exceeded timeout: {timeout}s after {current_step} steps"
                 )
@@ -395,38 +337,6 @@ class Workflow:
                 raise WorkflowError(f"Workflow execution failed: {e}") from e
             raise
 
-    def _cleanup_history(self, context: WorkflowContext, max_steps: int = 20):
-        """
-        [P1-2 修复] 定期清理 history，防止无界增长
-        
-        策略:
-        1. 保留最后 N 步的历史记录
-        2. 必须保留 last_output，它是下一步的默认输入
-        3. 删除最老的记录以限制内存使用
-        """
-        if len(context.history) <= max_steps:
-            return
-        
-        # 必须保留的关键字段
-        must_keep = {"last_output"}
-        
-        # 获取所有可删除的键
-        all_keys = set(context.history.keys()) - must_keep
-        old_keys = sorted(all_keys)[:-max_steps]
-        
-        # 删除最老的键
-        for key in old_keys:
-            logger.debug(f"Cleaning up history key: {key}")
-            del context.history[key]
-        
-        if old_keys:
-            logger.info(
-                "History cleanup",
-                before=len(context.history) + len(old_keys),
-                after=len(context.history),
-                removed=len(old_keys)
-            )
-
     async def _execute_layer_parallel(self, layer: Set[str], context: WorkflowContext) -> Dict[str, Any]:
         """
         并行执行单层节点
@@ -446,13 +356,14 @@ class Workflow:
             for node_name in layer:
                 node_func = self.graph.nodes[node_name]
                 
-                # [核心机制] Copy-On-Write (COW)
-                # 为每个节点创建 Context 的浅拷贝 (避免对大 history 做深拷贝)，
-                # 并对 `state` 做一次浅复制以实现写时复制（Copy-On-Write）。
-                # history 保持共享引用以节省内存和拷贝成本（只读语义）。
+                # [核心机制] Copy-On-Write (COW) with Copy-on-Read Support
+                # [Fix P0-5] 使用独立的 COWDict 类，支持“读取即深拷贝”策略，
+                # 防止并行节点直接修改共享的可变对象（如 list/dict），造成数据污染。
                 node_context = context.model_copy(deep=False)
-                # 将 state 设置为一个 Copy-On-Write 包装器，写时复制
-                node_context.state = _COWDict(context.state)
+                # [Fix] 2. 强制赋值绕过 Pydantic 验证
+                # Pydantic 默认会将 COWDict 降级为 dict，导致 get_diff 方法丢失
+                # 使用 object.__setattr__ 直接操作实例字典，保留 COWDict 类型
+                object.__setattr__(node_context, "state", COWDict(context.state))
                 # history 共享引用（只读），避免深拷贝开销
                 node_context.history = context.history
                 
@@ -479,11 +390,10 @@ class Workflow:
         职责:
         1. 运行时条件检查 (Condition Check)
         2. 调用 Executor 执行节点
-        3. 捕获结果与状态变更 (Diff Calculation)
+        3. 捕获结果与状态变更 (Diff Calculation with Deletions)
         """
         # 1. 运行时条件检查
         # 逻辑: 只要有一条指向本节点的边满足条件 (OR 逻辑)，则执行。
-        # 如果所有入边的条件都不满足，则跳过。
         incoming_edges = []
         for src, edges in self.graph.edges.items():
             for target, cond in edges:
@@ -493,15 +403,11 @@ class Workflow:
         if incoming_edges:
             should_run = False
             for src, cond in incoming_edges:
-                # 只有当上游已执行 (在 history 中) 或者是 Start 节点时，条件才有意义
-                # 如果上游节点未执行（被跳过），则该路径视为不通
                 if src == self.graph.entry_point or src in ctx.history:
-                    # 无条件边 -> 视为 True
                     if cond is None:
                         should_run = True
                         break
                     try:
-                        # 评估条件 (支持 sync/async)
                         res = cond(ctx)
                         if inspect.isawaitable(res):
                             res = await res
@@ -509,17 +415,15 @@ class Workflow:
                             should_run = True
                             break
                     except Exception as e:
-                        # 条件执行报错视为不通过 (Fail Safe)
                         logger.error(f"Condition check failed for {src}->{name}: {e}")
             
             if not should_run:
                 logger.info(f"Node {name} skipped due to conditions")
-                # [P0-4 修复] 返回 SKIPPED 状态，而不是 None
-                # 这样 _merge_layer_results 可以正确处理被跳过的节点
                 results[name] = {
                     "output": None,
-                    "state_diff": {},
-                    "status": NodeStatus.SKIPPED  # [新增] 标记为跳过
+                    "updates": {},
+                    "deletions": set(),
+                    "status": NodeStatus.SKIPPED
                 }
                 return
 
@@ -528,57 +432,56 @@ class Workflow:
             output = await self.executor.execute_node(name, func, ctx)
             
             # 3. 计算 State Diff
-            # 如果 ctx.state 是 COWDict，提取本地改动 (get_diff)，否则采用整个 state
-            if hasattr(ctx.state, "get_diff"):
-                state_diff = ctx.state.get_diff()
-            else:
-                state_diff = dict(ctx.state)
+            # [Fix P0-1] 获取更新列表 (updates) 和删除列表 (deletions)
+            # 确保并行节点发出的删除指令能被主流程捕获
+            updates, deletions = ctx.state.get_diff() # type: ignore
             
-            # 写入结果容器 (线程安全，因为是在协程回调中写入 dict)
             results[name] = {
                 "output": output,
-                "state_diff": state_diff
+                "updates": updates,
+                "deletions": deletions,
+                "status": NodeStatus.SUCCESS
             }
         except Exception as e:
-            # 在节点层记录丰富的上下文信息，便于排查
             logger.exception(
                 f"Node worker failed: {name}",
                 node=name,
-                session=getattr(ctx, 'metadata', {}).get('session_id'),
-                entry_point=self.graph.entry_point,
+                session=getattr(ctx, 'metadata', {}).get('session_id')
             )
-            # 包装为 WorkflowError 保留原始栈信息
+            # 标记失败，供上层处理或终止
+            results[name] = {
+                "status": NodeStatus.FAILED,
+                "error": str(e)
+            }
             raise WorkflowError(f"Node '{name}' execution error: {e}") from e
 
     def _merge_layer_results(self, context: WorkflowContext, results: Dict[str, Any]):
         """
         合并并行结果回主上下文 (Synchronization Point)
         
-        [P0-3 修复] Next.input=None 时，保留上一步输出而不是用 None 覆盖
-        [P0-4 修复] 处理 SKIPPED 节点，不更新历史
+        [Fix P0-1] 支持删除操作：优先执行 deletes，再执行 updates
+        [Fix P0-3] Next.input=None 时，保留上一步输出
+        [Fix P0-4] 处理 SKIPPED 节点
         """
         layer_outputs = {}
         
         for node_name, res in results.items():
-            # [P0-4 修复] 跳过的节点不更新 history
-            if res.get("status") == NodeStatus.SKIPPED:
-                logger.debug(f"Node {node_name} was skipped, not updating history")
+            if res.get("status") != NodeStatus.SUCCESS:
                 continue
                 
             output = res["output"]
-            state_diff = res["state_diff"]
+            updates = res.get("updates", {})
+            deletions = res.get("deletions", set())
             
-            # [P0-3 修复] 处理 Next 对象：仅当 input 被显式提供时才覆盖
+            # [Fix P0-3] 处理 Next 对象：仅当 input 被显式提供时才覆盖
             actual_data = output
             if isinstance(output, Next):
-                # 重点：如果 input 为 None，保留上一步的输出
                 if output.input is not None:
                     actual_data = output.input
                 else:
                     # 保留原有输出，不用 None 覆盖
                     actual_data = context.get_last_output()
             
-            # 兼容性处理：如果 Executor 返回的是 dict 形式的 Next (被意外 normalize 了)
             elif isinstance(output, dict) and output.get("node") and "<Next" in str(output):
                  actual_data = output.get("input")
 
@@ -586,10 +489,13 @@ class Workflow:
             context.history[node_name] = actual_data
             layer_outputs[node_name] = actual_data
             
-            # 合并 State (Last Write Wins)
-            # 并行节点若修改同一 Key，后处理者覆盖前者
-            if state_diff:
-                context.state.update(state_diff)
+            # [Fix P0-1] 合并 State (Last Write Wins)
+            # 1. 先执行删除
+            for k in deletions:
+                context.state.pop(k, None)
+            
+            # 2. 再执行更新
+            context.state.update(updates)
         
         # 更新 Last Output (供下一层使用)
         if not layer_outputs:
@@ -606,6 +512,8 @@ class Workflow:
         """
         检查并处理动态跳转 (Next)
         
+        [Fix P0-6] 支持递归解包，从 Team (List[MemberResult]) 中提取隐藏的 Next 指令
+        
         Args:
             results: 当前层的执行结果
             
@@ -613,19 +521,34 @@ class Workflow:
             找到的第一个 Next 指令 (如果有)
         """
         for res in results.values():
-            val = res["output"]
+            val = res.get("output")
             
+            # Case 1: 直接返回 Next (普通 Function 节点)
             if isinstance(val, Next):
-                # 将 Next.input 注入 state 的 _next_input，供下一个节点作为 input 使用
-                if val.input is not None:
-                    context.state["_next_input"] = val.input
-                
-                # 处理附带的 state 更新
-                if val.update_state:
-                    context.state.update(val.update_state)
-                    
+                self._apply_next_instruction(val, context)
                 return val
+            
+            # Case 2: Team 结果 (List[MemberResult])
+            # 需要识别 Team 内部某个 Member 是否发出了 Next 指令
+            if isinstance(val, list):
+                for item in val:
+                    # Duck typing: 检查是否有 result 属性且为 Next
+                    if hasattr(item, "result") and isinstance(item.result, Next):
+                        # 发现跳转指令，应用并返回
+                        # 注意：如果多个成员都返回 Next，这里默认采用第一个发现的 (Race 模式下通常只有一个 Winner)
+                        logger.info(f"Unwrapped Next instruction from Team member")
+                        self._apply_next_instruction(item.result, context)
+                        return item.result
+                        
         return None
+
+    def _apply_next_instruction(self, next_obj: Next, context: WorkflowContext):
+        """应用 Next 指令的副作用 (State Update / Next Input)"""
+        if next_obj.input is not None:
+            context.state["_next_input"] = next_obj.input
+        
+        if next_obj.update_state:
+            context.state.update(next_obj.update_state)
 
     async def resume(self, session_id: str) -> Any:
         """

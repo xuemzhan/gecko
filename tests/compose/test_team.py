@@ -183,3 +183,36 @@ def test_team_resolve_input_uses_last_output_even_if_false():
 
     # ✅ 断言：即使 last_output 是 False，也应被认为是“存在的有效值”
     assert resolved is False
+
+@pytest.mark.asyncio
+async def test_team_input_mapper_fault_tolerance():
+    """
+    [Fix P1-4] 测试输入映射失败时的故障隔离
+    索引 0 映射失败 -> 结果为 Fail
+    索引 1 映射成功 -> 结果为 Success
+    """
+    async def worker(inp):
+        return f"ok:{inp}"
+        
+    members = [worker, worker]
+    
+    def unstable_mapper(raw, idx):
+        if idx == 0:
+            raise ValueError("Mapper Error")
+        return raw
+        
+    team = Team(members, input_mapper=unstable_mapper) # type: ignore
+    
+    # 使用 patch 避免打印 error log 干扰测试输出
+    with patch("gecko.compose.team.logger"):
+        results = await team.run("data")
+        
+    assert len(results) == 2
+    
+    # Member 0: Failed due to mapper
+    assert results[0].is_success is False
+    assert results[0].error == "Input mapping failed"
+    
+    # Member 1: Success
+    assert results[1].is_success is True
+    assert results[1].result == "ok:data"

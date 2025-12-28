@@ -87,8 +87,10 @@ class WorkflowContext(BaseModel):
         description="Next 指令产生的动态跳转目标"
     )
 
-    def add_execution(self, execution: NodeExecution):
+    def add_execution(self, execution: NodeExecution, limit: int = 100):
         self.executions.append(execution)
+        if len(self.executions) > limit:
+            self.executions = self.executions[-limit:]
 
     def get_last_output(self) -> Any:
         return self.history.get("last_output", self.input)
