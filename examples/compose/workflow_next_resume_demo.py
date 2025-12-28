@@ -1,22 +1,22 @@
 # examples/compose/workflow_next_resume_demo.py
 """
-Workflow Next 指令断点恢复示例
+Workflow Next 指令断点恢复示例 (v0.5)
 
-演示 Gecko 如何处理 Next 指令的动态跳转持久化：
-1. 节点 A 返回 Next("B", input="...")。
-2. 系统在跳转后、B 执行前崩溃。
-3. 系统恢复，直接从 next_pointer 指向的 B 继续执行，而不重复执行 A。
+演示场景：
+1. StartNode 返回 Next("NextNode") 指令。
+2. 引擎在持久化该指令后、执行 NextNode 前发生崩溃。
+3. Resume 时，引擎应检测到 next_pointer，直接跳转到 NextNode，而不重复执行 StartNode。
 """
 import asyncio
 import os
 import sys
 
-# 确保可以导入 gecko
+# 路径修正，确保能导入 gecko
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
 from gecko.compose.workflow import Workflow, WorkflowContext, CheckpointStrategy
 from gecko.compose.nodes import step, Next
-# [Fix] 使用 create_storage 替代直接实例化，验证 Bug #7 的注册装饰器修复
+# [v0.5] 使用工厂方法创建存储
 from gecko.plugins.storage.factory import create_storage
 from gecko.core.logging import setup_logging
 from gecko.core.exceptions import WorkflowError
@@ -29,8 +29,7 @@ CRASH_FLAG = True
 @step("StartNode")
 async def start_node(context: WorkflowContext):
     print("\n>>> [StartNode] 执行中...")
-    # 动态跳转到 NextNode，并携带数据
-    # 期望行为：StartNode 执行完后，Next 指令被持久化
+    # 动态跳转到 NextNode
     return Next(node="NextNode", input="Jumped Data")
 
 @step("NextNode")
@@ -38,12 +37,11 @@ async def next_node(context: WorkflowContext):
     global CRASH_FLAG
     print("\n>>> [NextNode] 准备执行...")
     
-    # 获取上一步传来的数据
     inp = context.get_last_output()
     print(f"    收到输入: {inp}")
     
     if CRASH_FLAG:
-        print("    💀 [NextNode] 模拟系统崩溃! (Crash before logic)")
+        print("    💀 [NextNode] 模拟系统崩溃!")
         CRASH_FLAG = False
         raise RuntimeError("System Crash in NextNode")
     
@@ -51,62 +49,60 @@ async def next_node(context: WorkflowContext):
     return f"Processed({inp})"
 
 async def main():
-    # [Fix] 使用 explicit relative path (./) to avoid writing to root
     db_file = "./next_resume.db"
     db_url = f"sqlite:///{db_file}"
     
     if os.path.exists(db_file):
         os.remove(db_file)
 
-    # [Verification] Bug #7: 如果 SQLiteStorage 没加 @register_storage，这里会报错
+    # 1. 创建存储
     storage = await create_storage(db_url)
-
-    wf = Workflow(
-        name="NextResumeFlow", 
-        storage=storage, # type: ignore
-        # [Key] 必须为 ALWAYS，确保 Next 指令产生时立即持久化，以便验证 Resume
-        checkpoint_strategy=CheckpointStrategy.ALWAYS
-    )
-    
-    wf.add_node("StartNode", start_node)
-    wf.add_node("NextNode", next_node)
-    # 注意：这里没有显式添加 StartNode -> NextNode 的边
-    # 完全依赖 Next 指令跳转
-    wf.set_entry_point("StartNode")
-
-    session_id = "next_crash_session"
-
-    print(f"\n{'='*50}")
-    print("ROUND 1: 首次运行 (预期在跳转后、NextNode 前崩溃)")
-    print(f"{'='*50}")
-
-    try:
-        await wf.execute("Init", session_id=session_id)
-    except WorkflowError as e:
-        print(f"\n🔴 捕获到预期异常: {e}")
-
-    print(f"\n{'='*50}")
-    print("ROUND 2: 恢复运行 (预期直接从 NextNode 开始)")
-    print(f"{'='*50}")
-    
-    # 重置 Workflow 实例模拟重启 (关键是 storage 和 session_id 一致)
-    # 实际上用同一个 wf 实例也可以
     
     try:
-        # 恢复执行
-        # 期望：StartNode 不会被重新执行（没有 ">>> [StartNode] 执行中..." 输出）
-        # 直接进入 NextNode，且能获取到 "Jumped Data"
-        result = await wf.resume(session_id=session_id)
-        print(f"\n🎉 恢复成功! 最终结果: {result}")
+        wf = Workflow(
+            name="NextResumeFlow", 
+            storage=storage, # type: ignore
+            # [Key] 必须为 ALWAYS，确保 Next 指令产生时立即持久化
+            checkpoint_strategy=CheckpointStrategy.ALWAYS
+        )
         
-    except Exception as e:
-        print(f"❌ 恢复失败: {e}")
+        wf.add_node("StartNode", start_node)
+        wf.add_node("NextNode", next_node)
+        wf.set_entry_point("StartNode")
 
-    await storage.shutdown()
+        session_id = "next_crash_session"
+
+        print(f"\n{'='*50}")
+        print("ROUND 1: 首次运行 (预期崩溃)")
+        print(f"{'='*50}")
+
+        try:
+            await wf.execute("Init", session_id=session_id)
+        except WorkflowError as e:
+            print(f"\n🔴 捕获到预期异常: {e}")
+
+        print(f"\n{'='*50}")
+        print("ROUND 2: 恢复运行 (预期跳过 StartNode)")
+        print(f"{'='*50}")
+        
+        try:
+            # 恢复执行
+            # 期望：StartNode 不会被重新执行
+            # 直接进入 NextNode，且能获取到 "Jumped Data"
+            result = await wf.resume(session_id=session_id)
+            print(f"\n🎉 恢复成功! 最终结果: {result}")
+            
+        except Exception as e:
+            print(f"❌ 恢复失败: {e}")
+
+    finally:
+        # [v0.5 Best Practice] 必须关闭存储以释放文件锁 (SQLite WAL)
+        await storage.shutdown()
+        
+    # 清理文件
     if os.path.exists(db_file):
         try:
             os.remove(db_file)
-            if os.path.exists(db_file + ".lock"): os.remove(db_file + ".lock")
             if os.path.exists(db_file + "-wal"): os.remove(db_file + "-wal")
             if os.path.exists(db_file + "-shm"): os.remove(db_file + "-shm")
         except:

@@ -1,100 +1,117 @@
-# examples/workflow_dag.py
+# examples/compose/workflow_dag_demo.py
+"""
+Workflow DAG & Loop 示例 (v0.5)
+
+展示复杂拓扑编排：
+1. 循环与状态更新 (Next + update_state)
+2. Team 节点集成 (Workflow 嵌套 Team)
+3. 动态输入注入
+
+运行前提：
+    export ZHIPU_API_KEY="your_api_key"
+"""
 import asyncio
 import os
-from typing import List
 
-from gecko.compose.workflow import Workflow
+from gecko.compose.workflow import Workflow, WorkflowContext
 from gecko.compose.nodes import step, Next
-# [Refactor Note] 引入 MemberResult
 from gecko.compose.team import Team, MemberResult
 from gecko.core.builder import AgentBuilder
 from gecko.core.message import Message
-# [Refactor Note] 使用新的 Model Preset 类
+from gecko.core.logging import setup_logging
 from gecko.plugins.models.presets.zhipu import ZhipuChat 
+
+setup_logging(level="INFO")
 
 # 检查 API Key
 api_key = os.getenv("ZHIPU_API_KEY")
-if not api_key:
-    print("⚠️ Warning: ZHIPU_API_KEY not found in env. Mocking behavior might be needed.")
 
 # 工厂函数：创建新的 Agent 实例
 def make_agent(role_name: str = "Assistant"):
-    # [Refactor] 使用 ZhipuChat 类
-    model = ZhipuChat(api_key=api_key, model="glm-4-flash", temperature=0.7) # type: ignore
+    if not api_key:
+        # Mock 模式，防止无 Key 报错
+        class MockAgent:
+            async def run(self, x): 
+                from gecko.core.output import AgentOutput
+                return AgentOutput(content=f"[{role_name} View]: ok")
+        return MockAgent()
+
+    model = ZhipuChat(api_key=api_key, model="glm-4-flash", temperature=0.7)
     return AgentBuilder().with_model(model).with_session_id(f"agent_{role_name}").build()
 
+
 @step("research")
-async def research(context):
+async def research(context: WorkflowContext):
     """
-    调研节点：优先使用上一轮的反馈（如果有），否则使用初始输入
+    调研节点：优先使用上一轮的反馈（修正指令），否则使用初始输入
     """
-    # 1. 尝试获取上一步传来的“修正指令”（由 Next.input 注入到 last_output）
-    # 2. 如果没有，使用全局初始输入 context.input
+    # 1. 如果是从 Loop 回跳过来，Next.input 会注入到 last_output
+    # 2. 如果是第一次运行，last_output 默认为 context.input
     topic = context.get_last_output()
-    
-    # 如果是第一次运行，last_output 默认为 input
-    # 如果是从 Loop 回跳过来，last_output 是 "new_prompt"
     
     print(f"\n🔍 [Research] 正在调研: {topic}")
     
+    # 这里简单模拟调研过程
     agent = make_agent("Researcher")
+    # 如果是 MockAgent，没有 run 方法会报错吗？NodeExecutor 会处理
     output = await agent.run([Message(role="user", content=f"{topic}")])
-    return output.content # type: ignore
+    return output.content  # type: ignore
 
-# 定义 Team 节点
-# [Refactor] Team 现在是类型安全的，成员可以是 Agent
-team_node = Team(members=[make_agent("Reviewer_1"), make_agent("Reviewer_2")], name="ReviewBoard")
+
+# 定义 Team 节点：由两个评审员组成
+team_node = Team(
+    members=[make_agent("Reviewer_1"), make_agent("Reviewer_2")],  # type: ignore
+    name="ReviewBoard"
+)
+
 
 @step("check_quality")
-async def check_quality(context):
+async def check_quality(context: WorkflowContext):
     """
     质检节点：决定是否通过，或者打回重做
     """
-    # Team 的输出在 history 中，key 是节点名 "team_review"
+    # 获取 Team 的输出 (Workflow 自动将 Team 的输出放入 history)
     raw_result = context.history.get("team_review")
     
-    # [Refactor Note] Team 现在返回 List[MemberResult]
     combined_text = ""
+    # [v0.5] Team 返回 List[MemberResult]
     if isinstance(raw_result, list):
         valid_contents = []
         for res in raw_result:
-            # 显式检查类型和成功状态
-            if isinstance(res, MemberResult):
-                if res.is_success:
-                    valid_contents.append(str(res.result))
-                else:
-                    print(f"⚠️ 忽略失败的专家意见: {res.error}")
+            if isinstance(res, MemberResult) and res.is_success:
+                valid_contents.append(str(res.result))
         combined_text = "\n---\n".join(valid_contents)
     else:
-        # 防御性代码
         combined_text = str(raw_result)
         
     text_len = len(combined_text)
-    print(f"🧐 [Check] 当前有效内容长度: {text_len} 字符")
+    print(f"🧐 [Check] 当前评审内容长度: {text_len} 字符")
 
-    # 获取或初始化循环计数器 (使用 WorkflowContext.state)
+    # 获取循环计数器 (从 State 中)
     loop_count = context.state.get("loop_count", 0)
     
-    # 设定阈值：比如长度小于 100 且重试次数少于 2 次
-    if text_len < 100 and loop_count < 2:
+    # 模拟逻辑：如果这是第一次执行 (loop_count < 1)，强制打回重做
+    if loop_count < 1:
         new_count = loop_count + 1
-        # 更新状态
-        context.state["loop_count"] = new_count
-        print(f"⚠️ [Check] 内容太短，第 {new_count} 次打回重做...")
+        print(f"⚠️ [Check] 质量未达标，第 {new_count} 次打回重做...")
         
-        new_prompt = f"之前的内容太短了（只有{text_len}字）。请针对 '{context.input}' 写一篇不少于 200 字的详细分析报告。"
+        new_prompt = f"之前的内容不够深刻。请针对 '{context.input}' 写一篇更详细的报告。"
         
-        # 返回 Next 指令：
-        # - node: 跳转回 research 节点
-        # - input: 将 new_prompt 传递给 research 节点
-        # - [Phase 2 Feature] 也可以使用 update_state={"loop_count": new_count} 来更新状态
-        return Next(node="research", input=new_prompt)
+        # [v0.5 Best Practice] 
+        # 使用 Next 指令跳转，并利用 update_state 原子更新状态
+        # 这样避免了直接修改 context.state 的副作用担忧
+        return Next(
+            node="research", 
+            input=new_prompt,
+            update_state={"loop_count": new_count}
+        )
     
-    print("✅ [Check] 质量达标 (或已达最大重试次数)")
+    print("✅ [Check] 质量达标")
     return f"最终报告 (经过 {loop_count} 次修正):\n{combined_text}"
 
+
 async def main():
-    # [Phase 2 Feature] 显式开启 allow_cycles，虽然这里我们用 Next 跳转，但这是推荐做法
+    # allow_cycles=True 允许静态图存在环（虽然这里是用 Next 动态跳转）
     workflow = Workflow("ResearchLoop", allow_cycles=True)
     
     # 1. 注册节点
@@ -106,17 +123,14 @@ async def main():
     workflow.set_entry_point("research")
     workflow.add_edge("research", "team_review")
     workflow.add_edge("team_review", "check")
-    # check -> research 的边由代码逻辑动态控制 (Next)
+    # check -> research 的边由 Next 动态控制
     
     print("🚀 启动工作流...")
     
-    if not api_key:
-        print("🚫 缺少 API Key，演示将失败或使用 Mock 数据。")
-        return
-
-    # 初始输入简单一点，故意诱导第一次生成较短的内容
-    output = await workflow.execute("简述 AI Agent")
+    # 初始输入
+    output = await workflow.execute("简述 AI Agent 的未来")
     print("\n🎉 工作流结束 Result:\n", output)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
