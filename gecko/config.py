@@ -44,6 +44,10 @@ class GeckoSettings(BaseSettings):
         description="单模型最大并发请求数（0 = 不限制）",
     )
 
+    # 建议新增（示例）
+    default_session_id: str = Field(default="default", description="默认 session_id（用于 Memory 持久化）")
+    memory_max_tokens: int = Field(default=4000, ge=1, description="Memory 默认 max_tokens")
+
     # ================= 3. Workflow Engine (工作流引擎) =================
     workflow_checkpoint_strategy: Literal["always", "final", "manual"] = Field(
         default="final", description="持久化策略: always(每步), final(仅结束), manual(手动)"

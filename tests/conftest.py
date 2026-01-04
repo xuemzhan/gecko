@@ -93,7 +93,7 @@ def env_setup() -> None:
 
 
 @pytest.fixture(autouse=True)
-async def cleanup_litellm_resources() -> None:
+async def cleanup_litellm_resources() -> None: # type: ignore
     """
     [自动执行] 每个测试结束后清理 LiteLLM 持有的全局 HTTP 客户端。
 
@@ -113,7 +113,7 @@ async def cleanup_litellm_resources() -> None:
     - 最后强制做一次 gc.collect()，加速 socket 释放。
     """
     # 先运行测试用例
-    yield
+    yield # type: ignore
 
     try:
         import litellm  # type: ignore[import]
@@ -126,12 +126,12 @@ async def cleanup_litellm_resources() -> None:
     # 1) 处理 async_http_handler（新版本 LiteLLM 常用入口）
     #    其上通常有一个 .client 属性，为真正的 HTTP 客户端。
     if getattr(litellm, "async_http_handler", None):
-        handler = litellm.async_http_handler
+        handler = litellm.async_http_handler # type: ignore
         client = getattr(handler, "client", None)
         if client is not None:
             clients_to_close.append(client)
         # 清空模块级引用，迫使下个测试重新创建
-        litellm.async_http_handler = None
+        litellm.async_http_handler = None # type: ignore
 
     # 2) 处理 module_level_aclient（部分版本中存在的 async client）
     if getattr(litellm, "module_level_aclient", None):
@@ -140,8 +140,8 @@ async def cleanup_litellm_resources() -> None:
 
     # 3) 处理 http_client（旧版本 LiteLLM 可能仍在使用）
     if getattr(litellm, "http_client", None):
-        clients_to_close.append(litellm.http_client)
-        litellm.http_client = None
+        clients_to_close.append(litellm.http_client) # type: ignore
+        litellm.http_client = None # type: ignore
 
     # 定义一个通用的“关闭 client”帮助函数
     async def _close_client_like(client: object) -> None:
@@ -154,7 +154,7 @@ async def cleanup_litellm_resources() -> None:
         try:
             aclose = getattr(client, "aclose", None)
             if callable(aclose):
-                await aclose()
+                await aclose() # type: ignore
                 return
 
             close = getattr(client, "close", None)
