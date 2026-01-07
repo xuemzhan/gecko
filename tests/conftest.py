@@ -211,14 +211,14 @@ def event_bus() -> EventBus:
 
 
 @pytest.fixture
-def toolbox() -> ToolBox:
+def toolbox() -> ToolBox: # type: ignore
     """
     提供一个真实的 ToolBox 实例。
 
     适用场景：
     - 需要测试真实工具注册/调用逻辑的用例。
     """
-    return ToolBox()
+    return ToolBox() # type: ignore
 
 
 @pytest.fixture

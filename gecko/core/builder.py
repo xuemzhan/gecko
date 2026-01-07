@@ -2,17 +2,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Sequence, Literal
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence, Literal
 
 from gecko.config import get_settings
-from gecko.core.agent import Agent
 from gecko.core.engine.base import CognitiveEngine
 from gecko.core.engine.react import ReActEngine
 from gecko.core.exceptions import ConfigurationError
 from gecko.core.memory import TokenMemory
-from gecko.core.toolbox import ToolBox
+
 from gecko.plugins.storage.interfaces import SessionInterface
 from gecko.plugins.tools.base import BaseTool
+
+from gecko.core.agent import Agent
+from gecko.core.toolbox import ToolBox
 
 
 # ----------------------------------------------------------------------
@@ -20,7 +22,7 @@ from gecko.plugins.tools.base import BaseTool
 # ----------------------------------------------------------------------
 
 # ToolBox 工厂：输入 “工具列表 + toolbox_config”，返回一个 ToolBox 实例
-ToolBoxFactory = Callable[[list[BaseTool], dict[str, Any]], ToolBox]
+ToolBoxFactory = Callable[[list[BaseTool], dict[str, Any]], ToolBox] # type: ignore
 
 # TokenMemory 工厂：输入 “session_id / max_tokens / model_driver / storage”，返回一个 TokenMemory 实例
 MemoryFactory = Callable[[str, int, Any, SessionInterface | None], TokenMemory]
@@ -42,7 +44,7 @@ class AgentComponents:
     - toolbox: 工具箱（已按策略去重）
     - memory : 记忆模块（已注入 model_driver/storage）
     """
-    toolbox: ToolBox
+    toolbox: ToolBox # type: ignore
     memory: TokenMemory
 
 
@@ -598,7 +600,7 @@ class AgentBuilder:
 
         agent = Agent(
             model=self._model,  # validate 已保证非 None
-            toolbox=toolbox,
+            toolbox=toolbox, # type: ignore
             memory=memory,
             engine_cls=self._engine_cls,
             event_bus=agent_kwargs.get("event_bus"),
@@ -708,7 +710,7 @@ class AgentBuilder:
 
         return session_id, max_tokens
 
-    def _build_toolbox(self) -> ToolBox:
+    def _build_toolbox(self) -> ToolBox: # type: ignore
         """
         构建 ToolBox，并按 name 去重。
 

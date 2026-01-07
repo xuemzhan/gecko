@@ -56,7 +56,7 @@ class Agent:
     def __init__(
         self,
         model: Any,
-        toolbox: ToolBox,
+        toolbox: ToolBox, # type: ignore
         memory: TokenMemory,
         engine_cls: type[CognitiveEngine] = ReActEngine,
         event_bus: EventBus | None = None,
@@ -84,7 +84,7 @@ class Agent:
         # - 便于在同一 Agent 中多次调用 engine.step / engine.step_stream
         self.engine: CognitiveEngine = engine_cls(
             model=model,
-            toolbox=toolbox,
+            toolbox=toolbox, # type: ignore
             memory=memory,
             event_bus=self.event_bus,
             **engine_kwargs,

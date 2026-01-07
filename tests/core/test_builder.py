@@ -9,6 +9,9 @@ from gecko.core.toolbox import ToolBox
 from gecko.plugins.storage.interfaces import SessionInterface
 from gecko.plugins.tools.base import BaseTool
 
+# 关键修复：从 pydantic 导入 BaseModel 和 create_model
+from pydantic import BaseModel, create_model
+
 
 # ----------------------------------------------------------------------
 # Test helpers
@@ -35,7 +38,7 @@ class MockEngine(CognitiveEngine):
 
 
 class BareModel:
-    """一个“普通对象模型”，用于严格控制 hasattr 行为。"""
+    """一个"普通对象模型"，用于严格控制 hasattr 行为。"""
     pass
 
 
@@ -47,30 +50,45 @@ class BareModelWithCompletion:
 
 class _TestTool(BaseTool):
     """
-    最小可实例化工具实现，用于测试 Builder 的工具去重逻辑。
-
+    测试用最小工具实现（完整满足 BaseTool 的 Pydantic 字段要求）
+    
     关键点：
-    - BaseTool 是抽象类，至少要求实现抽象方法 `_run`（从报错可知）。
-    - 我们提供 `_run` 的最小实现以使其可实例化。
+    - BaseTool 是 Pydantic BaseModel
+    - 必须提供所有必需字段（name, description, args_schema）
+    - args_schema 是工具参数的 Pydantic Model 类型
     """
-    def __init__(self, name: str, description: str | None = None):
-        self.name = name
-        self.description = description or f"tool {name}"
-
-    # BaseTool 抽象方法：必须实现（从失败栈可知）
+    
+    name: str
+    description: str = ""
+    args_schema: type[BaseModel]  # Python 3.12+ 使用小写 type
+    
     def _run(self, *args, **kwargs):  # type: ignore[override]
+        """同步执行（BaseTool 抽象方法）"""
         return None
 
-    # 如果 BaseTool 还定义了 run/arun，这里提供兼容实现（不一定是抽象要求，但无害）
     def run(self, *args, **kwargs):  # type: ignore[override]
+        """同步执行入口"""
         return self._run(*args, **kwargs)
 
     async def arun(self, *args, **kwargs):  # type: ignore[override]
+        """异步执行入口"""
         return self._run(*args, **kwargs)
 
 
 def make_tool(name: str) -> BaseTool:
-    return _TestTool(name)
+    """
+    创建测试工具实例
+    
+    使用 pydantic.create_model 动态创建空的 args_schema 类
+    """
+    # 为每个工具创建唯一的 args_schema（避免共享同一类导致潜在问题）
+    EmptyArgsSchema = create_model(f"{name}ArgsSchema")
+    
+    return _TestTool(
+        name=name,
+        description=f"tool {name}",
+        args_schema=EmptyArgsSchema,
+    )
 
 
 class StubSettings:
@@ -131,7 +149,7 @@ def test_builder_system_prompt_handling(mock_llm):
     assert builder._engine_kwargs["system_prompt"] == "You are a bot"
 
     agent = builder.build()
-    assert agent.engine._seen_kwargs["system_prompt"] == "You are a bot"
+    assert agent.engine._seen_kwargs["system_prompt"] == "You are a bot"  # type: ignore
 
 
 # ----------------------------------------------------------------------
@@ -290,8 +308,8 @@ def test_builder_engine_kwargs_filter_non_strict_filters(mock_llm):
         .with_engine_kwargs_filter(allow=["a"], strict=False)
     )
     agent = b.build()
-    assert agent.engine._seen_kwargs.get("a") == 1
-    assert "b" not in agent.engine._seen_kwargs
+    assert agent.engine._seen_kwargs.get("a") == 1 # type: ignore
+    assert "b" not in agent.engine._seen_kwargs # type: ignore
 
 
 def test_builder_engine_kwargs_filter_deny_filters(mock_llm):
@@ -303,8 +321,8 @@ def test_builder_engine_kwargs_filter_deny_filters(mock_llm):
         .with_engine_kwargs_filter(deny=["secret"], strict=False)
     )
     agent = b.build()
-    assert agent.engine._seen_kwargs.get("a") == 1
-    assert "secret" not in agent.engine._seen_kwargs
+    assert agent.engine._seen_kwargs.get("a") == 1 # type: ignore
+    assert "secret" not in agent.engine._seen_kwargs # type: ignore
 
 
 def test_builder_tool_dedup_last_wins(mock_llm):
@@ -320,8 +338,10 @@ def test_builder_tool_dedup_last_wins(mock_llm):
         .with_tools([t1, t2])
     )
     comps = b.build_components()
-    assert len(comps.toolbox.tools) == 1
-    assert comps.toolbox.tools[0] is t2
+    # _tools 是字典 {tool_name: tool_instance}
+    assert len(comps.toolbox._tools) == 1
+    assert "same" in comps.toolbox._tools
+    assert comps.toolbox._tools["same"] is t2
 
 
 def test_builder_tool_dedup_first_wins(mock_llm):
@@ -337,8 +357,10 @@ def test_builder_tool_dedup_first_wins(mock_llm):
         .with_tools([t1, t2])
     )
     comps = b.build_components()
-    assert len(comps.toolbox.tools) == 1
-    assert comps.toolbox.tools[0] is t1
+    # _tools 是字典 {tool_name: tool_instance}
+    assert len(comps.toolbox._tools) == 1
+    assert "same" in comps.toolbox._tools
+    assert comps.toolbox._tools["same"] is t1
 
 
 def test_builder_tool_dedup_error_raises(mock_llm):
@@ -364,7 +386,9 @@ def test_builder_toolbox_factory_is_used(mock_llm):
     def toolbox_factory(tools, cfg):
         seen["tools"] = tools
         seen["cfg"] = cfg
-        return ToolBox(tools=tools, **cfg)
+        # 注意：ToolBox.__init__ 只接受 tools 参数，不接受其他配置参数
+        # cfg 中的参数（如 timeout）应该在工厂内部处理，而非直接透传
+        return ToolBox(tools=tools)
 
     b = (
         AgentBuilder()
@@ -379,7 +403,9 @@ def test_builder_toolbox_factory_is_used(mock_llm):
     assert "tools" in seen
     assert len(seen["tools"]) == 1
     assert seen["cfg"]["timeout"] == 1
-    assert len(comps.toolbox.tools) == 1
+    # _tools 是字典
+    assert len(comps.toolbox._tools) == 1
+    assert "t1" in comps.toolbox._tools
 
 
 def test_builder_memory_factory_is_used(mock_llm):
@@ -426,8 +452,8 @@ def test_builder_event_bus_not_passed_to_engine(mock_llm, event_bus):
 
     agent = b.build()
     assert agent.event_bus is event_bus
-    assert "event_bus" not in agent.engine._seen_kwargs
-    assert agent.engine._seen_kwargs["x"] == 1
+    assert "event_bus" not in agent.engine._seen_kwargs # type: ignore
+    assert agent.engine._seen_kwargs["x"] == 1 # type: ignore
 
 
 def test_builder_on_build_hook_called(mock_llm):
